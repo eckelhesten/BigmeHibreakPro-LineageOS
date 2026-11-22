@@ -1,0 +1,30 @@
+# Types the stock vendor policy (Android 11, sepolicy 31.0) expects from the platform.
+# Bigme added them to AOSP system/sepolicy; we declare them in system_ext instead.
+# The stock vendor_sepolicy.cil only references them through the versioned attributes:
+#   allow hal_graphics_composer_default vendor_xrz_prop_31_0      property_service set + file read
+#   allow hal_graphics_composer_default xrz_system_file_31_0      file read
+#   allow hal_graphics_composer_default xrz_debugfs_31_0          dir search, file rw
+# so each type is also put into its *_31_0 attribute (what the stock 31.0 mapping did).
+# The vendor's plat_pub_versioned.cil declares the same attributes; init compiles the split
+# policy with secilc -m, which allows that repeated declaration.
+
+system_public_prop(vendor_xrz_prop)
+type xrz_debugfs, fs_type, debugfs_type;
+type xrz_system_file, system_file_type, file_type;
+
+attribute vendor_xrz_prop_31_0;
+attribute xrz_debugfs_31_0;
+attribute xrz_system_file_31_0;
+typeattribute vendor_xrz_prop vendor_xrz_prop_31_0;
+typeattribute xrz_debugfs xrz_debugfs_31_0;
+typeattribute xrz_system_file xrz_system_file_31_0;
+
+# Platform side: the framework, composer, and e-ink settings read the XRZ policy properties;
+# system_server / system_app (HiBreakParts) change user settings, and surfaceflinger switches
+# motion fast-mode / sleep-mode properties (EinkMotion).
+get_prop({ system_server surfaceflinger system_app }, vendor_xrz_prop)
+set_prop({ system_server surfaceflinger system_app }, vendor_xrz_prop)
+
+# init chown/chmods eink_debug nodes on fs and switches clean_a2 / anti_flicker / global_dither
+allow init xrz_debugfs:dir search;
+allow init xrz_debugfs:file { w_file_perms setattr };

@@ -1,0 +1,201 @@
+From 1d5e2b65ddac25bdfad8ec9d9af1b89b9fc3ff49 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sun, 22 Nov 2026 11:47:39 +0100
+Subject: [PATCH] sf: e-ink motion: only large changes are motion; the settle
+ repaint reaches the panel
+
+Two owner reports (docs/bug-queue.md 0h, 0i):
+
+- Any animation kept the whole panel in FAST: three composites within
+  150 ms started FAST whatever their size, so a playing video, GIF,
+  animated ad or spinner held the screen in A2 (one bit) until it
+  stopped. A composite now counts as motion only if the layers with a
+  new buffer cover at least debug.sf.eink_motion.min_area_pct (30) of
+  the screen, measured from their damage on screen, or a finger touched
+  the screen within debug.sf.eink_motion.touch_recent_ms (2000; flings
+  run on after the finger lifts). Small frames no longer extend FAST
+  either. min_area_pct=0 restores the old behaviour.
+
+- After a scroll, Balanced sometimes stayed "crispy" (the FAST frame):
+  EinkMotion put the user's mode back and repainted, but the stock
+  composer skips a composite without new layer buffers, so the panel
+  kept the last FAST frame until the composer's own idle refresh
+  (0.61-0.64 s after the last frame) - or for good when the mode was
+  back before it. The repaint now goes out with the composer's one-shot
+  (vendor.xrz.force_global_refresh_mode) in the restored mode, reset to
+  -1 once it has gone out (debug.sf.eink_motion.settle_force, default 1).
+---
+ .../DisplayHardware/EinkMotion.cpp            | 40 ++++++++++++++++---
+ .../DisplayHardware/EinkMotion.h              | 18 ++++++++-
+ services/surfaceflinger/SurfaceFlinger.cpp    | 23 ++++++++---
+ 3 files changed, 69 insertions(+), 12 deletions(-)
+
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index 3c870d0..ad0a376 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -99,6 +99,11 @@ void EinkMotion::reloadConfigIfChanged() {
+     // The kernel cleans up after the last FAST frame in passes that take ~600 ms; a mode change
+     // before they finish cancels them and leaves ghosts.
+     c.end = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.end_ms", 700));
++    c.minArea = std::min(100u, base::GetUintProperty<uint32_t>("debug.sf.eink_motion.min_area_pct",
++                                                               30u)) / 100.f;
++    c.touchRecent =
++            ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.touch_recent_ms", 2000));
++    c.settleForce = base::GetBoolProperty("debug.sf.eink_motion.settle_force", true);
+     c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true) &&
+             !base::GetBoolProperty("debug.sf.eink_engine", false);
+     c.asleep = base::GetBoolProperty("vendor.xrz.hibreak_sleep", false);
+@@ -193,7 +198,7 @@ void EinkMotion::applySleepMode() {
+     mSleepModeSet = true;
+ }
+ 
+-void EinkMotion::onComposite(bool imeVisible) {
++void EinkMotion::onComposite(bool imeVisible, float damage) {
+     std::lock_guard lock(mMutex);
+     reloadConfigIfChanged();
+     const nsecs_t now = systemTime();
+@@ -209,9 +214,24 @@ void EinkMotion::onComposite(bool imeVisible) {
+         mAsleep = false;
+     }
+     if (mConfig.sleep && mConfig.asleep != mAsleep) beginSleepTransition(mConfig.asleep, now);
++    if (mSettleArmed != 0 && now - mSettleArmed > ms2ns(500)) {
++        // The settle one-shot has gone out with the repaint; nothing else may inherit it.
++        base::SetProperty(kForceModeProperty, "-1");
++        mSettleArmed = 0;
++    }
++    if (mConfig.touchDown) mLastTouch = now;
++    const bool touchRecent =
++            mConfig.touchEnabled && mLastTouch != 0 && now - mLastTouch <= mConfig.touchRecent;
++    // Small changes (a video, an animated ad, a spinner) are not motion.
++    const bool counts = damage >= mConfig.minArea || touchRecent;
+     const bool inCadence = mLastFrame != 0 && now - mLastFrame <= mConfig.gap;
+     const bool touchCadence = mLastFrame != 0 && now - mLastFrame <= mConfig.touchGap;
+-    mStreak = inCadence ? mStreak + 1 : 1;
++    if (counts) {
++        const bool motionCadence =
++                mLastMotionFrame != 0 && now - mLastMotionFrame <= mConfig.gap;
++        mStreak = motionCadence ? mStreak + 1 : 1;
++        mLastMotionFrame = now;
++    }
+     mLastFrame = now;
+     mImeVisible = imeVisible;
+     if (imeVisible != mImePublished) {
+@@ -240,7 +260,7 @@ void EinkMotion::onComposite(bool imeVisible) {
+     const uint32_t current = readMode();
+     // Occasional frames under a resting finger (a cursor blink) don't extend the fast mode;
+     // the touch hold in the thread does that, for a bounded time.
+-    if (motionFast || (mFast && inCadence) || (touchFast && touchCadence)) {
++    if (motionFast || (mFast && inCadence && counts) || (touchFast && touchCadence)) {
+         mMotionEnd = now;
+     }
+     if (mFast && (current != mWritten || modeSerial() != mWrittenSerial)) {
+@@ -340,11 +360,21 @@ void EinkMotion::threadLoop() {
+                   static_cast<int>(ns2ms(now - mTouchHoldSince)));
+         }
+         mTouchHoldSince = 0;
+-        // The screen is still: back to the user's mode, and one repaint in it.
+-        if (readMode() == mWritten && modeSerial() == mWrittenSerial) writeMode(mBase);
++        // The screen is still: back to the user's mode, and one repaint in it. The composer
++        // skips a composite without new buffers, so the repaint goes out with its one-shot in
++        // that mode (otherwise the panel keeps the last FAST frame until the composer's own idle
++        // refresh ~0.6 s later; docs/bug-queue.md 0i).
++        if (readMode() == mWritten && modeSerial() == mWrittenSerial) {
++            writeMode(mBase);
++            if (mConfig.settleForce) {
++                base::SetProperty(kForceModeProperty, std::to_string(mBase != 0 ? mBase : 0xb2));
++                mSettleArmed = now;
++            }
++        }
+         mFast = false;
+         mStreak = 0;
+         mLastFrame = 0; // the repaint must not count as motion
++        mLastMotionFrame = 0;
+         const auto repaint = mRepaint;
+         lock.unlock();
+         if (repaint) repaint();
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index add27c2..871214c 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -51,8 +51,9 @@ public:
+     // Called once, with a thread-safe function that makes SurfaceFlinger composite again.
+     void setRepaint(std::function<void()> repaint);
+ 
+-    // Called on the main thread for every composite, before it is presented.
+-    void onComposite(bool imeVisible);
++    // Called on the main thread for every composite, before it is presented. damage: the share
++    // of the screen that layers with a new buffer cover in this frame (0..1).
++    void onComposite(bool imeVisible, float damage = 1.f);
+ 
+ private:
+     EinkMotion() = default;
+@@ -75,6 +76,16 @@ private:
+         uint32_t frames = 3;     // debug.sf.eink_motion.frames
+         nsecs_t gap = 0;         // debug.sf.eink_motion.gap_ms
+         nsecs_t end = 0;         // debug.sf.eink_motion.end_ms
++        // A frame counts as motion only if it changes at least this share of the screen
++        // (debug.sf.eink_motion.min_area_pct, 0 = every frame), or a finger touched the screen
++        // within touchRecent (debug.sf.eink_motion.touch_recent_ms; flings run on after the
++        // finger lifts). A playing video, GIF or spinner then no longer holds the panel in FAST.
++        float minArea = 0.3f;
++        nsecs_t touchRecent = 0;
++        // When the motion ends, the user's mode goes out with the composer's one-shot
++        // (debug.sf.eink_motion.settle_force): the composer skips a repaint without new buffers,
++        // so without it the panel kept the last FAST frame until its own idle refresh.
++        bool settleForce = true;
+ 
+         // Sleep screen (see the class comment). vendor.xrz.hibreak_sleep is set by
+         // system_server; the rest are debug.sf.eink_sleep.* for tuning without a build.
+@@ -111,6 +122,9 @@ private:
+     const prop_info* mTouchProp = nullptr;
+ 
+     nsecs_t mLastFrame = 0;
++    nsecs_t mLastMotionFrame = 0; // the last frame that counted as motion
++    nsecs_t mLastTouch = 0;       // the last composite with a finger down
++    nsecs_t mSettleArmed = 0;     // when the settle one-shot was armed, 0 = not armed
+     // Last timestamp that extends the FAST exit countdown (not reset by slow 500 ms cursor blinks).
+     nsecs_t mMotionEnd = 0;
+     uint32_t mStreak = 0;
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 8cd543f..6bb34cb 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3255,16 +3255,29 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         // whether the input method is on screen (its buffer layer is named "InputMethod#<id>").
+         // The snapshots are held by the layers' front ends while a frame is composited, not by
+         // mLayerSnapshotBuilder.
++        // And how much of the screen changed: the screen area of the damage of layers with a new
++        // buffer (their whole bounds when the damage is unknown), against the largest visible
++        // layer (the screen, for the app or wallpaper behind).
+         bool imeVisible = false;
++        float changed = 0.f;
++        float screen = 1.f;
+         for (const auto& [layer, layerFE] : layers) {
+             const auto& snapshot = layerFE->mSnapshot;
+-            if (snapshot && snapshot->isVisible &&
+-                snapshot->name.find("InputMethod#") != std::string::npos) {
+-                imeVisible = true;
+-                break;
++            if (!snapshot || !snapshot->isVisible) continue;
++            if (snapshot->name.find("InputMethod#") != std::string::npos) imeVisible = true;
++            const FloatRect bounds = snapshot->transformedBounds;
++            if (bounds.isEmpty()) continue;
++            screen = std::max(screen, bounds.getWidth() * bounds.getHeight());
++            if (!snapshot->changes.test(frontend::RequestedLayerState::Changes::Buffer)) continue;
++            FloatRect area = bounds;
++            const Rect damage = snapshot->surfaceDamage.getBounds();
++            if (damage.isValid() && !damage.isEmpty()) {
++                const Rect onScreen = snapshot->geomLayerTransform.transform(damage);
++                area = bounds.intersect(onScreen.toFloatRect());
+             }
++            if (area.isValid()) changed += area.getWidth() * area.getHeight();
+         }
+-        EinkMotion::get().onComposite(imeVisible);
++        EinkMotion::get().onComposite(imeVisible, std::min(1.f, changed / screen));
+     }
+ 
+     mCompositionEngine->present(mainThreadRefreshArgs);
+-- 
+2.50.1 (Apple Git-155)
+

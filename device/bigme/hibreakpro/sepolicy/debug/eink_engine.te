@@ -1,0 +1,17 @@
+# SurfaceFlinger's e-ink engine (frameworks/native patch 0005, debug.sf.eink_engine): it allocates
+# its grey buffer from ION and submits DRM_IOCTL_EINK_UPDATE on /dev/dri/card0 (system:system).
+# Debug builds only: this directory is added to SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS on userdebug/eng,
+# so production user builds do not grant surfaceflinger direct DRI/ION/xrz_system_file access.
+#
+# /dev/dri/card0 is labelled dri_device by the stock vendor policy, which declares that type
+# itself, so the platform side can't name it at build time. We declare it here as well (same
+# attributes as the vendor's): init compiles the split policy with secilc -m, which accepts a
+# repeated type declaration, the same way the XRZ types in xrz.te work.
+type dri_device, dev_type, mlstrustedobject;
+
+allow surfaceflinger dri_device:chr_file rw_file_perms;
+allow surfaceflinger ion_device:chr_file r_file_perms;
+
+# On the first update the kernel driver verifies a licence key by reading /system/eink_key with the
+# caller's credentials ("eink verify key"); denied, the ioctl spins in the kernel.
+allow surfaceflinger xrz_system_file:file r_file_perms;

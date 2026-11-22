@@ -1,0 +1,136 @@
+From e1122643f9137b6a2aadfc57487b6c93c19acb07 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Thu, 19 Nov 2026 19:32:53 +0000
+Subject: [PATCH] hwui: e-ink text as grid-fitted 1-bit glyphs
+
+On the HiBreak Pro the panel shows black and white only in its normal and
+fast modes. Anti-aliased glyphs were thresholded afterwards (SurfaceFlinger's
+e-ink pass, or the kernel's dither), which leaves each stem 2 or 3 px wide
+depending on where it falls on the pixel grid: blotchy, uneven text.
+
+With debug.hwui.eink_glyphs (and debug.hwui.eink_text), hwui rasterises
+text straight to black and white:
+  1  1-bit glyphs (aliased), no hinting
+  2  1-bit glyphs grid-fitted by FreeType's autohinter: every stem and bar
+     a whole number of pixels, so equal strokes stay equal
+  3  as 2 in Skia's fake bold
+Glyph origins are on whole pixels (no subpixel positioning), which hinted
+shapes need; layout and advances are unchanged.
+
+debug.hwui.eink_text_faded_alpha (percent) raises clearly faded text
+(alpha below 0.5: hints, disabled widgets; nearly invisible text is left
+alone) to that alpha, so it shows as a dense even grey instead of a few
+specks. 0 keeps the app's alpha.
+
+Compared offline on the phone's Roboto at the panel's size (300 ppi,
+density 1.875): mode 2 gives the most even text; mode 3 is heavy.
+
+Change-Id: I200e2589a923546c9af22a65657d4d535419ee97
+---
+ libs/hwui/Properties.cpp         |  5 +++++
+ libs/hwui/Properties.h           |  8 ++++++++
+ libs/hwui/hwui/DrawTextFunctor.h | 33 +++++++++++++++++++++++++++++---
+ 3 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/libs/hwui/Properties.cpp b/libs/hwui/Properties.cpp
+index 60d916d31..e6652cc52 100644
+--- a/libs/hwui/Properties.cpp
++++ b/libs/hwui/Properties.cpp
+@@ -81,6 +81,8 @@ bool Properties::sDisableProfileBars = false;
+ RenderPipelineType Properties::sRenderPipelineType = RenderPipelineType::NotInitialized;
+ bool Properties::enableHighContrastText = false;
+ bool Properties::einkText = false;
++int Properties::einkGlyphs = 0;
++float Properties::einkTextFadedAlpha = 0.f;
+ bool Properties::einkNoShadow = false;
+ 
+ bool Properties::waitForGpuCompletion = false;
+@@ -148,6 +150,9 @@ bool Properties::load() {
+ 
+     debugLayersUpdates = base::GetBoolProperty(PROPERTY_DEBUG_LAYERS_UPDATES, false);
+     einkText = base::GetBoolProperty("debug.hwui.eink_text", false);
++    einkGlyphs = base::GetIntProperty("debug.hwui.eink_glyphs", 0);
++    einkTextFadedAlpha =
++            std::clamp(base::GetIntProperty("debug.hwui.eink_text_faded_alpha", 0), 0, 100) / 100.f;
+     einkNoShadow = base::GetBoolProperty("debug.hwui.eink_no_shadow", false);
+     INIT_LOGD("  Layers updates debug enabled: %d", debugLayersUpdates);
+ 
+diff --git a/libs/hwui/Properties.h b/libs/hwui/Properties.h
+index bc51ebee7..2a55efe95 100644
+--- a/libs/hwui/Properties.h
++++ b/libs/hwui/Properties.h
+@@ -312,6 +312,14 @@ public:
+     // E-ink panels: text is drawn in pure black or white (by its lightness), with no outline or
+     // backdrop. Set once per process from debug.hwui.eink_text.
+     static bool einkText;
++    // E-ink glyph rendering (debug.hwui.eink_glyphs), with einkText: 0 = anti-aliased as usual,
++    // 1 = 1-bit glyphs, 2 = 1-bit glyphs grid-fitted by FreeType's autohinter (every stem a
++    // whole number of pixels: even strokes on a black-and-white panel), 3 = as 2 in fake bold.
++    static int einkGlyphs;
++    // Alpha for clearly faded text (alpha < 0.5: hints, disabled widgets), so it shows as a
++    // dense even grey on the panel instead of a few specks (debug.hwui.eink_text_faded_alpha,
++    // percent; 0 = keep the app's alpha).
++    static float einkTextFadedAlpha;
+     // E-ink panels: no elevation shadows. A soft grey shadow is a band of dither noise around
+     // every card, button and dialog. Set once per process from debug.hwui.eink_no_shadow.
+     static bool einkNoShadow;
+diff --git a/libs/hwui/hwui/DrawTextFunctor.h b/libs/hwui/hwui/DrawTextFunctor.h
+index 2d0d6b314..ff6552e72 100644
+--- a/libs/hwui/hwui/DrawTextFunctor.h
++++ b/libs/hwui/hwui/DrawTextFunctor.h
+@@ -123,13 +123,32 @@ static bool snapTextColorForEink(const Paint& paint, Paint* out) {
+     // e-ink enhancement decides from the composed picture.
+     if (lab.L > 55 && lab.L < 85) return false;
+     SkColor4f snapped = lab.L <= 55 ? SkColors::kBlack : SkColors::kWhite;
+-    snapped.fA = c.fA >= 0.5f ? 1.f : c.fA;
++    // Faded text (hints, disabled): optionally raised to a fixed alpha. Nearly invisible text
++    // (fades in progress) is left alone.
++    const float faded = uirenderer::Properties::einkTextFadedAlpha;
++    snapped.fA = c.fA >= 0.5f ? 1.f
++            : (faded > 0.f && c.fA >= 0.15f) ? std::max(c.fA, faded)
++            : c.fA;
+     if (snapped == c) return false;
+     *out = paint;
+     out->setColor(snapped);
+     return true;
+ }
+ 
++// E-ink glyphs (Properties::einkGlyphs): rasterised straight to black and white instead of
++// anti-aliased and thresholded later (which leaves stems 2 or 3 px wide at random, blotchy).
++// With the autohinter every stem and bar lands on whole pixels, so equal strokes stay equal.
++// Glyph origins on whole pixels too (no subpixel positioning): hinted shapes need it.
++static void applyEinkGlyphs(Paint* p) {
++    const int mode = uirenderer::Properties::einkGlyphs;
++    SkFont& font = p->getSkFont();
++    font.setEdging(SkFont::Edging::kAlias);
++    font.setSubpixel(false);
++    font.setHinting(mode >= 2 ? SkFontHinting::kFull : SkFontHinting::kNone);
++    font.setForceAutoHinting(mode >= 2);
++    if (mode >= 3) font.setEmbolden(true);
++}
++
+ class DrawTextFunctor {
+ public:
+     /**
+@@ -187,8 +206,16 @@ public:
+             gDrawTextBlobMode = DrawTextBlobMode::Normal;
+         } else if (CC_UNLIKELY(uirenderer::Properties::einkText)) {
+             Paint einkPaint;
+-            const Paint& p = snapTextColorForEink(paint, &einkPaint) ? einkPaint : paint;
+-            canvas->drawGlyphs(glyphFunc, glyphCount, p, x, y, totalAdvance);
++            bool changed = snapTextColorForEink(paint, &einkPaint);
++            if (uirenderer::Properties::einkGlyphs > 0) {
++                if (!changed) {
++                    einkPaint = paint;
++                    changed = true;
++                }
++                applyEinkGlyphs(&einkPaint);
++            }
++            canvas->drawGlyphs(glyphFunc, glyphCount, changed ? einkPaint : paint, x, y,
++                               totalAdvance);
+         } else {
+             // standard draw path
+             canvas->drawGlyphs(glyphFunc, glyphCount, paint, x, y, totalAdvance);
+-- 
+2.43.0
+

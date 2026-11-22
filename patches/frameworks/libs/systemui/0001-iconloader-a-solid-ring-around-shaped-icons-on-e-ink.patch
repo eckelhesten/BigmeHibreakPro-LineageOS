@@ -1,0 +1,130 @@
+From 5aab094063b2460873cffec89b5df86f7f0f6536 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 14 Nov 2026 19:46:09 +0100
+Subject: [PATCH] iconloader: a solid ring around shaped icons on e-ink
+
+With debug.sysui.eink_palette=1, icons drawn in the launcher's icon
+shape get a 2dp black ring along the shape instead of the soft shadow
+layer. An e-ink panel shows the shadow as a grey smudge, and icons with
+white backgrounds had no visible edge on the white home screen.
+
+Change-Id: I4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70
+---
+ .../icons/FastBitmapDrawableDelegate.kt       | 47 ++++++++++++++++++-
+ .../icons/mono/ThemedIconDelegate.kt          |  7 ++-
+ 2 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/iconloaderlib/src/com/android/launcher3/icons/FastBitmapDrawableDelegate.kt b/iconloaderlib/src/com/android/launcher3/icons/FastBitmapDrawableDelegate.kt
+index 563d5b9..dc2ec52 100644
+--- a/iconloaderlib/src/com/android/launcher3/icons/FastBitmapDrawableDelegate.kt
++++ b/iconloaderlib/src/com/android/launcher3/icons/FastBitmapDrawableDelegate.kt
+@@ -24,8 +24,12 @@ import android.graphics.Paint
+ import android.graphics.Rect
+ import android.graphics.Shader
+ import android.graphics.Shader.TileMode.CLAMP
++import android.content.res.Configuration
++import android.content.res.Resources
++import android.util.Log
+ import androidx.core.graphics.ColorUtils
+ import com.android.launcher3.icons.BitmapInfo.Companion.FLAG_FULL_BLEED
++import com.android.launcher3.icons.IconNormalizer.ICON_VISIBLE_AREA_FACTOR
+ import com.android.launcher3.icons.GraphicsUtils.resizeToContentSize
+ 
+ /** A delegate for changing the rendering of [FastBitmapDrawable], to support multi-inheritance */
+@@ -129,12 +133,61 @@ interface FastBitmapDrawableDelegate {
+             paint: Paint,
+             shader: Shader?,
+         ) {
+-            drawBitmap(iconShape.shadowLayer, null, bounds, paint)
++            if (!EINK_ICON_RING) {
++                drawBitmap(iconShape.shadowLayer, null, bounds, paint)
++            }
+             resizeToContentSize(bounds, iconShape.pathSize.toFloat()) {
+                 paint.shader = shader
+                 iconShape.shapeRenderer.render(this, paint)
+                 paint.shader = null
+             }
++            drawEinkRing(bounds, iconShape, paint.alpha)
++        }
++
++        /**
++         * E-ink: a solid ring along the icon shape instead of the soft shadow, which the panel
++         * shows as a grey smudge. The width stays consistent on screen (capped on tiny icons)
++         * and follows light/dark mode. Does nothing unless [EINK_ICON_RING].
++         */
++        fun Canvas.drawEinkRing(bounds: Rect, iconShape: IconShape, alpha: Int) {
++            if (!EINK_ICON_RING || bounds.width() <= 0) return
++            val res = Resources.getSystem()
++            val night =
++                (res.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
++                    Configuration.UI_MODE_NIGHT_YES
++            val ringPx = minOf(2f * res.displayMetrics.density, bounds.width() * 0.10f)
++            val ringPaint = einkRingPaint.get()!!
++            ringPaint.color = if (night) Color.WHITE else Color.BLACK
++            ringPaint.alpha = alpha
++            resizeToContentSize(bounds, iconShape.pathSize.toFloat()) {
++                val pathToPixels =
++                    bounds.width() / iconShape.pathSize.toFloat() * ICON_VISIBLE_AREA_FACTOR
++                ringPaint.strokeWidth = ringPx / pathToPixels
++                drawPath(iconShape.path, ringPaint)
++            }
+         }
++
++        /**
++         * E-ink panels (debug.sysui.eink_palette=1): icons get a solid ring instead of a shadow.
++         * SystemProperties is read by reflection, because some users of this library build
++         * against the public SDK.
++         */
++        val EINK_ICON_RING: Boolean =
++            try {
++                Class.forName("android.os.SystemProperties")
++                    .getMethod("getBoolean", String::class.java, Boolean::class.javaPrimitiveType)
++                    .invoke(null, "debug.sysui.eink_palette", false) as Boolean
++            } catch (e: Exception) {
++                Log.w("FastBitmapDrawable", "Unable to read the e-ink property", e)
++                false
++            }
++
++        // ThreadLocal: iconloader draws on both the UI thread and background icon executors.
++        private val einkRingPaint: ThreadLocal<Paint> =
++            ThreadLocal.withInitial {
++                Paint(Paint.ANTI_ALIAS_FLAG).apply {
++                    style = Paint.Style.STROKE
++                }
++            }
+     }
+ }
+diff --git a/iconloaderlib/src/com/android/launcher3/icons/mono/ThemedIconDelegate.kt b/iconloaderlib/src/com/android/launcher3/icons/mono/ThemedIconDelegate.kt
+index e056d71..e5fd8e8 100644
+--- a/iconloaderlib/src/com/android/launcher3/icons/mono/ThemedIconDelegate.kt
++++ b/iconloaderlib/src/com/android/launcher3/icons/mono/ThemedIconDelegate.kt
+@@ -24,6 +24,8 @@ import android.graphics.Rect
+ import com.android.launcher3.icons.BitmapInfo
+ import com.android.launcher3.icons.FastBitmapDrawable
+ import com.android.launcher3.icons.FastBitmapDrawableDelegate
++import com.android.launcher3.icons.FastBitmapDrawableDelegate.Companion.EINK_ICON_RING
++import com.android.launcher3.icons.FastBitmapDrawableDelegate.Companion.drawEinkRing
+ import com.android.launcher3.icons.FastBitmapDrawableDelegate.DelegateFactory
+ import com.android.launcher3.icons.GraphicsUtils.getColorMultipliedFilter
+ import com.android.launcher3.icons.GraphicsUtils.resizeToContentSize
+@@ -59,13 +61,16 @@ class ThemedIconDelegate(
+         bounds: Rect,
+         paint: Paint,
+     ) {
+-        canvas.drawBitmap(iconShape.shadowLayer, null, bounds, paint)
++        if (!EINK_ICON_RING) {
++            canvas.drawBitmap(iconShape.shadowLayer, null, bounds, paint)
++        }
+ 
+         canvas.resizeToContentSize(bounds, iconShape.pathSize.toFloat()) {
+             clipPath(iconShape.path)
+             drawPaint(paint)
+             drawBitmap(monoIcon, null, shapeBounds, monoPaint)
+         }
++        canvas.drawEinkRing(bounds, iconShape, monoPaint.alpha)
+     }
+ 
+     override fun setAlpha(alpha: Int) {
+-- 
+2.50.1 (Apple Git-155)
+

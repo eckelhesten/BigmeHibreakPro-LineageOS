@@ -1,0 +1,90 @@
+From 17269cfba947fad38a7107f51f0fcea0490c2164 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 14 Nov 2026 16:50:08 +0100
+Subject: [PATCH 4/4] SystemUI: outline the power menu on e-ink
+
+With debug.sysui.eink_palette=1 the power menu and its round buttons get
+a 2dp outline in the on-surface colour, and their background tint is
+removed, because a tint would paint over the line.
+
+With the two-tone palette both are as white as the screen behind them,
+and on e-ink no dim layer sets the menu apart (debug.eink.windows), so
+without an outline only the icons and labels were visible.
+
+Change-Id: I3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f
+---
+ .../GlobalActionsDialogLite.java              | 28 +++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/globalactions/GlobalActionsDialogLite.java b/packages/SystemUI/src/com/android/systemui/globalactions/GlobalActionsDialogLite.java
+index 2a12c0d5..e3d2f2ea 100644
+--- a/packages/SystemUI/src/com/android/systemui/globalactions/GlobalActionsDialogLite.java
++++ b/packages/SystemUI/src/com/android/systemui/globalactions/GlobalActionsDialogLite.java
+@@ -64,6 +64,7 @@ import android.graphics.Shader;
+ import android.graphics.Typeface;
+ import android.graphics.drawable.BitmapDrawable;
+ import android.graphics.drawable.Drawable;
++import android.graphics.drawable.GradientDrawable;
+ import android.media.AudioManager;
+ import android.os.Binder;
+ import android.os.Build;
+@@ -201,6 +202,24 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
+ 
+     private static final String TAG = "GlobalActionsDialogLite";
+ 
++    /**
++     * E-ink panels (debug.sysui.eink_palette=1): the menu and its buttons are as white as the
++     * screen behind them, and no dim layer sets them apart, so they get a solid outline.
++     */
++    private static final boolean EINK_OUTLINES =
++            SystemProperties.getBoolean("debug.sysui.eink_palette", false);
++
++    /** Outlines a view's shape background, without a tint, which would paint over the line. */
++    private static void einkOutline(View view) {
++        if (view == null || !(view.getBackground() instanceof GradientDrawable)) return;
++        final Context context = view.getContext();
++        final GradientDrawable background = (GradientDrawable) view.getBackground().mutate();
++        view.setBackgroundTintList(null);
++        background.setColor(context.getColor(R.color.materialColorSurface));
++        background.setStroke(Math.round(2 * context.getResources().getDisplayMetrics().density),
++                context.getColor(R.color.materialColorOnSurface));
++    }
++
+     private static final String INTERACTION_JANK_TAG = "global_actions";
+ 
+     private static final boolean SHOW_SILENT_TOGGLE = true;
+@@ -1089,6 +1108,11 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
+             icon.getDrawable().setTint(iconColor);
+             icon.setBackgroundTintList(ColorStateList.valueOf(backgroundColor));
+             v.setBackgroundTintList(ColorStateList.valueOf(backgroundColor));
++            if (EINK_OUTLINES) {
++                einkOutline(icon);
++                // einkOutline fills with materialColorSurface (same as onError in e-ink palette).
++                icon.getDrawable().setTint(v.getContext().getColor(R.color.materialColorOnSurface));
++            }
+             return v;
+         }
+ 
+@@ -2402,6 +2426,9 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
+                 }
+                 mIconView.setImageTintList(ColorStateList.valueOf(textAndIconColor));
+             }
++            if (EINK_OUTLINES && !isTv()) {
++                einkOutline(mIconView);
++            }
+ 
+             return v;
+         }
+@@ -3165,6 +3192,9 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
+                         getContext().getColor(R.color.materialColorSurfaceContainerLow)
+                 ));
+             }
++            if (EINK_OUTLINES) {
++                einkOutline(findViewById(R.id.list));
++            }
+ 
+             // If user entered from the lock screen and smart lock was enabled, disable it
+             int user = mSelectedUserInteractor.getSelectedUserId();
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,10 @@
+# Bring-up log collector, debug builds only (see hbdebug.sh).
+service hbdebug /system_ext/bin/hbdebug.sh
+    user root
+    group root log readproc
+    oneshot
+    disabled
+
+# /metadata is mounted in first stage; start early so the boot itself is logged.
+on post-fs
+    start hbdebug

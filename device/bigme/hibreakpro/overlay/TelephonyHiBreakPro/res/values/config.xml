@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The device's MMTEL (voice/SMS over IMS) service: MediaTek's IMS service from the stock
+         firmware (docs/volte.md). Telephony binds com.mediatek.ims.MtkDynamicImsService through
+         ImsResolver. No RCS package: RCS stays off. -->
+    <string name="config_ims_mmtel_package" translatable="false">com.mediatek.ims</string>
+</resources>

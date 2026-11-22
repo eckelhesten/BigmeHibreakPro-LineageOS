@@ -1,0 +1,60 @@
+From a30b90db13d9683e4e74e55e62e095c4d5139cb9 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 14 Nov 2026 14:47:55 +0100
+Subject: [PATCH 2/4] SystemUI: no notification stack animations on e-ink
+
+With debug.sysui.eink_palette=1 the notification stack keeps its
+animations off: heads-up notifications appear and leave at once, and
+notifications are added, removed and reordered without movement.
+
+Heads-up notifications slide in on a spring (PhysicsPropertyAnimator),
+which ignores the animator duration scale, so they kept animating on the
+Bigme HiBreak Pro even with all animation scales at 0. Every frame of
+that is a refresh of the e-ink panel.
+
+Change-Id: I5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7
+---
+ .../stack/NotificationStackScrollLayout.java         | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayout.java b/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayout.java
+index b38d6dde..f3bbed09 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayout.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayout.java
+@@ -60,6 +60,7 @@ import android.graphics.RenderNode;
+ import android.graphics.Shader;
+ import android.os.Bundle;
+ import android.os.SystemClock;
++import android.os.SystemProperties;
+ import android.os.Trace;
+ import android.util.AttributeSet;
+ import android.util.IndentingPrintWriter;
+@@ -265,8 +266,16 @@ public class NotificationStackScrollLayout
+     private final ArrayList<View> mSwipedOutViews = new ArrayList<>();
+     private NotificationStackSizeCalculator mNotificationStackSizeCalculator;
+     private final StackStateAnimator mStateAnimator;
++    /**
++     * E-ink panels (debug.sysui.eink_palette=1): notifications appear, move and go away without
++     * animation. Heads-up notifications otherwise slide in on a spring, which the animator
++     * duration scale does not shorten, and every frame of it is a panel refresh.
++     */
++    private static final boolean EINK_NO_ANIMATIONS =
++            SystemProperties.getBoolean("debug.sysui.eink_palette", false);
++
+     // TODO(b/332732878): call setAnimationsEnabled with scene container enabled, then remove this
+-    private boolean mAnimationsEnabled = SceneContainerFlag.isEnabled();
++    private boolean mAnimationsEnabled = SceneContainerFlag.isEnabled() && !EINK_NO_ANIMATIONS;
+     private boolean mChangePositionInProgress;
+     private boolean mChildTransferInProgress;
+ 
+@@ -3549,6 +3558,7 @@ public class NotificationStackScrollLayout
+     }
+ 
+     public void setAnimationsEnabled(boolean animationsEnabled) {
++        animationsEnabled &= !EINK_NO_ANIMATIONS;
+         // TODO(b/332732878): remove the initial value of this field once the setter is called
+         mAnimationsEnabled = animationsEnabled;
+         updateNotificationAnimationStates();
+-- 
+2.50.1 (Apple Git-155)
+

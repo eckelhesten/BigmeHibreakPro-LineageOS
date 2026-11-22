@@ -1,0 +1,10 @@
+# VoLTE through MediaTek's IMS service (docs/volte.md).
+#
+# The stock vendor declares video calling over LTE and Wi-Fi as supported. Its IMS service then
+# sets up video call providers through MediaTek's vtservice and media libraries, which live on
+# stock's system_ext and which we don't carry. Turn the capability off before the RIL and the IMS
+# service start (the RIL starts later, on vendor.ril.mtk=1), so the modem doesn't offer video and
+# the IMS service doesn't try. Voice and SMS over IMS are not affected.
+on post-fs-data
+    setprop persist.vendor.vilte_support 0
+    setprop persist.vendor.viwifi_support 0

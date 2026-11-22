@@ -1,0 +1,118 @@
+From a799bcfb0784a20c01c3e6f3c246958538eb39dd Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Fri, 13 Nov 2026 15:34:00 +0000
+Subject: [PATCH 1/4] SystemUI: e-ink options for the lock screen and
+ notifications
+
+Two property-controlled options, defaults unchanged:
+
+- debug.sysui.keyguard_scrim_alpha replaces the fixed 0.2 black
+  behind-scrim on the lock screen. On the Bigme HiBreak Pro e-ink panel
+  the dimmed white wallpaper turns into a dithered grey, and the backing
+  pills of high-contrast text show on it; the device sets 0.
+- debug.sysui.notification_outline_dp > 0 outlines notification cards
+  (black in light mode, white in dark mode), so they stand out on a
+  white background without relying on subtle surface tints.
+
+Change-Id: I18e829bce07d29ae88e1cd063aa9dba3a4fe9fb4
+---
+ .../row/NotificationBackgroundView.java       | 24 +++++++++++++++++++
+ .../statusbar/phone/ScrimController.java      | 18 +++++++++++++-
+ 2 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/notification/row/NotificationBackgroundView.java b/packages/SystemUI/src/com/android/systemui/statusbar/notification/row/NotificationBackgroundView.java
+index a1987581f..c7e6bc2ee 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/notification/row/NotificationBackgroundView.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/notification/row/NotificationBackgroundView.java
+@@ -21,7 +21,9 @@ import static com.android.systemui.util.ColorUtilKt.hexColorString;
+ 
+ import android.content.Context;
+ import android.content.res.ColorStateList;
++import android.content.res.Configuration;
+ import android.graphics.Canvas;
++import android.graphics.Color;
+ import android.graphics.Path;
+ import android.graphics.PorterDuff;
+ import android.graphics.PorterDuffColorFilter;
+@@ -30,6 +32,7 @@ import android.graphics.drawable.Drawable;
+ import android.graphics.drawable.GradientDrawable;
+ import android.graphics.drawable.LayerDrawable;
+ import android.graphics.drawable.RippleDrawable;
++import android.os.SystemProperties;
+ import android.util.AttributeSet;
+ import android.view.View;
+ 
+@@ -277,6 +280,7 @@ public class NotificationBackgroundView extends View implements Dumpable,
+         mBackground.mutate();
+         if (mBackground != null) {
+             mBackground.setCallback(this);
++            applyOutline();
+             setTint(mTintColor);
+         }
+         if (mBackground instanceof RippleDrawable) {
+@@ -286,6 +290,26 @@ public class NotificationBackgroundView extends View implements Dumpable,
+         invalidate();
+     }
+ 
++    /**
++     * debug.sysui.notification_outline_dp > 0 draws an outline around notification cards
++     * (black in light mode, white in dark mode). E-ink devices use it: tinted surfaces alone
++     * barely separate from the background there. The outline goes on the stateful layer, whose
++     * fill is set with setColor() (stroke untouched), not on the tinted base layer.
++     */
++    private void applyOutline() {
++        int dp = SystemProperties.getInt("debug.sysui.notification_outline_dp", 0);
++        if (dp <= 0 || !(mBackground instanceof LayerDrawable layers)
++                || layers.getNumberOfLayers() < 2
++                || !(layers.getDrawable(1) instanceof GradientDrawable stateful)) {
++            return;
++        }
++        boolean night = (mContext.getResources().getConfiguration().uiMode
++                & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
++        int px = Math.max(1, Math.round(dp * mContext.getResources().getDisplayMetrics().density));
++        stateful.mutate();
++        stateful.setStroke(px, night ? Color.WHITE : Color.BLACK);
++    }
++
+     public void setCustomBackground(int drawableResId) {
+         final Drawable d = mContext.getDrawable(drawableResId);
+         setCustomBackground(d);
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimController.java b/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimController.java
+index 0d953a3f5..7a319bd21 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimController.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimController.java
+@@ -33,6 +33,7 @@ import android.annotation.IntDef;
+ import android.annotation.SuppressLint;
+ import android.content.Context;
+ import android.graphics.Color;
++import android.os.SystemProperties;
+ import android.os.Handler;
+ import android.util.Log;
+ import android.util.MathUtils;
+@@ -212,7 +213,22 @@ public class ScrimController implements ViewTreeObserver.OnPreDrawListener, Dump
+     /**
+      * Default alpha value for most scrims.
+      */
+-    protected static final float KEYGUARD_SCRIM_ALPHA = 0.2f;
++    protected static final float KEYGUARD_SCRIM_ALPHA = keyguardScrimAlpha();
++
++    /**
++     * debug.sysui.keyguard_scrim_alpha overrides the default (0.2). E-ink devices set 0: a dimmed
++     * white wallpaper becomes a dithered grey, and high-contrast text then shows its backing
++     * pills on it.
++     */
++    private static float keyguardScrimAlpha() {
++        try {
++            float alpha = Float.parseFloat(
++                    SystemProperties.get("debug.sysui.keyguard_scrim_alpha", "0.2"));
++            return Math.max(0f, Math.min(1f, alpha));
++        } catch (NumberFormatException e) {
++            return 0.2f;
++        }
++    }
+ 
+     /**
+      * The default scrim under the shade and dialogs.
+-- 
+2.43.0
+

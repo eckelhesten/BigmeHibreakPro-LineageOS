@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 21 Nov 2026 10:39:04 +0100
+Subject: [PATCH] sf: e-ink damage covers the pass's reach; bounded finger-hold
+ FAST
+
+Two fixes on top of the motion fixes:
+
+- Client-target damage (debug.sf.hwc_client_target_damage) is padded by
+  how far the e-ink pass reads around a pixel: 3 r for the render pass's
+  full version (its outer ring), 2 r for the enhancement pass, nothing
+  for the per-pixel FAST and 16-level versions. Pixels next to a change
+  change too; without them a partial panel update (the composer does
+  rect commits when auto clean is off, and in the grey and clean modes)
+  left their old values as a fringe of up to 11 px around the change.
+  debug.sf.eink.damage_pad=0 turns the padding off for comparison.
+
+- A finger resting on a still screen keeps FAST for at most
+  debug.sf.eink_motion.touch_hold_ms (5000) after the motion ended; then
+  the screen is drawn once in the user's mode and the touch alone does
+  not bring FAST back until the next touch (the property's serial
+  changes). Before, a thumb resting while reading, or a touch whose up
+  never reached us, kept the panel in FAST's one-bit cheap pass for as
+  long as it lasted. Frames under the finger extend FAST only when they
+  come closer than debug.sf.eink_motion.touch_gap_ms (400) apart, so a
+  slow app being dragged stays fast but a blinking cursor does not.
+---
+ .../CompositionEngine/src/Output.cpp          | 40 +++++++++++++++--
+ .../DisplayHardware/EinkMotion.cpp            | 45 +++++++++++++++----
+ .../DisplayHardware/EinkMotion.h              | 12 +++++
+ 3 files changed, 86 insertions(+), 11 deletions(-)
+
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index 6e3fe18..e1b2107 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -56,6 +56,7 @@
+ 
+ #include <android-base/properties.h>
+ #include <sys/system_properties.h>
++#include <cmath>
+ #include <mutex>
+ #include <ui/DebugUtils.h>
+ #include <ui/HdrCapabilities.h>
+@@ -103,6 +104,10 @@ ScaleVector getScale(const Rect& from, const Rect& to) {
+             .y = static_cast<float>(to.height()) / from.height()};
+ }
+ 
++// E-ink (defined with the e-ink settings below): how far around a changed pixel the e-ink pass
++// changes the output.
++int32_t einkDamagePadding();
++
+ } // namespace
+ 
+ std::shared_ptr<Output> createOutput(
+@@ -1347,9 +1352,21 @@ void Output::finishFrame(GpuCompositionResult&& result) {
+     static const bool kClientTargetDamage =
+             base::GetBoolProperty("debug.sf.hwc_client_target_damage", false);
+     if (kClientTargetDamage) {
+-        const Region dirty = outputState.transform.transform(getDirtyRegion())
+-                                     .intersect(outputState.framebufferSpace.getBoundsAsRect());
+-        mRenderSurface->setBufferDamage(dirty);
++        Region dirty = outputState.transform.transform(getDirtyRegion());
++        // The e-ink pass reads a neighbourhood around each pixel, so pixels next to a change
++        // change too. Without them in the damage a partial panel update leaves their old values
++        // as a fringe around the changed area.
++        const int32_t pad =
++                getDisplayIdVariant().and_then(asPhysicalDisplayId) ? einkDamagePadding() : 0;
++        if (pad > 0) {
++            Region padded;
++            for (const Rect& r : dirty) {
++                padded.orSelf(Rect(r.left - pad, r.top - pad, r.right + pad, r.bottom + pad));
++            }
++            dirty = padded;
++        }
++        mRenderSurface->setBufferDamage(
++                dirty.intersect(outputState.framebufferSpace.getBoundsAsRect()));
+     }
+     // swap buffers (presentation)
+     mRenderSurface->queueBuffer(std::move(*optReadyFence), getHdrSdrRatio(buffer));
+@@ -1553,6 +1570,8 @@ struct EinkEnhance {
+     float minTone = 1.f;
+     bool knock = true;
+     bool invert = false;
++    // Client-target damage padded by the pass's reach (debug.sf.eink.damage_pad, default on).
++    bool damagePad = true;
+ };
+ 
+ float einkProp(const char* name, uint32_t def, float scale) {
+@@ -1589,6 +1608,7 @@ EinkEnhance getEinkEnhance() {
+                 base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.gate1_x1000", 800u) / 1000.f;
+         c.render = static_cast<int32_t>(
+                 base::GetUintProperty<uint32_t>("debug.sf.eink_render", 3u));
++        c.damagePad = base::GetBoolProperty("debug.sf.eink.damage_pad", true);
+         const uint32_t effectiveMode = (forceMode != 0) ? forceMode : mode;
+         if (c.render >= 3 && enhancePct > 0) {
+             // The panel's mode decides what the frame must become: NORMAL (DU, dithered by the
+@@ -1688,6 +1708,20 @@ EinkEnhance getEinkEnhance() {
+     return sConfig;
+ }
+ 
++// The render pass's full version reads its outer ring 3 r away (r = radius), the enhancement
++// pass 2 r; the FAST and 16-level versions work per pixel.
++int32_t einkDamagePadding() {
++    const EinkEnhance e = getEinkEnhance();
++    if (!e.damagePad) return 0;
++    float reach = 0.f;
++    if (e.render >= 3) {
++        reach = e.mode == 0 ? 3.f * e.radius : 0.f;
++    } else if (e.strength > 0.f) {
++        reach = 2.f * e.radius;
++    }
++    return reach > 0.f ? static_cast<int32_t>(std::ceil(reach)) + 1 : 0;
++}
++
+ } // namespace
+ 
+ renderengine::DisplaySettings Output::generateClientCompositionDisplaySettings(
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index 1ac7ed4..9c3269a 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -35,6 +35,8 @@ constexpr char kModeProperty[] = "vendor.xrz.global_refresh_mode";
+ constexpr char kForceModeProperty[] = "vendor.xrz.force_global_refresh_mode";
+ // The composer skips its panel update while this is 1 (it still presents the frame).
+ constexpr char kDisableCommitProperty[] = "vendor.xrz.disable_commit";
++// A finger is on the screen (system_server, DisplayPolicy).
++constexpr char kTouchProperty[] = "vendor.xrz.hibreak_touch";
+ 
+ uint32_t readUint(const prop_info* pi, uint32_t fallback) {
+     if (!pi) return fallback;
+@@ -87,8 +89,10 @@ void EinkMotion::reloadConfigIfChanged() {
+     // The first frames of a flick after idle would otherwise go out in the normal mode, which
+     // the kernel runs as a multi-pass update (~550 ms) that the FAST frames queue behind.
+     c.touchEnabled = c.motion && base::GetBoolProperty("debug.sf.eink_motion.touch", true);
+-    c.touchDown = c.touchEnabled &&
+-            base::GetBoolProperty("vendor.xrz.hibreak_touch", false);
++    c.touchDown = c.touchEnabled && base::GetBoolProperty(kTouchProperty, false);
++    c.touchHold =
++            ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.touch_hold_ms", 5000));
++    c.touchGap = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.touch_gap_ms", 400));
+     c.fastMode = base::GetUintProperty<uint32_t>("debug.sf.eink_motion.mode", 0xb3);
+     c.frames = std::max(2u, base::GetUintProperty<uint32_t>("debug.sf.eink_motion.frames", 3));
+     c.gap = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.gap_ms", 150));
+@@ -124,6 +128,12 @@ uint32_t EinkMotion::modeSerial() {
+     return mModeProp ? __system_property_serial(mModeProp) : 0u;
+ }
+ 
++uint32_t EinkMotion::touchSerial() {
++    // The property exists from the first touch on; every touch down and up writes it.
++    if (!mTouchProp) mTouchProp = __system_property_find(kTouchProperty);
++    return mTouchProp ? __system_property_serial(mTouchProp) : 0u;
++}
++
+ void EinkMotion::writeMode(uint32_t mode) {
+     base::SetProperty(kModeProperty, std::to_string(mode));
+     if (!mModeProp) mModeProp = __system_property_find(kModeProperty);
+@@ -196,6 +206,7 @@ void EinkMotion::onComposite(bool imeVisible) {
+     }
+     if (mConfig.sleep && mConfig.asleep != mAsleep) beginSleepTransition(mConfig.asleep, now);
+     const bool inCadence = mLastFrame != 0 && now - mLastFrame <= mConfig.gap;
++    const bool touchCadence = mLastFrame != 0 && now - mLastFrame <= mConfig.touchGap;
+     mStreak = inCadence ? mStreak + 1 : 1;
+     mLastFrame = now;
+     mImeVisible = imeVisible;
+@@ -216,10 +227,16 @@ void EinkMotion::onComposite(bool imeVisible) {
+         return;
+     }
+ 
+-    const bool wantFast = (mConfig.motion && mStreak >= mConfig.frames) || mConfig.touchDown ||
++    // A new touch (the property was written since the hold ran out) may start FAST again.
++    if (mTouchHoldExpired && touchSerial() != mExpiredTouchSerial) mTouchHoldExpired = false;
++    const bool motionFast = (mConfig.motion && mStreak >= mConfig.frames) ||
+             (mConfig.ime && imeVisible);
++    const bool touchFast = mConfig.touchDown && !mTouchHoldExpired;
++    const bool wantFast = motionFast || touchFast;
+     const uint32_t current = readMode();
+-    if (wantFast || (mFast && inCadence)) {
++    // Occasional frames under a resting finger (a cursor blink) don't extend the fast mode;
++    // the touch hold in the thread does that, for a bounded time.
++    if (motionFast || (mFast && inCadence) || (touchFast && touchCadence)) {
+         mMotionEnd = now;
+     }
+     if (mFast && (current != mWritten || modeSerial() != mWrittenSerial)) {
+@@ -234,6 +251,7 @@ void EinkMotion::onComposite(bool imeVisible) {
+         writeMode(mWritten);
+         mFast = true;
+         mMotionEnd = now;
++        mTouchHoldSince = 0;
+     }
+     // The thread ends the fast mode once the frames stop.
+     if (mFast) mCondition.notify_one();
+@@ -298,15 +316,26 @@ void EinkMotion::threadLoop() {
+             continue;
+         }
+         if (now < due) {
++            mTouchHoldSince = 0; // moving again
+             mCondition.wait_for(lock, std::chrono::nanoseconds(due - now));
+             continue;
+         }
+         // Keep FAST while a finger is still resting on the screen so the settle repaint does not
+-        // immediately re-enter FAST and oscillate every 700 ms.
+-        if (mConfig.touchEnabled && base::GetBoolProperty("vendor.xrz.hibreak_touch", false)) {
+-            mCondition.wait_for(lock, std::chrono::milliseconds(100));
+-            continue;
++        // immediately re-enter FAST and oscillate every 700 ms; but only for touchHold: a thumb
++        // resting while reading (or a touch that never ended for us) must not keep the screen in
++        // FAST's one-bit cheap pass. Once it has run out, the touch alone doesn't bring FAST back.
++        if (mConfig.touchEnabled && base::GetBoolProperty(kTouchProperty, false)) {
++            if (mTouchHoldSince == 0) mTouchHoldSince = now;
++            if (now - mTouchHoldSince < mConfig.touchHold) {
++                mCondition.wait_for(lock, std::chrono::milliseconds(100));
++                continue;
++            }
++            mTouchHoldExpired = true;
++            mExpiredTouchSerial = touchSerial();
++            ALOGI("finger resting for %d ms: back to the normal mode",
++                  static_cast<int>(ns2ms(now - mTouchHoldSince)));
+         }
++        mTouchHoldSince = 0;
+         // The screen is still: back to the user's mode, and one repaint in it.
+         if (readMode() == mWritten && modeSerial() == mWrittenSerial) writeMode(mBase);
+         mFast = false;
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index 45ffd58..33ae45d 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -64,6 +64,13 @@ private:
+         // frames composed meanwhile go FAST at once (debug.sf.eink_motion.touch, default on).
+         bool touchEnabled = true;
+         bool touchDown = false;
++        // A finger resting on the still screen keeps FAST for at most this long after the motion
++        // ended (debug.sf.eink_motion.touch_hold_ms); then the screen is drawn in the user's mode
++        // and the touch alone doesn't bring FAST back until the next touch.
++        nsecs_t touchHold = 0;
++        // With a finger down, frames closer together than this count as motion (a slow app being
++        // dragged); a cursor blink (500 ms) doesn't (debug.sf.eink_motion.touch_gap_ms).
++        nsecs_t touchGap = 0;
+         uint32_t fastMode = 0xb3; // debug.sf.eink_motion.mode
+         uint32_t frames = 3;     // debug.sf.eink_motion.frames
+         nsecs_t gap = 0;         // debug.sf.eink_motion.gap_ms
+@@ -87,6 +94,7 @@ private:
+     void reloadConfigIfChanged();
+     uint32_t readMode();
+     uint32_t modeSerial();
++    uint32_t touchSerial();
+     void writeMode(uint32_t mode);
+     bool isFast(uint32_t mode) const;
+     void threadLoop();
+@@ -100,6 +108,7 @@ private:
+     Config mConfig;
+     uint32_t mPropSerial = 0xffffffffu;
+     const prop_info* mModeProp = nullptr;
++    const prop_info* mTouchProp = nullptr;
+ 
+     nsecs_t mLastFrame = 0;
+     // Last timestamp that extends the FAST exit countdown (not reset by slow 500 ms cursor blinks).
+@@ -111,6 +120,9 @@ private:
+     uint32_t mBase = 0;    // the mode to put back
+     uint32_t mWritten = 0; // what we wrote, to notice when someone else changes the mode
+     uint32_t mWrittenSerial = 0;
++    nsecs_t mTouchHoldSince = 0;       // a resting finger holds FAST since then, 0 = no hold
++    bool mTouchHoldExpired = false;    // the hold ran out during this touch
++    uint32_t mExpiredTouchSerial = 0;  // vendor.xrz.hibreak_touch's serial when it ran out
+ 
+     bool mAsleep = false;         // the last vendor.xrz.hibreak_sleep acted on
+     bool mFrozen = false;         // the composer's panel updates are held back
+-- 
+2.50.1 (Apple Git-155)
+

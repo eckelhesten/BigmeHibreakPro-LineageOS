@@ -1,0 +1,4 @@
+# E-ink data read by the stock vendor composer
+/system/eink_key            u:object_r:xrz_system_file:s0
+/system/etc/g_c001          u:object_r:xrz_system_file:s0
+/system/etc/g_c002          u:object_r:xrz_system_file:s0

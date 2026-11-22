@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sleep screen weather conditions; the rest of HiBreakParts is English only. -->
+<resources>
+    <string name="weather_clear">Bezchmurnie</string>
+    <string name="weather_partly_cloudy">Małe zachmurzenie</string>
+    <string name="weather_cloudy">Pochmurno</string>
+    <string name="weather_fog">Mgła</string>
+    <string name="weather_drizzle">Mżawka</string>
+    <string name="weather_rain">Deszcz</string>
+    <string name="weather_showers">Przelotne opady</string>
+    <string name="weather_snow">Śnieg</string>
+    <string name="weather_thunderstorm">Burza</string>
+    <string name="sleep_calendar_no_title">(Bez tytułu)</string>
+</resources>

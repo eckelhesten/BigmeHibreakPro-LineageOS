@@ -1,0 +1,105 @@
+# XRZ e-ink policy default normally set by Bigme's system build (ro.* must be set at build time)
+ro.vendor.xrz.default_refresh_mode=178
+
+# E-ink: no blur, monochrome panel (no wide colour or HDR); animations are on per Defaults v7
+ro.sf.blurs_are_expensive=1
+ro.surface_flinger.supports_background_blur=0
+ro.surface_flinger.has_wide_color_display=false
+ro.surface_flinger.has_HDR_display=false
+
+# The vendor e-ink HWC treats HWC2 "whole layer damaged" (zero rects) as "no change" and skips the
+# commit, which freezes any producer that passes no damage (boot animation, GL). Our
+# frameworks/native patch sends the buffer bounds explicitly instead.
+debug.sf.hwc_explicit_full_damage=1
+
+# Compose everything on the GPU. The vendor HWC rotates app layers (panel is landscape-native,
+# primary_display_orientation=270) through the MDP blit engine, whose fence wait never completes,
+# so the panel freezes after the boot animation. frameworks/native patch 0003 adds this property.
+debug.sf.force_client_composition=1
+
+# With forced GPU composition, tell the composer which part of the frame changed, so it can do
+# partial panel updates (e.g. only the keyboard area). frameworks/native patch 0004.
+debug.sf.hwc_client_target_damage=1
+
+# Lock screen: no dark scrim over the (white) wallpaper. frameworks/base patch 0001.
+debug.sysui.keyguard_scrim_alpha=0
+# Notification cards get a 2 dp black outline (white in dark mode). Same patch.
+debug.sysui.notification_outline_dp=2
+# Two-tone (black/white) system palette instead of the wallpaper-derived one. frameworks/base patch 0002.
+# The same switch: e-ink battery icon (0003), outlined quick settings tiles (0004), notifications
+# that appear and move without animation (0006), an outlined brightness slider (0007), and in
+# Launcher3 plain white scrims with outlined recents cards, popups and search box (patch 0002).
+debug.sysui.eink_palette=1
+# Text in pure black or white by its lightness, with no backdrop (unlike high-contrast text, whose
+# backing rectangles show as grey pills). frameworks/base patch 0009.
+debug.hwui.eink_text=1
+# Text rasterised straight to black and white, grid-fitted by FreeType's autohinter, so stems are
+# even (anti-aliased glyphs thresholded later came out 2 or 3 px at random). 0 = anti-aliased,
+# 1 = 1-bit unhinted, 2 = 1-bit hinted, 3 = 2 in fake bold. frameworks/base 0021. Faded text
+# (hints, disabled) is raised to 70 % alpha: a dense grey instead of a few specks.
+debug.hwui.eink_glyphs=2
+debug.hwui.eink_text_faded_alpha=70
+# No dim layer behind dialogs and popups; they get a solid outline instead. frameworks/base patch 0005.
+debug.eink.windows=1
+# Own e-ink engine in SurfaceFlinger (frameworks/native patch 0005), read at boot. Off: the vendor
+# composer sends whole-panel updates, the only kind the kernel runs on its fast, self-cleaning
+# path (docs/eink-stock-policy.md). The engine's partial updates are slower and ghost.
+debug.sf.eink_engine=0
+# Fast e-ink mode (A2, ~36 ms per frame) while the screen moves or the keyboard is up, the
+# chosen mode again once it is still. frameworks/native patch 0006; the two triggers have
+# switches in HiBreakParts (vendor.xrz.hibreak_motion_fast, vendor.xrz.hibreak_ime_fast).
+debug.sf.eink_motion=1
+# The panel's real density (6.13", 824x1648 = 300 ppi). The composer reports 667.61 x 188.55 dpi,
+# which made SystemUI's falsing check send swipes up on the lock screen back from the bouncer.
+# frameworks/native patch 0010.
+debug.sf.dpi_override=300
+
+# Sleep screen: SystemUI covers the always-on display with its e-ink sleep screen (clock, date,
+# notification icons; frameworks/base EinkSleepScreen), and SurfaceFlinger holds the panel while
+# the phone goes to sleep or wakes up, so it shows one clean change instead of every step
+# (frameworks/native EinkMotion, debug.sf.eink_sleep.* to tune).
+debug.sysui.eink_sleep=1
+debug.sf.eink_sleep=1
+# Black-and-white rendering for every app (frameworks/native, SurfaceFlinger's e-ink pass): text,
+# icons and lines of any colour become solid black or white (each pixel goes to the darkest or
+# lightest value around it), anti-aliased edges become hard, flat areas and photos are left to
+# the panel's dither; it never pushes a side to pure black (0012: that smeared white labels on
+# coloured buttons). Strength in percent, 0 = off; frameworks/native 0009, 0011, 0012,
+# debug.sf.eink_enhance.{radius_x10,t1_x1000,
+# t2_x1000,solid1_x1000,solid2_x1000,gate0_x1000,gate1_x1000} to tune.
+debug.sf.eink_enhance=100
+# Since 2026-11-20 the pass renders the frame as the panel will show it (frameworks/native 0013):
+# grey text of any weight solid, faint cards, fields and separators kept as 1-px outlines, light
+# greys bleached and dark greys crushed (HiBreakParts' contrast setting), then a blue-noise
+# dither to pure black and white (16 exact levels in the grey modes; FAST gets a cheap version).
+# 2 = the enhancement pass above, for comparison. Scored offline and on camera with
+# scripts/eink-bench; tunables debug.sf.eink.* (see the patch).
+debug.sf.eink_render=3
+# Tone curve of the render pass, measured on camera with a grey ramp (scripts/eink-bench/calib.py,
+# 2026-11-20): the blue-noise dither has little dot gain, so a power of 2.0 (2.4 for HD's 16
+# greys) brings an app's grey closest to its lightness on an LCD (error 0.10, was 0.15).
+debug.sf.eink.gamma_x100=200
+debug.sf.eink.gamma16_x100=240
+# FAST frames: the cheap pass while scrolling (steadier: 0-2 % of panel frames without new content
+# instead of 25 %), the full pass while the keyboard is up (frameworks/native 0014).
+debug.sf.eink.fast_full=2
+# The kernel's dither is redundant behind the render pass (0/255 pass it unchanged), but it stays
+# on: on 2026-11-20 the panel once showed several frames stacked (an image viewer opening over a
+# Wikipedia article, its black background never drawn), not reproduced in six tries, and with the
+# dither off (0, init.hibreakpro.eink.rc writes global_dither 5) the kernel runs a path we can't
+# see into. Turning it off saved no measurable CPU.
+debug.sf.eink_kernel_dither=1
+# Touch boost: the power HAL's LAUNCH mode (full clocks) from a touch down until 250 ms after
+# the finger lifts, at most 2 s; page turns otherwise ran at the floor clocks and the first one
+# after reading a page lagged. frameworks/base 0020; 0 turns it off.
+debug.eink.touch_boost_ms=250
+# No touch ripples (dither patterns flickering through several refreshes per touch) and no
+# elevation shadows (bands of dither noise around cards and dialogs). frameworks/base.
+debug.eink.no_ripple=1
+debug.hwui.eink_no_shadow=1
+
+# VoLTE (docs/volte.md): MediaTek modems set up the IMS PDN only for a modem-cognitive IMS profile
+# with id 2 (RILConstants.DATA_PROFILE_IMS). IMS-only APNs from the APN database have neither,
+# so frameworks/opt/telephony 0002 sends them with this id; -1 or unset keeps AOSP behaviour.
+# persist.debug.telephony.ims_apn_profile_id overrides it at runtime for testing.
+ro.telephony.ims_apn_profile_id=2

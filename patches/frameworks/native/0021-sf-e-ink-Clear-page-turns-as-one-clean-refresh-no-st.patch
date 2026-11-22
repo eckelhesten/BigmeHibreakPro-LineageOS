@@ -1,0 +1,206 @@
+From 1555d520cf0101e37da394ae2011f46183056a72 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sun, 22 Nov 2026 15:32:49 +0000
+Subject: [PATCH] sf: e-ink Clear: page turns as one clean refresh, no stale
+ motion streak
+
+Clear (CLEAN, GC16) in Kindle: a page turn is ~8 frames in 150-250 ms
+after the tap. They went FAST (A2 dots), and the clean refresh came
+1.5-2 s after the tap: 700 ms after the last frame, plus another 700 ms
+when the composer s own idle refresh (~0.65 s after the last frame, no
+new content) inherited the motion streak and held FAST again.
+
+- A frame continues a motion streak only if it counts (enough of the
+  screen changed, or a recent touch); a composite without new content
+  no longer extends FAST, in every mode.
+- In a flashing mode (0xb0, 0x04), new content without a finger down
+  or the keyboard is held back (vendor.xrz.disable_commit) from its
+  first frame until the frames stop for
+  debug.sf.eink_motion.clean_quiet_ms (100), then shown with the
+  one-shot in that mode: one GC16 of the finished page. Motion that
+  lasts longer than debug.sf.eink_motion.clean_hold_ms (600, 0 = off),
+  a finger or the keyboard goes FAST as before.
+
+Change-Id: I2c1b357dc589b6d0b76b0676928d4001d996c2dd
+---
+ .../DisplayHardware/EinkMotion.cpp            | 84 ++++++++++++++++++-
+ .../DisplayHardware/EinkMotion.h              | 12 +++
+ 2 files changed, 95 insertions(+), 1 deletion(-)
+
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index ad0a376..1c9ee53 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -104,6 +104,12 @@ void EinkMotion::reloadConfigIfChanged() {
+     c.touchRecent =
+             ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.touch_recent_ms", 2000));
+     c.settleForce = base::GetBoolProperty("debug.sf.eink_motion.settle_force", true);
++    // Kindle's page turn: ~8 frames in 150-250 ms after the tap. Held, it is one GC16 of the new
++    // page ~0.4 s after the tap; in FAST it was A2 dots, then the GC16 1.5-2 s after the tap.
++    c.cleanHold =
++            ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.clean_hold_ms", 600));
++    c.cleanQuiet =
++            ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.clean_quiet_ms", 100));
+     c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true) &&
+             !base::GetBoolProperty("debug.sf.eink_engine", false);
+     c.asleep = base::GetBoolProperty("vendor.xrz.hibreak_sleep", false);
+@@ -151,6 +157,23 @@ bool EinkMotion::isFast(uint32_t mode) const {
+     return m == (mConfig.fastMode & 0xff) || m == 0xb3 || m == 0x10 || m == 0x11;
+ }
+ 
++bool EinkMotion::isFlashing(uint32_t mode) {
++    // Clear: CLEAN as a policy mode, or GC16 as a raw waveform. Every update flashes the panel.
++    const uint32_t m = mode & 0xff;
++    return m == 0xb0 || m == 0x04;
++}
++
++void EinkMotion::beginTurnHold(uint32_t turnBase, nsecs_t now) {
++    // The composer presents the frames but leaves the panel alone until the thread lets it go.
++    mTurnBase = turnBase;
++    mFrozen = true;
++    mFreezeForTurn = true;
++    mFreezeForSleep = false;
++    mFreezeStart = now;
++    base::SetProperty(kDisableCommitProperty, "1");
++    mCondition.notify_one();
++}
++
+ void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now) {
+     mAsleep = asleep;
+     const uint32_t current = readMode();
+@@ -178,6 +201,7 @@ void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now) {
+     base::SetProperty(kDisableCommitProperty, "1");
+     mForceArmed = false;
+     mFrozen = true;
++    mFreezeForTurn = false; // a held page turn is shown with the sleep or wake picture
+     mFreezeForSleep = asleep;
+     mFreezeStart = now;
+     ALOGI("%s: panel held", asleep ? "going to sleep" : "waking up");
+@@ -241,6 +265,10 @@ void EinkMotion::onComposite(bool imeVisible, float damage) {
+         base::SetProperty("vendor.xrz.hibreak_ime_visible", imeVisible ? "1" : "0");
+     }
+     if (mFrozen) {
++        // A finger or the keyboard during a held page turn: that is interaction, show it FAST.
++        if (mFreezeForTurn && (mConfig.touchDown || (mConfig.ime && imeVisible))) {
++            mFreezeStart = now - mConfig.cleanHold;
++        }
+         // The thread lets the panel go once the frames stop.
+         mCondition.notify_one();
+         return;
+@@ -253,7 +281,10 @@ void EinkMotion::onComposite(bool imeVisible, float damage) {
+ 
+     // A new touch (the property was written since the hold ran out) may start FAST again.
+     if (mTouchHoldExpired && touchSerial() != mExpiredTouchSerial) mTouchHoldExpired = false;
+-    const bool motionFast = (mConfig.motion && mStreak >= mConfig.frames) ||
++    // Only a frame that counts continues a streak: a composite without new content (the
++    // composer's own idle refresh ~0.65 s after the last frame) used to inherit the streak of the
++    // last motion and held FAST for another end_ms, so Clear's clean refresh came ~1.4 s late.
++    const bool motionFast = (mConfig.motion && counts && mStreak >= mConfig.frames) ||
+             (mConfig.ime && imeVisible);
+     const bool touchFast = mConfig.touchDown && !mTouchHoldExpired;
+     const bool wantFast = motionFast || touchFast;
+@@ -269,6 +300,17 @@ void EinkMotion::onComposite(bool imeVisible, float damage) {
+         mBase = current;
+         mFast = false;
+     }
++    // Clear: new content is held from its first frame on and shown in one clean refresh once
++    // its frames stop (a page turn: one GC16 of the new page). From the first frame: the composer
++    // decides about a frame when it arrives, so a hold that began with the third frame still let
++    // the first go out as a GC16 of its own. Not with a finger down (a drag follows the finger),
++    // with the keyboard up, or for the repaint that shows a hold (no new content).
++    if (!mFast && damage > 0.f && counts && !touchFast && !(mConfig.ime && imeVisible) &&
++        mConfig.cleanHold > 0 && mConfig.sleep && isFlashing(current) &&
++        now - mTurnReleased > ms2ns(150)) {
++        beginTurnHold(current, now);
++        return;
++    }
+     if (wantFast && !mFast && !isFast(current)) {
+         mBase = current;
+         mWritten = mConfig.fastMode;
+@@ -284,6 +326,46 @@ void EinkMotion::onComposite(bool imeVisible, float damage) {
+ void EinkMotion::threadLoop() {
+     std::unique_lock lock(mMutex);
+     while (true) {
++        if (mFrozen && mFreezeForTurn) {
++            const nsecs_t now = systemTime();
++            const nsecs_t quietAt = mLastFrame + mConfig.cleanQuiet;
++            const nsecs_t due = std::min(quietAt, mFreezeStart + mConfig.cleanHold);
++            if (now < due) {
++                mCondition.wait_for(lock, std::chrono::nanoseconds(due - now));
++                continue;
++            }
++            const bool moving = now < quietAt;
++            mFrozen = false;
++            mFreezeForTurn = false;
++            // The composer lost the damage of the frames it held back: the first picture after
++            // the hold goes out with the one-shot, in the mode it is meant for.
++            if (moving) {
++                // Longer motion (an animated scroll, a finger): FAST from here, then the usual
++                // settle into Clear.
++                mBase = mTurnBase;
++                mWritten = mConfig.fastMode;
++                writeMode(mWritten);
++                mFast = true;
++                mMotionEnd = now;
++                mTouchHoldSince = 0;
++                base::SetProperty(kForceModeProperty, std::to_string(mConfig.fastMode));
++            } else {
++                base::SetProperty(kForceModeProperty, std::to_string(mTurnBase));
++                mStreak = 0;
++                mLastMotionFrame = 0;
++            }
++            mSettleArmed = now;
++            mTurnReleased = now;
++            base::SetProperty(kDisableCommitProperty, "0");
++            ALOGI("page turn held %d ms: %s", static_cast<int>(ns2ms(now - mFreezeStart)),
++                  moving ? "still moving, fast" : "shown clean");
++            mLastFrame = 0; // the repaint must not count as motion
++            const auto repaint = mRepaint;
++            lock.unlock();
++            if (repaint) repaint();
++            lock.lock();
++            continue;
++        }
+         if (mFrozen) {
+             const nsecs_t now = systemTime();
+             const nsecs_t minHold = mFreezeForSleep ? mConfig.sleepMin : mConfig.wakeMin;
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index 871214c..b411a56 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -86,6 +86,13 @@ private:
+         // (debug.sf.eink_motion.settle_force): the composer skips a repaint without new buffers,
+         // so without it the panel kept the last FAST frame until its own idle refresh.
+         bool settleForce = true;
++        // Clear (GC16, flashing): new content without a finger on the screen (a page turn) is
++        // held back from its first frame and shown as one clean refresh once its frames stop for
++        // cleanQuiet, instead of FAST frames and a clean refresh 0.7 s later
++        // (debug.sf.eink_motion.clean_hold_ms, 0 = FAST as in the other modes). Motion that goes
++        // on for longer than the hold goes FAST.
++        nsecs_t cleanHold = 0;
++        nsecs_t cleanQuiet = 0;  // debug.sf.eink_motion.clean_quiet_ms
+ 
+         // Sleep screen (see the class comment). vendor.xrz.hibreak_sleep is set by
+         // system_server; the rest are debug.sf.eink_sleep.* for tuning without a build.
+@@ -108,6 +115,8 @@ private:
+     uint32_t touchSerial();
+     void writeMode(uint32_t mode);
+     bool isFast(uint32_t mode) const;
++    static bool isFlashing(uint32_t mode);
++    void beginTurnHold(uint32_t turnBase, nsecs_t now);
+     void threadLoop();
+     void beginSleepTransition(bool asleep, nsecs_t now);
+     void applySleepMode();
+@@ -141,6 +150,9 @@ private:
+     bool mAsleep = false;         // the last vendor.xrz.hibreak_sleep acted on
+     bool mFrozen = false;         // the composer's panel updates are held back
+     bool mFreezeForSleep = false; // the freeze is for going to sleep (not for waking up)
++    bool mFreezeForTurn = false;  // the freeze holds a short animation in Clear (a page turn)
++    uint32_t mTurnBase = 0;       // the flashing mode the held animation is shown in
++    nsecs_t mTurnReleased = 0;    // when the last hold was let go
+     nsecs_t mFreezeStart = 0;
+     bool mSleepModeSet = false;   // the property holds our sleep mode
+     uint32_t mSleepBase = 0;      // the mode to put back when waking up
+-- 
+2.43.0
+

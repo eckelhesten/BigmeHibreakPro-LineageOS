@@ -1,0 +1,63 @@
+From 469f98c8d1ca3090300981e0fd4463a8eb4000c3 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Mon, 16 Nov 2026 12:15:20 +0000
+Subject: [PATCH] sf: fast e-ink mode at once for frames composed while a
+ finger is down
+
+After a few seconds idle, the first frames of a flick went out in the
+normal mode until three frames had followed each other. The kernel runs
+a normal-mode update as several passes (~550 ms), and the FAST frames
+queue behind it: the first flick after idle lagged by ~0.6 s (measured:
+first fast frame at 730-800 ms, 136 ms with FAST set beforehand).
+
+system_server now sets vendor.xrz.hibreak_touch while a finger is on the
+screen, and frames composed meanwhile switch to FAST at once.
+debug.sf.eink_motion.touch=0 turns this off.
+
+Change-Id: If2dc2000a3a011f96de94ecb34bbf545ccb46938
+---
+ services/surfaceflinger/DisplayHardware/EinkMotion.cpp | 6 +++++-
+ services/surfaceflinger/DisplayHardware/EinkMotion.h   | 3 +++
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index a50f3ce..63aa5d1 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -75,6 +75,10 @@ void EinkMotion::reloadConfigIfChanged() {
+     Config c;
+     c.motion = base::GetBoolProperty("vendor.xrz.hibreak_motion_fast", true);
+     c.ime = base::GetBoolProperty("vendor.xrz.hibreak_ime_fast", true);
++    // The first frames of a flick after idle would otherwise go out in the normal mode, which
++    // the kernel runs as a multi-pass update (~550 ms) that the FAST frames queue behind.
++    c.touchDown = c.motion && base::GetBoolProperty("debug.sf.eink_motion.touch", true) &&
++            base::GetBoolProperty("vendor.xrz.hibreak_touch", false);
+     c.fastMode = base::GetUintProperty<uint32_t>("debug.sf.eink_motion.mode", 0xb3);
+     c.frames = std::max(2u, base::GetUintProperty<uint32_t>("debug.sf.eink_motion.frames", 3));
+     c.gap = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.gap_ms", 150));
+@@ -108,7 +112,7 @@ void EinkMotion::onComposite(bool imeVisible) {
+     mLastFrame = now;
+     mImeVisible = imeVisible;
+ 
+-    const bool wantFast = (mConfig.motion && mStreak >= mConfig.frames) ||
++    const bool wantFast = (mConfig.motion && mStreak >= mConfig.frames) || mConfig.touchDown ||
+             (mConfig.ime && imeVisible);
+     const uint32_t current = readMode();
+     if (mFast && current != mWritten) {
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index f427271..7d40b48 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -50,6 +50,9 @@ private:
+     struct Config {
+         bool motion = true;      // vendor.xrz.hibreak_motion_fast
+         bool ime = true;         // vendor.xrz.hibreak_ime_fast
++        // A finger is on the screen (vendor.xrz.hibreak_touch, set by system_server), and
++        // frames composed meanwhile go FAST at once (debug.sf.eink_motion.touch, default on).
++        bool touchDown = false;
+         uint32_t fastMode = 0xb3; // debug.sf.eink_motion.mode
+         uint32_t frames = 3;     // debug.sf.eink_motion.frames
+         nsecs_t gap = 0;         // debug.sf.eink_motion.gap_ms
+-- 
+2.43.0
+

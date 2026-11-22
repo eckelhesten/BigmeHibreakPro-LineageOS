@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HiBreak parts</string>
+    <string name="settings_title">E-ink &amp; front light</string>
+    <string name="settings_summary">Refresh modes, per-app modes, front light, side keys</string>
+
+    <string name="tile_refresh">Refresh screen</string>
+    <string name="tile_mode">E-ink mode</string>
+    <string name="tile_warmth">Light warmth</string>
+    <string name="warmth_value">%1$d%% warm</string>
+
+    <string name="mode_default">Default</string>
+    <string name="mode_clear">Clear</string>
+    <string name="mode_balanced">Balanced</string>
+    <string name="mode_fast">Fast</string>
+    <string name="mode_global">Use global mode</string>
+    <string name="mode_inverted">Default, colours inverted (for dark apps)</string>
+
+    <string name="cat_sleep">Sleep screen</string>
+    <string name="sleep_title">Weather and calendar</string>
+    <string name="sleep_summary">Shown at the bottom of the screen while the phone sleeps</string>
+    <string name="sleep_cat_weather">Weather</string>
+    <string name="sleep_weather">Show weather</string>
+    <string name="sleep_weather_summary">City, icon, temperature and condition</string>
+    <string name="sleep_weather_city">City</string>
+    <string name="sleep_weather_city_none">Not set</string>
+    <string name="sleep_weather_city_hint">Name of a city or town</string>
+    <string name="sleep_weather_search">Search</string>
+    <string name="sleep_weather_searching">Searching…</string>
+    <string name="sleep_weather_no_match">No place called “%1$s” found</string>
+    <string name="sleep_weather_error">Could not reach the weather service. Check the connection.</string>
+    <string name="sleep_weather_unit">Unit</string>
+    <string name="sleep_weather_celsius">Celsius (°C)</string>
+    <string name="sleep_weather_fahrenheit">Fahrenheit (°F)</string>
+    <string name="sleep_weather_source">Weather from Open-Meteo (open-meteo.com). The city search and, about once an hour, the city’s coordinates are sent there; nothing else.</string>
+    <string name="sleep_cat_calendar">Calendar</string>
+    <string name="sleep_calendar">Show next event</string>
+    <string name="sleep_calendar_summary">From every calendar on the phone that is set to visible</string>
+    <string name="sleep_calendar_no_title">(No title)</string>
+    <!-- Weather conditions on the sleep screen (WMO codes, Weather.condition) -->
+    <string name="weather_clear">Clear</string>
+    <string name="weather_partly_cloudy">Partly cloudy</string>
+    <string name="weather_cloudy">Cloudy</string>
+    <string name="weather_fog">Fog</string>
+    <string name="weather_drizzle">Drizzle</string>
+    <string name="weather_rain">Rain</string>
+    <string name="weather_showers">Showers</string>
+    <string name="weather_snow">Snow</string>
+    <string name="weather_thunderstorm">Thunderstorm</string>
+    <string-array name="sleep_unit_entries">
+        <item>@string/sleep_weather_celsius</item>
+        <item>@string/sleep_weather_fahrenheit</item>
+    </string-array>
+    <string-array name="sleep_unit_values">
+        <item>c</item>
+        <item>f</item>
+    </string-array>
+
+    <string name="cat_frontlight">Front light</string>
+    <string name="frontlight_enabled">Front light</string>
+    <string name="frontlight_enabled_summary">Brightness is set with the normal brightness slider</string>
+    <string name="frontlight_warmth">Warmth</string>
+
+    <string name="cat_text">Text and motion</string>
+    <string name="text_bold">Bold text</string>
+    <string name="text_bold_summary">Heavier strokes read better on e-ink</string>
+    <string name="no_animations">No animations</string>
+    <string name="no_animations_summary">Turn off window, transition and app animations</string>
+    <string name="cat_eink">E-ink display</string>
+    <string name="eink_mode">Refresh mode</string>
+    <string name="eink_motion_fast">Smooth scrolling</string>
+    <string name="eink_motion_fast_summary">Fast mode while the screen moves: pictures turn black and white until it stops</string>
+    <string name="eink_fast_greys">Greys in Fast mode</string>
+    <string name="eink_fast_greys_summary">Fast mode and scrolling draw greys instead of black and white dots: smoother text and pictures at the same speed</string>
+    <string name="eink_ime_fast">Fast typing</string>
+    <string name="eink_ime_fast_summary">Fast mode while the keyboard is open</string>
+    <string name="eink_contrast">Contrast</string>
+    <string name="contrast_off">Off</string>
+    <string name="contrast_medium">Medium</string>
+    <string name="contrast_strong">Strong</string>
+    <string name="eink_clean">Clear ghosting</string>
+    <string name="clean_manual">Only when asked</string>
+    <string name="clean_unlock">After unlocking</string>
+    <string name="clean_every4">After unlocking and every 4th app switch</string>
+    <string name="clean_every">After unlocking and every app switch</string>
+    <string name="eink_refresh_now">Refresh screen now</string>
+    <string name="eink_refresh_now_summary">One full refresh to clear ghosting</string>
+    <string name="eink_auto_clean">Automatic clean refresh</string>
+    <string name="eink_auto_clean_summary">The panel removes ghosting itself after each change. Off makes the screen slower and leaves ghosts</string>
+    <string name="eink_anti_flicker">Reduce flicker</string>
+    <string name="eink_app_modes">Per-app refresh modes</string>
+    <string name="eink_app_modes_summary">Use a different refresh mode while an app is in front</string>
+
+    <string name="cat_keys">Side keys</string>
+    <string name="key_f1">Key 1 (F1)</string>
+    <string name="key_f2">Key 2 (F2)</string>
+    <string name="key_pick_app">Choose app</string>
+
+    <string name="action_none">Do nothing</string>
+    <string name="action_eink_refresh">Refresh screen</string>
+    <string name="action_eink_mode">Next e-ink mode</string>
+    <string name="action_frontlight">Front light on/off</string>
+    <string name="action_flashlight">Flashlight on/off</string>
+    <string name="action_screenshot">Screenshot</string>
+    <string name="action_camera">Open camera</string>
+    <string name="action_notifications">Open notifications</string>
+    <string name="action_app">Launch an app…</string>
+    <string name="action_app_named">Launch %1$s</string>
+
+    <string-array name="mode_entries">
+        <item>@string/mode_default</item>
+        <item>@string/mode_clear</item>
+        <item>@string/mode_balanced</item>
+        <item>@string/mode_fast</item>
+    </string-array>
+    <string-array name="mode_values">
+        <item>0</item>
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+    </string-array>
+    <string-array name="contrast_entries">
+        <item>@string/contrast_off</item>
+        <item>@string/contrast_medium</item>
+        <item>@string/contrast_strong</item>
+    </string-array>
+    <string-array name="contrast_values">
+        <item>0</item>
+        <item>1</item>
+        <item>2</item>
+    </string-array>
+    <string-array name="clean_entries">
+        <item>@string/clean_manual</item>
+        <item>@string/clean_unlock</item>
+        <item>@string/clean_every4</item>
+        <item>@string/clean_every</item>
+    </string-array>
+    <string-array name="clean_values">
+        <item>-1</item>
+        <item>0</item>
+        <item>4</item>
+        <item>1</item>
+    </string-array>
+    <string-array name="app_mode_entries">
+        <item>@string/mode_global</item>
+        <item>@string/mode_default</item>
+        <item>@string/mode_clear</item>
+        <item>@string/mode_balanced</item>
+        <item>@string/mode_fast</item>
+        <item>@string/mode_inverted</item>
+    </string-array>
+    <string-array name="app_mode_values">
+        <item>-1</item>
+        <item>0</item>
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+        <item>4</item>
+    </string-array>
+    <string-array name="key_action_entries">
+        <item>@string/action_none</item>
+        <item>@string/action_eink_refresh</item>
+        <item>@string/action_eink_mode</item>
+        <item>@string/action_frontlight</item>
+        <item>@string/action_flashlight</item>
+        <item>@string/action_screenshot</item>
+        <item>@string/action_camera</item>
+        <item>@string/action_notifications</item>
+        <item>@string/action_app</item>
+    </string-array>
+    <string-array name="key_action_values">
+        <item>none</item>
+        <item>eink_refresh</item>
+        <item>eink_mode</item>
+        <item>frontlight</item>
+        <item>flashlight</item>
+        <item>screenshot</item>
+        <item>camera</item>
+        <item>notifications</item>
+        <item>app</item>
+    </string-array>
+</resources>

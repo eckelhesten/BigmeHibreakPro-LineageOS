@@ -1,0 +1,55 @@
+name: hcloud-janitor
+
+# Cost guard: delete any CI build server (label hibreak=ci) older than 6 hours, in case a
+# build job died without cleaning up. Hetzner bills stopped servers too, so delete, never stop.
+on:
+  schedule: [{ cron: "17 * * * *" }]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      HCLOUD_VERSION: v1.70.2
+      MAX_AGE_HOURS: 6
+      KEY_GRACE_SECONDS: 900
+    steps:
+      - name: Install hcloud CLI
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          curl -fsSL "https://github.com/hetznercloud/cli/releases/download/${HCLOUD_VERSION}/hcloud-linux-amd64.tar.gz" -o "$tmp/hcloud-linux-amd64.tar.gz"
+          curl -fsSL "https://github.com/hetznercloud/cli/releases/download/${HCLOUD_VERSION}/checksums.txt" -o "$tmp/checksums.txt"
+          expected=$(awk '$2 ~ /^(\.\/)?hcloud-linux-amd64\.tar\.gz$/ { print $1 }' "$tmp/checksums.txt")
+          [ -n "$expected" ]
+          echo "$expected  $tmp/hcloud-linux-amd64.tar.gz" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f "$tmp/hcloud-linux-amd64.tar.gz" hcloud
+      - name: Delete stale build servers and keys
+        run: |
+          set -euo pipefail
+          now=$(date +%s)
+          servers_json=$(hcloud server list -l hibreak=ci -o json)
+          jq -r '.[] | "\(.name)\t\(.labels.created | tonumber? // 0)"' <<<"$servers_json" |
+          while IFS=$'\t' read -r name created; do
+            (( created > 0 )) || continue
+            age=$(( (now - created) / 3600 ))
+            if (( age >= MAX_AGE_HOURS )); then
+              echo "deleting $name (${age} h old)"
+              hcloud server delete "$name" || true
+            fi
+          done
+          # Throwaway SSH keys whose server is gone and older than KEY_GRACE_SECONDS
+          all_servers=$(hcloud server list -o json | jq -r '.[].name')
+          keys_json=$(hcloud ssh-key list -l hibreak=ci -o json)
+          jq -r '.[] | "\(.name)\t\(.labels.created | tonumber? // 0)"' <<<"$keys_json" |
+          while IFS=$'\t' read -r k created; do
+            grep -qxF "$k" <<<"$all_servers" && continue
+            if (( created > 0 && (now - created) >= KEY_GRACE_SECONDS )); then
+              echo "deleting orphaned key $k"
+              hcloud ssh-key delete "$k" || true
+            fi
+          done

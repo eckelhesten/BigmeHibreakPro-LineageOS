@@ -1,0 +1,38 @@
+From 818aff65bd48b5c8ae88ff5711519df342a8f23c Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Mon, 16 Nov 2026 15:59:11 +0000
+Subject: [PATCH] pm: allow microG signature spoofing on user builds with
+ ro.hibreak.microg
+
+LineageOS lets microG Services and Companion, signed with microG's own
+certificate, present Google's signature, but only on debuggable builds.
+HiBreak Pro ships microG on a user (release) build, so let the device opt
+in with ro.hibreak.microg=true. The package and certificate checks stay.
+
+Change-Id: I1928f9ff992e24d3b23e7914a4bc67c0d81692b5
+---
+ .../core/java/com/android/server/pm/ComputerEngine.java     | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/services/core/java/com/android/server/pm/ComputerEngine.java b/services/core/java/com/android/server/pm/ComputerEngine.java
+index 3300f3481..23ab7067a 100644
+--- a/services/core/java/com/android/server/pm/ComputerEngine.java
++++ b/services/core/java/com/android/server/pm/ComputerEngine.java
+@@ -1486,7 +1486,13 @@ public class ComputerEngine implements Computer {
+     public static native boolean isDebuggable();
+ 
++    private static final boolean HIBREAK_MICROG =
++            android.os.SystemProperties.getBoolean("ro.hibreak.microg", false);
++
+     public static boolean isMicrogSigned(AndroidPackage p) {
+-        if (!isDebuggable()) {
++        // LineageOS allows this on debuggable (userdebug, eng) builds only. A device that ships
++        // microG on a user build opts in with ro.hibreak.microg; the checks below still limit it
++        // to microG Services and Companion signed with microG's own certificate.
++        if (!isDebuggable() && !HIBREAK_MICROG) {
+             return false;
+         }
+ 
+-- 
+2.43.0
+

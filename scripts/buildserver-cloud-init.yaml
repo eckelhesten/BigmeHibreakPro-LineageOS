@@ -1,0 +1,23 @@
+#cloud-config
+# Hetzner build server for LineageOS (Ubuntu 24.04). Installs build deps on first boot.
+package_update: true
+packages: [bc, bison, build-essential, ccache, curl, flex, g++-multilib, gcc-multilib, git, git-lfs, gnupg, gperf, imagemagick, lib32z1-dev, libelf-dev, liblz4-tool, lz4, libssl-dev, libxml2, libxml2-utils, lzop, pngcrush, rsync, schedtool, squashfs-tools, xsltproc, zip, unzip, zlib1g-dev, zstd, python3, python-is-python3, libncurses6, tmux, openjdk-21-jdk-headless]
+runcmd:
+  # 32 GB swap: soong_build's analysis of lineage-23.2 peaks at ~29 GB RSS, and the OOM killer
+  # takes the whole tmux scope (pipeline included) with it on a 32 GB CPX62.
+  - - bash
+    - -c
+    - |
+      set -euo pipefail
+      fallocate -l 32G /swapfile
+      chmod 600 /swapfile
+      mkswap -q /swapfile
+      swapon /swapfile
+      grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      curl -fsSL --retry 3 https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+      chmod 0755 /usr/local/bin/repo
+      git config --system user.name "hibreak-build"
+      git config --system user.email "build@localhost"
+      git config --system color.ui false
+      mkdir -p /srv/lineage
+      touch /var/lib/cloud/instance/hibreak-ready

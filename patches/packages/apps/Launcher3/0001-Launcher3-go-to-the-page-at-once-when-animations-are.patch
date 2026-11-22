@@ -1,0 +1,46 @@
+From 7779c62f1b7f2202c6c5639b39d63e6a49daff7c Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Fri, 13 Nov 2026 22:29:22 +0000
+Subject: [PATCH] Launcher3: go to the page at once when animations are off
+
+With the animator duration scale at 0, snapToPage() still ran a scroller
+animation of up to a second after the finger lifted. On an e-ink panel
+every frame of it is a refresh, so the page swipe on the Bigme HiBreak
+Pro kept the panel busy long after the gesture. Treat the snap as
+immediate when ValueAnimator.areAnimatorsEnabled() is false; dragging a
+page still follows the finger.
+
+Change-Id: I83f06bcb22a226f6c26527f0e6530671b0dc3203
+---
+ src/com/android/launcher3/PagedView.java | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/com/android/launcher3/PagedView.java b/src/com/android/launcher3/PagedView.java
+index ca8ed95..f660de8 100644
+--- a/src/com/android/launcher3/PagedView.java
++++ b/src/com/android/launcher3/PagedView.java
+@@ -26,6 +26,7 @@ import static com.android.launcher3.touch.PagedOrientationHandler.VIEW_SCROLL_BY
+ import static com.android.launcher3.touch.PagedOrientationHandler.VIEW_SCROLL_TO;
+ 
+ import android.animation.LayoutTransition;
++import android.animation.ValueAnimator;
+ import android.annotation.SuppressLint;
+ import android.content.Context;
+ import android.content.res.Configuration;
+@@ -1777,6 +1778,13 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
+ 
+         mNextPage = whichPage;
+ 
++        // With animations off (animator duration scale 0, the default on e-ink devices), go to
++        // the page at once: a snap animation keeps drawing frames for up to a second after the
++        // finger lifts, and an e-ink panel shows them as a slow series of refreshes.
++        if (!ValueAnimator.areAnimatorsEnabled()) {
++            immediate = true;
++        }
++
+         awakenScrollBars(duration);
+         if (immediate) {
+             duration = 0;
+-- 
+2.43.0
+

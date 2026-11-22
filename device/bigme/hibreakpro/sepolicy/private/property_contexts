@@ -1,0 +1,17 @@
+# XRZ e-ink composer policy properties (same prefixes as stock plat_property_contexts)
+vendor.xrz.             u:object_r:vendor_xrz_prop:s0
+persist.vendor.xrz.     u:object_r:vendor_xrz_prop:s0
+ro.vendor.xrz.          u:object_r:vendor_xrz_prop:s0
+
+# MediaTek IMS service (ims.te): the properties it sets, labelled as on stock's system_ext
+# (stock types system_mtk_imsconfig_prop, _supp_serv_prop, _uce_support_prop,
+# _rcs_single_reg_support_prop, _usp_srv_prop). The vendor only has the prefixes vendor.ril.,
+# vendor.gsm. and persist.vendor., which these longer entries override.
+vendor.ril.imsconfig.force.notify         u:object_r:mtk_ims_system_prop:s0
+vendor.gsm.radio.ss.sc                    u:object_r:mtk_ims_system_prop:s0
+vendor.gsm.radio.ss.imsdereg              u:object_r:mtk_ims_system_prop:s0
+persist.vendor.suppserv.                  u:object_r:mtk_ims_system_prop:s0
+persist.vendor.radio.cfu_over_ims         u:object_r:mtk_ims_system_prop:s0
+persist.vendor.mtk_uce_support            u:object_r:mtk_ims_system_prop:s0
+persist.vendor.mtk_rcs_single_reg_support u:object_r:mtk_ims_system_prop:s0
+persist.vendor.mtk_usp_optr_slot_         u:object_r:mtk_ims_system_prop:s0

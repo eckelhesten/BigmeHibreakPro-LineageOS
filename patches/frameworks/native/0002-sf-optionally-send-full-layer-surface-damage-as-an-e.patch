@@ -1,0 +1,62 @@
+From c45f9807223a6483a6cc5f43cc3aa74e938fb3a9 Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Fri, 13 Nov 2026 13:26:48 +0000
+Subject: [PATCH] sf: optionally send full-layer surface damage as an explicit
+ rect
+
+HWC2 encodes "the whole layer changed" as zero damage rects. The MT6877
+e-ink composer on the Bigme HiBreak Pro (XRZ CommitPolicy) reads zero
+rects as "no dirty region" and skips the commit. The skipped buffer is
+never released, so producers that pass no damage (the boot animation,
+GL apps) block on the release fence and the screen freezes after the
+first frame. HWUI is unaffected because it always passes explicit
+damage.
+
+With debug.sf.hwc_explicit_full_damage=1, send the buffer bounds as a
+single rect instead. Frames without a new buffer still send an empty
+region (unchanged), so the composer only commits real updates.
+
+Change-Id: I1ef0ca7de3419c009921a80a1ffd5cd365253424
+---
+ .../CompositionEngine/src/OutputLayer.cpp      | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp b/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp
+index c9fde21..6e246bc 100644
+--- a/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include <DisplayHardware/Hal.h>
++#include <android-base/properties.h>
+ #include <android-base/stringprintf.h>
+ #include <compositionengine/DisplayColorProfile.h>
+ #include <compositionengine/LayerFECompositionState.h>
+@@ -738,7 +739,22 @@ void OutputLayer::writeOutputIndependentPerFrameStateToHWC(
+             : (getState().hwc->stateOverridden ? Region::INVALID_REGION
+                                                : outputIndependentState.surfaceDamage);
+ 
+-    if (auto error = hwcLayer->setSurfaceDamage(surfaceDamage); error != hal::Error::NONE) {
++    // Some vendor composers (MT6877 e-ink HWC on the Bigme HiBreak Pro) read the HWC2 encoding of
++    // full-layer damage (zero rects) as "nothing changed" and skip the commit. The skipped buffer is
++    // never released, so its producer stalls on the release fence and the display freezes. Send
++    // the buffer bounds explicitly instead when debug.sf.hwc_explicit_full_damage is set.
++    static const bool kExplicitFullDamage =
++            base::GetBoolProperty("debug.sf.hwc_explicit_full_damage", false);
++    Region explicitFullDamage;
++    const Region* damageToSend = &surfaceDamage;
++    if (kExplicitFullDamage && outputIndependentState.buffer && surfaceDamage.isRect() &&
++        surfaceDamage.getBounds() == Rect::INVALID_RECT) {
++        explicitFullDamage = Region(Rect(outputIndependentState.buffer->getWidth(),
++                                         outputIndependentState.buffer->getHeight()));
++        damageToSend = &explicitFullDamage;
++    }
++
++    if (auto error = hwcLayer->setSurfaceDamage(*damageToSend); error != hal::Error::NONE) {
+         ALOGE("[%s] Failed to set surface damage: %s (%d)", getLayerFE().getDebugName(),
+               to_string(error).c_str(), static_cast<int32_t>(error));
+         outputIndependentState.surfaceDamage.dump(LOG_TAG);
+-- 
+2.43.0
+

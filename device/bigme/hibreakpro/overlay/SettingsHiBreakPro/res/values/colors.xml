@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- E-ink: the Settings homepage category icons are black on white instead of colour pairs, which render as dithered greys. -->
+<resources>
+    <color name="homepage_blue_fg">#FF000000</color>
+    <color name="homepage_blue_bg">#FFFFFFFF</color>
+    <color name="homepage_blue_variant_fg">#FF000000</color>
+    <color name="homepage_blue_variant_bg">#FFFFFFFF</color>
+    <color name="homepage_cyan_fg">#FF000000</color>
+    <color name="homepage_cyan_bg">#FFFFFFFF</color>
+    <color name="homepage_green_fg">#FF000000</color>
+    <color name="homepage_green_bg">#FFFFFFFF</color>
+    <color name="homepage_grey_fg">#FF000000</color>
+    <color name="homepage_grey_bg">#FFFFFFFF</color>
+    <color name="homepage_orange_fg">#FF000000</color>
+    <color name="homepage_orange_bg">#FFFFFFFF</color>
+    <color name="homepage_pink_fg">#FF000000</color>
+    <color name="homepage_pink_bg">#FFFFFFFF</color>
+    <color name="homepage_purple_fg">#FF000000</color>
+    <color name="homepage_purple_bg">#FFFFFFFF</color>
+    <color name="homepage_red_fg">#FF000000</color>
+    <color name="homepage_red_bg">#FFFFFFFF</color>
+    <color name="homepage_yellow_fg">#FF000000</color>
+    <color name="homepage_yellow_bg">#FFFFFFFF</color>
+    <color name="homepage_generic_icon_background">#FFFFFFFF</color>
+</resources>

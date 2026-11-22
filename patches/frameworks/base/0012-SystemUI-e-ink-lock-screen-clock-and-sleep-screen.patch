@@ -1,0 +1,299 @@
+From d1f80aad4ec1a65a288f8f840aab03f9237761f8 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Mon, 16 Nov 2026 13:17:58 +0000
+Subject: [PATCH] SystemUI: e-ink lock screen clock and sleep screen (always-on
+ display)
+
+With debug.sysui.eink_palette:
+- The lock screen clock is pure black on a light lock wallpaper and white
+  on a dark one, from the wallpaper dark-text hint (patch 0010 rule),
+  instead of the clock seed or accent colour.
+- Always-on display is the sleep screen: the lock screen as it is, on the
+  lock wallpaper. No black front scrim, no blanking, and no light reveal
+  scrim (it covered the panel in black in AOD, and in white when the
+  screen turned off). The panel keeps its image without power.
+- While dozing, the clock, the notification icons and the battery line
+  keep their lock screen colours instead of turning white.
+- No burn-in offsets or scaling: e-ink can not burn in, and each shift
+  would cost a panel refresh.
+
+Change-Id: Ib81ca76095ed46dc00b429b4dc3805fc16d5721a
+---
+ .../shared/clocks/DefaultClockController.kt    |  3 +++
+ .../clocks/FlexClockTextViewController.kt      |  6 +++++-
+ .../clocks/FlexClockViewGroupController.kt     |  6 +++++-
+ .../android/keyguard/ClockEventController.kt   | 18 ++++++++++++++++++
+ .../android/systemui/doze/util/BurnInHelper.kt |  6 ++++++
+ .../KeyguardIndicationController.java          | 12 ++++++++----
+ .../systemui/statusbar/LightRevealScrim.kt     |  9 ++++++++-
+ .../systemui/statusbar/StatusBarIconView.java  | 11 ++++++++---
+ .../NotificationIconContainerViewBinder.kt     | 18 ++++++++++++++++++
+ .../systemui/statusbar/phone/ScrimState.java   |  7 +++++++
+ 10 files changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/DefaultClockController.kt b/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/DefaultClockController.kt
+index 5597b2f19..4e08dda0f 100644
+--- a/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/DefaultClockController.kt
++++ b/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/DefaultClockController.kt
+@@ -178,6 +178,9 @@ class DefaultClockController(
+         open fun recomputePadding(targetRegion: Rect?) {}
+ 
+         private fun getAodColor(): Int {
++            if (android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)) {
++                return currentColor
++            }
+             return if (ambientAod()) {
+                 ctx.resources.getColor(android.R.color.system_accent1_100)
+             } else {
+diff --git a/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/FlexClockTextViewController.kt b/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/FlexClockTextViewController.kt
+index 8abaa09e0..67e5cbb09 100644
+--- a/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/FlexClockTextViewController.kt
++++ b/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/FlexClockTextViewController.kt
+@@ -199,7 +199,11 @@ open class FlexClockTextViewController(
+             override fun onThemeChanged(theme: ThemeConfig) {
+                 view.updateColor(
+                     lockscreenColor = theme.getDefaultColor(clockCtx.context),
+-                    aodColor = theme.getAodColor(clockCtx.context),
++                    // E-ink sleep screen: the wallpaper stays, so the clock keeps its colour.
++                    aodColor =
++                        if (android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false))
++                            theme.getDefaultColor(clockCtx.context)
++                        else theme.getAodColor(clockCtx.context),
+                 )
+                 refreshTime()
+             }
+diff --git a/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/FlexClockViewGroupController.kt b/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/FlexClockViewGroupController.kt
+index ddc589102..becf2cd6d 100644
+--- a/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/FlexClockViewGroupController.kt
++++ b/packages/SystemUI/customization/src/com/android/systemui/shared/clocks/FlexClockViewGroupController.kt
+@@ -182,7 +182,11 @@ class FlexClockViewGroupController(private val clockCtx: ClockContext) : FlexClo
+             override fun onThemeChanged(theme: ThemeConfig) {
+                 view.updateColor(
+                     lockscreenColor = theme.getDefaultColor(clockCtx.context),
+-                    aodColor = theme.getAodColor(clockCtx.context),
++                    // E-ink sleep screen: the wallpaper stays, so the clock keeps its colour.
++                    aodColor =
++                        if (android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false))
++                            theme.getDefaultColor(clockCtx.context)
++                        else theme.getAodColor(clockCtx.context),
+                 )
+             }
+ 
+diff --git a/packages/SystemUI/src/com/android/keyguard/ClockEventController.kt b/packages/SystemUI/src/com/android/keyguard/ClockEventController.kt
+index f579bc4f5..a381ce6fe 100644
+--- a/packages/SystemUI/src/com/android/keyguard/ClockEventController.kt
++++ b/packages/SystemUI/src/com/android/keyguard/ClockEventController.kt
+@@ -260,6 +260,24 @@ constructor(
+ 
+     private fun updateColors() {
+         val isDarkTheme = isDarkTheme()
++        if (android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)) {
++            // E-ink: pure black on a light lock wallpaper, white on a dark one, decided by the
++            // lock wallpaper's dark-text hint (ImageWallpaperColorExtractor's e-ink rule).
++            val wm = context.getSystemService(android.app.WallpaperManager::class.java)
++            val colors =
++                wm?.getWallpaperColors(android.app.WallpaperManager.FLAG_LOCK)
++                    ?: wm?.getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM)
++            val isDark =
++                colors?.let {
++                    (it.colorHints and android.app.WallpaperColors.HINT_SUPPORTS_DARK_TEXT) == 0
++                } ?: isDarkTheme
++            val color = if (isDark) android.graphics.Color.WHITE else android.graphics.Color.BLACK
++            clock?.run {
++                smallClock.updateTheme { it.copy(isDarkTheme = isDark, seedColor = color) }
++                largeClock.updateTheme { it.copy(isDarkTheme = isDark, seedColor = color) }
++            }
++            return
++        }
+         if (regionSamplingEnabled) {
+             clock?.smallClock?.run {
+                 val isDark = smallRegionSampler?.currentRegionDarkness()?.isDark ?: isDarkTheme
+diff --git a/packages/SystemUI/src/com/android/systemui/doze/util/BurnInHelper.kt b/packages/SystemUI/src/com/android/systemui/doze/util/BurnInHelper.kt
+index 888785510..f5de585f1 100644
+--- a/packages/SystemUI/src/com/android/systemui/doze/util/BurnInHelper.kt
++++ b/packages/SystemUI/src/com/android/systemui/doze/util/BurnInHelper.kt
+@@ -20,6 +20,9 @@ import android.util.MathUtils
+ import com.android.systemui.shared.Flags
+ 
+ private const val MILLIS_PER_MINUTES = 1000 * 60f
++
++/** E-ink panels can't burn in, and every shift would cost a panel refresh. */
++private val EINK = android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)
+ private const val BURN_IN_PREVENTION_PERIOD_Y = 271f
+ private const val BURN_IN_PREVENTION_PERIOD_X = 43f
+ private const val BURN_IN_PREVENTION_PERIOD_SCALE = 181f
+@@ -33,6 +36,7 @@ private const val BURN_IN_PREVENTION_PERIOD_PROGRESS = 89f
+  * @param xAxis If we're moving on X or Y.
+  */
+ fun getBurnInOffset(amplitude: Int, xAxis: Boolean): Int {
++    if (EINK) return 0
+     return zigzag(
+             System.currentTimeMillis() / MILLIS_PER_MINUTES,
+             amplitude.toFloat(),
+@@ -46,6 +50,7 @@ fun getBurnInOffset(amplitude: Int, xAxis: Boolean): Int {
+  * current time.
+  */
+ fun getBurnInProgressOffset(): Float {
++    if (EINK) return 0f
+     return zigzag(
+         System.currentTimeMillis() / MILLIS_PER_MINUTES,
+         1f,
+@@ -55,6 +60,7 @@ fun getBurnInProgressOffset(): Float {
+ 
+ /** Returns a value to scale a view in order to avoid burn in. */
+ fun getBurnInScale(): Float {
++    if (EINK) return 1f
+     val baseBurninScale = if (Flags.clockReactiveSmartspaceLayout()) 0.75f else 0.8f
+     return baseBurninScale +
+         zigzag(
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/KeyguardIndicationController.java b/packages/SystemUI/src/com/android/systemui/statusbar/KeyguardIndicationController.java
+index 7f0926a44..9ff5a8fcf 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/KeyguardIndicationController.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/KeyguardIndicationController.java
+@@ -1135,10 +1135,14 @@ public class KeyguardIndicationController {
+                 mWakeLock.setAcquired(true);
+                 final KeyguardIndication.Builder builder = new KeyguardIndication.Builder()
+                         .setMessage(newIndication)
+-                        .setTextColor(ColorStateList.valueOf(
+-                                useMisalignmentColor
+-                                        ? mContext.getColor(R.color.misalignment_text_color)
+-                                        : Color.WHITE));
++                        .setTextColor(useMisalignmentColor
++                                ? ColorStateList.valueOf(
++                                        mContext.getColor(R.color.misalignment_text_color))
++                                // E-ink sleep screen: on the wallpaper, as on the lock screen.
++                                : android.os.SystemProperties.getBoolean(
++                                        "debug.sysui.eink_palette", false)
++                                        ? getInitialTextColorState()
++                                        : ColorStateList.valueOf(Color.WHITE));
+                 if (mBiometricMessage != null && newIndication == mBiometricMessage) {
+                     builder.setForceAccessibilityLiveRegionAssertive();
+                 }
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/LightRevealScrim.kt b/packages/SystemUI/src/com/android/systemui/statusbar/LightRevealScrim.kt
+index a56624ca6..986e8583c 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/LightRevealScrim.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/LightRevealScrim.kt
+@@ -287,6 +287,9 @@ data class PowerButtonReveal(
+ 
+ private const val TAG = "LightRevealScrim"
+ 
++private val EINK_NO_REVEAL =
++    android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)
++
+ /**
+  * Scrim view that partially reveals the content underneath it using a [RadialGradient] with a
+  * transparent center. The center position, size, and stops of the gradient can be manipulated to
+@@ -313,7 +316,11 @@ constructor(
+      * obscured and 1 means they'll be fully visible.
+      */
+     var revealAmount: Float = 1f
+-        set(value) {
++        set(requested) {
++            // E-ink: never cover the panel. The screen-off reveal and the AOD scrim would leave
++            // a black (or white) panel behind, where the lock screen should stay as the sleep
++            // screen.
++            val value = if (EINK_NO_REVEAL) 1f else requested
+             if (field != value) {
+                 field = value
+                 if (value <= 0.0f || value >= 1.0f) {
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarIconView.java b/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarIconView.java
+index bdf215c7f..c1acff131 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarIconView.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarIconView.java
+@@ -183,6 +183,9 @@ public class StatusBarIconView extends AnimatedImageView implements StatusIconDi
+     private boolean mIncreasedSize;
+     private boolean mShowsConversation;
+     private float mDozeAmount;
++    /** E-ink: the sleep screen shows the wallpaper, so icons keep their colour while dozing. */
++    private static final boolean EINK =
++            android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false);
+     private final NotificationDozeHelper mDozer;
+ 
+     public StatusBarIconView(Context context, String slot, StatusBarNotification sbn) {
+@@ -647,7 +650,8 @@ public class StatusBarIconView extends AnimatedImageView implements StatusIconDi
+     }
+ 
+     private void updateDecorColor() {
+-        int color = NotificationUtils.interpolateColors(mDecorColor, Color.WHITE, mDozeAmount);
++        int color = NotificationUtils.interpolateColors(mDecorColor, Color.WHITE,
++                EINK ? 0f : mDozeAmount);
+         if (mDotPaint.getColor() != color) {
+             mDotPaint.setColor(color);
+ 
+@@ -684,9 +688,10 @@ public class StatusBarIconView extends AnimatedImageView implements StatusIconDi
+                 mMatrix = new float[4 * 5];
+                 mMatrixColorFilter = new ColorMatrixColorFilter(mMatrix);
+             }
++            float doze = EINK ? 0f : mDozeAmount;
+             int color = NotificationUtils.interpolateColors(
+-                    mCurrentSetColor, Color.WHITE, mDozeAmount);
+-            updateTintMatrix(mMatrix, color, DARK_ALPHA_BOOST * mDozeAmount);
++                    mCurrentSetColor, Color.WHITE, doze);
++            updateTintMatrix(mMatrix, color, DARK_ALPHA_BOOST * doze);
+             mMatrixColorFilter.setColorMatrixArray(mMatrix);
+             setColorFilter(null);  // setColorFilter only invalidates if the instance changed.
+             setColorFilter(mMatrixColorFilter);
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/notification/icon/ui/viewbinder/NotificationIconContainerViewBinder.kt b/packages/SystemUI/src/com/android/systemui/statusbar/notification/icon/ui/viewbinder/NotificationIconContainerViewBinder.kt
+index 3255e4062..13dc39caa 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/notification/icon/ui/viewbinder/NotificationIconContainerViewBinder.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/notification/icon/ui/viewbinder/NotificationIconContainerViewBinder.kt
+@@ -53,6 +53,7 @@ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.stateIn
+ 
+ /** Binds a view-model to a [NotificationIconContainer]. */
+@@ -119,6 +120,7 @@ object NotificationIconContainerViewBinder {
+             val color: StateFlow<Int> =
+                 configuration
+                     .getColorAttr(R.attr.wallpaperTextColor, DEFAULT_AOD_ICON_COLOR)
++                    .map { einkAodIconColor(view.context) ?: it }
+                     .stateIn(this)
+             val tintAlpha = viewModel.tintAlpha.stateIn(this)
+             val animsEnabled = viewModel.areIconAnimationsEnabled.stateIn(this)
+@@ -361,6 +363,22 @@ object NotificationIconContainerViewBinder {
+     }
+ 
+     @ColorInt private const val DEFAULT_AOD_ICON_COLOR = Color.WHITE
++
++    /**
++     * E-ink sleep screen: the icons sit on the lock wallpaper, so black on a light one and white
++     * on a dark one (its dark-text hint), as the keyguard status bar. Null when not e-ink.
++     */
++    private fun einkAodIconColor(context: android.content.Context): Int? {
++        if (!android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)) return null
++        val wm = context.getSystemService(android.app.WallpaperManager::class.java) ?: return null
++        val colors =
++            wm.getWallpaperColors(android.app.WallpaperManager.FLAG_LOCK)
++                ?: wm.getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM)
++                ?: return null
++        val darkText =
++            (colors.colorHints and android.app.WallpaperColors.HINT_SUPPORTS_DARK_TEXT) != 0
++        return if (darkText) Color.BLACK else Color.WHITE
++    }
+     private const val TAG = "NotifIconContainerViewBinder"
+ }
+ 
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimState.java b/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimState.java
+index 6c20ebc23..4f520809f 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimState.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimState.java
+@@ -264,6 +264,13 @@ public enum ScrimState {
+             mFrontTint = mBackgroundColor;
+             mFrontAlpha = (alwaysOnEnabled || isDocked || quickPickupEnabled)
+                     ? mAodFrontScrimAlpha : 1f;
++            if (alwaysOnEnabled
++                    && android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)) {
++                // E-ink sleep screen: no black scrim and no blanking; the lock wallpaper and
++                // the clock stay on the panel, which keeps them without power.
++                mFrontAlpha = 0f;
++                mBlankScreen = false;
++            }
+ 
+             mBehindTint = mBackgroundColor;
+             mBehindAlpha = ScrimController.TRANSPARENT;
+-- 
+2.43.0
+

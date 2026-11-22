@@ -1,0 +1,84 @@
+From 2feb1e8a5e995c55705ab61091472d36d2ab5a0b Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Sat, 21 Nov 2026 21:59:34 +0100
+Subject: [PATCH 1/2] Restore a no-op TelephonyMetrics for prebuilt IMS
+ services
+
+Android 16 removed com.android.internal.telephony.metrics.TelephonyMetrics.
+MediaTek's ImsService (com.mediatek.ims, built for Android 14) still calls
+TelephonyMetrics.getInstance() and writeOnRilSolicitedResponse(),
+writeOnRilTimeoutResponse(), writeRilAnswer() and writeRilSendSms() from
+its RIL adapter, so it dies with NoClassDefFoundError on the first IMS
+RIL response.
+
+Bring the class back with exactly those methods (plus the Android 10
+writeRilSendSms signature that older MediaTek IMS builds use), all
+no-ops. proguard.flags keeps public classes under
+com.android.internal.telephony, so R8 leaves it in telephony-common.
+---
+ .../telephony/metrics/TelephonyMetrics.java   | 53 +++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+ create mode 100644 src/java/com/android/internal/telephony/metrics/TelephonyMetrics.java
+
+diff --git a/src/java/com/android/internal/telephony/metrics/TelephonyMetrics.java b/src/java/com/android/internal/telephony/metrics/TelephonyMetrics.java
+new file mode 100644
+index 0000000..7aaa971
+--- /dev/null
++++ b/src/java/com/android/internal/telephony/metrics/TelephonyMetrics.java
+@@ -0,0 +1,53 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.internal.telephony.metrics;
++
++/**
++ * No-op stand-in for the legacy telephony metrics logger that Android 16 removed.
++ *
++ * Prebuilt vendor ImsService packages built for Android 14 (MediaTek's com.mediatek.ims) call
++ * these methods from their RIL adapter on every IMS request and response. Without the class they
++ * die with NoClassDefFoundError on the first one. Nothing here records anything.
++ *
++ * @hide
++ */
++public class TelephonyMetrics {
++    private static final TelephonyMetrics sInstance = new TelephonyMetrics();
++
++    private TelephonyMetrics() {}
++
++    /** @return the shared no-op instance */
++    public static TelephonyMetrics getInstance() {
++        return sInstance;
++    }
++
++    /** Solicited RIL response (no-op). */
++    public void writeOnRilSolicitedResponse(int phoneId, int rilSerial, int rilError, int rilRequest,
++            Object ret) {}
++
++    /** RIL request timeout (no-op). */
++    public void writeOnRilTimeoutResponse(int phoneId, int rilSerial, int rilRequest) {}
++
++    /** RIL answer request (no-op). */
++    public void writeRilAnswer(int phoneId, int rilSerial) {}
++
++    /** SMS sent through the RIL (no-op). */
++    public void writeRilSendSms(int phoneId, int rilSerial, int tech, int format, long messageId) {}
++
++    /** SMS sent through the RIL, Android 10 and older signature (no-op). */
++    public void writeRilSendSms(int phoneId, int rilSerial, int tech, int format) {}
++}
+-- 
+2.50.1 (Apple Git-155)
+

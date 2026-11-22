@@ -1,0 +1,53 @@
+From da8fc21807f3ce0c9539ec5dc859952a9a2e5439 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 17 Nov 2026 07:52:48 +0000
+Subject: [PATCH 16/16] SystemUI: keyguard transitions jump to their end on
+ e-ink
+
+With debug.sysui.eink_palette, the keyguard transition animators (to and
+from the sleep screen, the lock screen and the bouncer) and the doze amount
+animator get a duration of 0. Each animation frame would be a panel
+refresh, and SurfaceFlinger holds the panel until the screen has settled,
+so the animation only delayed the wake-up picture.
+
+Change-Id: I00f073988bf2e6cb9fc23b3d9bb19f6607dd054c
+---
+ .../data/repository/KeyguardTransitionRepository.kt         | 6 ++++++
+ .../systemui/statusbar/StatusBarStateControllerImpl.java    | 4 +++-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/keyguard/data/repository/KeyguardTransitionRepository.kt b/packages/SystemUI/src/com/android/systemui/keyguard/data/repository/KeyguardTransitionRepository.kt
+index f916b066b..94a04667d 100644
+--- a/packages/SystemUI/src/com/android/systemui/keyguard/data/repository/KeyguardTransitionRepository.kt
++++ b/packages/SystemUI/src/com/android/systemui/keyguard/data/repository/KeyguardTransitionRepository.kt
+@@ -224,6 +224,12 @@ constructor(
+                 // An animator was provided, so use it to run the transition
+                 animator.setFloatValues(startingValue, 1f)
+                 animator.duration = ((1f - startingValue) * animator.duration).toLong()
++                // E-ink: keyguard transitions (to and from the sleep screen, the lock screen, the
++                // bouncer) jump to their end. Each animation frame would be a panel refresh, and
++                // SurfaceFlinger holds the panel until the screen has settled.
++                if (android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)) {
++                    animator.duration = 0
++                }
+                 val updateListener = AnimatorUpdateListener { animation ->
+                     emitTransition(
+                         TransitionStep(
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarStateControllerImpl.java b/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarStateControllerImpl.java
+index 67b472135..c9cc9d8b8 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarStateControllerImpl.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/StatusBarStateControllerImpl.java
+@@ -456,7 +456,9 @@ public class StatusBarStateControllerImpl implements
+         ObjectAnimator darkAnimator = ObjectAnimator.ofFloat(
+                 this, SET_DARK_AMOUNT_PROPERTY, mDozeAmountTarget);
+         darkAnimator.setInterpolator(Interpolators.LINEAR);
+-        darkAnimator.setDuration(StackStateAnimator.ANIMATION_DURATION_WAKEUP);
++        // E-ink: the doze amount jumps, see KeyguardTransitionRepository.
++        darkAnimator.setDuration(android.os.SystemProperties.getBoolean(
++                "debug.sysui.eink_palette", false) ? 0 : StackStateAnimator.ANIMATION_DURATION_WAKEUP);
+         darkAnimator.start();
+         return darkAnimator;
+     }
+-- 
+2.43.0
+

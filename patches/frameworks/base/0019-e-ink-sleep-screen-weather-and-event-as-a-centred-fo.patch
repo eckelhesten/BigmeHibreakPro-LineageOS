@@ -1,0 +1,543 @@
+From 8d303f03b82837d23ba32918ad7a8cced94320e3 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 17 Nov 2026 19:37:05 +0100
+Subject: [PATCH 19/19] e-ink: sleep screen weather and event as a centred footer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The two corners looked unordered (two stacks of different sizes, no
+shared baseline, an icon drawn in a padded square), and every boxed or
+columned layout tried after them looked busier than the clock above.
+The simplest one won: two centred lines at the bottom, one size, one
+weight, on the clock's axis:
+
+    Berlin · [icon] 5°C · Cloudy
+    Tomorrow 19:30 · Eat candy
+
+- Each item is one line and never wraps. On the weather line a long
+  city name is shortened first, so the temperature and the condition
+  ("Cloudy", in the phone's language, from HiBreakParts) stay; on the
+  event line the title is shortened, the time never is. With only one
+  of the two, it takes the bottom line.
+- The icon sits inline, centred on the capital height; EinkWeatherIcon
+  places icons by their ink with the same line width for all of them.
+- Tunable: debug.sysui.eink_sleep.footer_{size,leading,icon}.
+- hibreak_sleep_weather_data version 2 adds the WMO code and the
+  condition; version 1 still reads.
+---
+ .../systemui/shade/EinkSleepScreen.java       | 144 +++++++------
+ .../systemui/shade/EinkWeatherIcon.java       | 191 +++++++++++++-----
+ 2 files changed, 222 insertions(+), 113 deletions(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+index bd4189e8..f021459d 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+@@ -24,8 +24,6 @@ import android.os.UserHandle;
+ import android.provider.Settings;
+ import android.service.notification.NotificationListenerService;
+ import android.service.notification.StatusBarNotification;
+-import android.text.Layout;
+-import android.text.StaticLayout;
+ import android.text.TextPaint;
+ import android.text.TextUtils;
+ import android.text.format.DateFormat;
+@@ -67,14 +65,26 @@ import java.util.Set;
+  *
+  * Tuning without a build (read when the screen appears), debug.sysui.eink_sleep.*:
+  * weight (font weight of the numerals, 500), size (numeral height as a share of the screen
+- * width in percent, 52), icons (0 hides the notification icons), battery (0 hides it).
++ * width in percent, 52), icons (0 hides the notification icons), battery (0 hides it),
++ * footer_size (the footer's text size, per mille of the width, 46), footer_leading (baseline
++ * to baseline, per mille, 64), footer_icon (weather icon height in percent of the capital
++ * height, 135).
+  *
+- * Weather (bottom left) and the next calendar event (bottom right) come from HiBreakParts
++ * The footer, two centred lines at the bottom in one size and weight:
++ *     Berlin · [icon] 5°C · Cloudy
++ *     Tomorrow 19:30 · Eat candy
++ * Each item is one line that never wraps: on the weather line a long city name is shortened
++ * first (temperature and condition stay), on the event line the title (the time stays). With
++ * only one of them, it takes the bottom line.
++ *
++ * Weather and the next calendar event come from HiBreakParts
+  * (Settings > Display > E-ink & front light > Sleep screen), which writes them to
+  * Settings.System and keeps them current:
+- * hibreak_sleep_weather_data = "1;kind;day 1/0;temperature in C;unit c/f;fetched at ms;city",
++ * hibreak_sleep_weather_data =
++ * "2;kind;day 1/0;temperature in C;unit c/f;fetched at ms;WMO code;condition;city" (the
++ * condition in the phone's language; version 1 had no code and condition),
+  * hibreak_sleep_calendar_data = "1;begin ms;end ms;all day 1/0;title" (local times).
+- * Read at every redraw (the minute tick), so a change shows within a minute. With either corner
++ * Read at every redraw (the minute tick), so a change shows within a minute. With the footer
+  * shown, the battery moves to the top.
+  */
+ public final class EinkSleepScreen extends View implements StatusBarStateController.StateListener {
+@@ -100,12 +110,17 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+     private float mSize = 0.52f;
+     private boolean mShowIcons = true;
+     private boolean mShowBattery = true;
++    // Footer layout, as shares of the screen width (debug.sysui.eink_sleep.footer_*).
++    private float mFooterSize = 0.046f;
++    private float mFooterLeading = 0.064f;
++    private float mFooterIcon = 1.35f;
+ 
+-    private final TextPaint mCornerPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
++    private final TextPaint mFooterPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+     // Weather: shown while mWeatherCity != null.
+     private String mWeatherKind;
+     private boolean mWeatherDay;
+     private String mWeatherTemp;
++    private String mWeatherCondition;
+     private String mWeatherCity;
+     // Next event: shown while mEventTitle != null.
+     private String mEventTitle;
+@@ -146,6 +161,12 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+             mSize = SystemProperties.getInt("debug.sysui.eink_sleep.size", 52) / 100f;
+             mShowIcons = SystemProperties.getBoolean("debug.sysui.eink_sleep.icons", true);
+             mShowBattery = SystemProperties.getBoolean("debug.sysui.eink_sleep.battery", true);
++            mFooterSize = SystemProperties.getInt("debug.sysui.eink_sleep.footer_size", 46)
++                    / 1000f;
++            mFooterLeading = SystemProperties.getInt("debug.sysui.eink_sleep.footer_leading", 64)
++                    / 1000f;
++            mFooterIcon = SystemProperties.getInt("debug.sysui.eink_sleep.footer_icon", 135)
++                    / 100f;
+             bringToFront();
+             setVisibility(VISIBLE);
+             refresh();
+@@ -214,9 +235,13 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         try {
+             String weather = Settings.System.getStringForUser(mContext.getContentResolver(),
+                     WEATHER_DATA, UserHandle.USER_CURRENT);
+-            String[] f = weather != null ? weather.split(";", 7) : null;
+-            if (f != null && f.length == 7 && "1".equals(f[0])
+-                    && now - Long.parseLong(f[5]) < WEATHER_MAX_AGE && !f[6].isEmpty()) {
++            String[] f = weather != null ? weather.split(";", 9) : null;
++            // Version 1: city in field 6, no condition. Version 2: code, condition, city.
++            if (f != null && f.length == 7 && "1".equals(f[0])) {
++                f = new String[] {f[0], f[1], f[2], f[3], f[4], f[5], "", "", f[6]};
++            }
++            if (f != null && f.length == 9 && ("1".equals(f[0]) || "2".equals(f[0]))
++                    && now - Long.parseLong(f[5]) < WEATHER_MAX_AGE && !f[8].isEmpty()) {
+                 final boolean fahrenheit = "f".equals(f[4]);
+                 final double celsius = Double.parseDouble(f[3]);
+                 final long t = Math.round(fahrenheit ? celsius * 9 / 5 + 32 : celsius);
+@@ -224,7 +249,8 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+                 mWeatherDay = "1".equals(f[2]);
+                 mWeatherTemp = (t < 0 ? "\u2212" + (-t) : Long.toString(t))
+                         + (fahrenheit ? "\u00b0F" : "\u00b0C");
+-                mWeatherCity = f[6];
++                mWeatherCondition = f[7].isEmpty() ? null : f[7];
++                mWeatherCity = f[8];
+             }
+         } catch (RuntimeException e) {
+             Log.w(TAG, "weather", e);
+@@ -306,11 +332,11 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+             }
+         }
+ 
+-        // Weather (bottom left) and the next event (bottom right).
+-        final boolean corners = mWeatherCity != null || mEventTitle != null;
+-        if (corners) drawCorners(canvas, w, h, fg, bg);
++        // Weather and the next event: two centred lines at the bottom.
++        final boolean footer = mWeatherCity != null || mEventTitle != null;
++        if (footer) drawFooter(canvas, w, h, fg, bg);
+ 
+-        // Battery, small, at the bottom (at the top while the corners are shown).
++        // Battery, small, at the bottom (at the top while the footer is shown).
+         if (mShowBattery) {
+             Intent battery = mContext.registerReceiver(null,
+                     new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+@@ -321,63 +347,67 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+                 if (level >= 0 && scale > 0) {
+                     mTextPaint.setTextSize(w * 0.042f);
+                     String text = (charging ? "⚡︎ " : "") + (level * 100 / scale) + " %";
+-                    canvas.drawText(text, w / 2f, corners ? w * 0.10f : h - w * 0.12f,
++                    canvas.drawText(text, w / 2f, footer ? w * 0.10f : h - w * 0.12f,
+                             mTextPaint);
+                 }
+             }
+         }
+     }
+ 
+-    private void drawCorners(Canvas canvas, int w, int h, int fg, int bg) {
+-        final float margin = w * 0.07f;
+-        final float maxWidth = w * 0.40f;
+-        final float small = w * 0.042f;
+-        final float gap = w * 0.028f;
+-        // Baseline of the small lines (city, time), where the battery used to be.
+-        final float base = h - w * 0.11f;
+-        mCornerPaint.setColor(fg);
+-        mCornerPaint.setTypeface(typeface(500));
++    /** The footer (see the class comment): one size, one weight, each item on one line. */
++    private void drawFooter(Canvas canvas, int w, int h, int fg, int bg) {
++        final float maxWidth = w * 0.86f;
++        final float bottom = h - w * 0.085f;
++        mFooterPaint.setColor(fg);
++        mFooterPaint.setTypeface(typeface(400));
++        mFooterPaint.setTextAlign(Paint.Align.LEFT);
++        mFooterPaint.setTextSize(w * mFooterSize);
++        final String sep = " \u00b7 ";
++        final boolean both = mWeatherCity != null && mEventTitle != null;
+ 
+         if (mWeatherCity != null) {
+-            mCornerPaint.setTextAlign(Paint.Align.LEFT);
+-            mCornerPaint.setTextSize(small);
+-            canvas.drawText(ellipsize(mWeatherCity, maxWidth), margin, base, mCornerPaint);
+-            final float icon = w * 0.12f;
+-            final float iconTop = base - small * 0.75f - gap - icon;
+-            EinkWeatherIcon.draw(canvas, mWeatherKind, mWeatherDay, margin, iconTop, icon, fg, bg);
+-            mCornerPaint.setTextSize(w * 0.085f);
+-            mCornerPaint.getTextBounds("0", 0, 1, mBounds);
+-            canvas.drawText(mWeatherTemp, margin + icon + w * 0.03f,
+-                    iconTop + (icon + mBounds.height()) / 2f, mCornerPaint);
++            // Berlin · [icon] 5°C · Cloudy; the city gives way first.
++            final float baseline = both ? bottom - w * mFooterLeading : bottom;
++            final float cap = capHeight();
++            final float iconHeight = cap * mFooterIcon;
++            final float iconWidth = EinkWeatherIcon.width(mWeatherKind, mWeatherDay, iconHeight);
++            final float iconGap = mFooterPaint.measureText(" ");
++            final String tail = mWeatherTemp
++                    + (mWeatherCondition != null ? sep + mWeatherCondition : "");
++            final float fixed = iconWidth + iconGap + mFooterPaint.measureText(tail)
++                    + mFooterPaint.measureText(sep);
++            final float cityRoom = maxWidth - fixed;
++            final String head = cityRoom > mFooterPaint.getTextSize() * 2
++                    ? ellipsize(mWeatherCity, cityRoom) + sep : "";
++            final float headWidth = mFooterPaint.measureText(head);
++            float x = (w - (headWidth + iconWidth + iconGap
++                    + mFooterPaint.measureText(tail))) / 2f;
++            canvas.drawText(head, x, baseline, mFooterPaint);
++            x += headWidth;
++            EinkWeatherIcon.draw(canvas, mWeatherKind, mWeatherDay, x, baseline - cap / 2f,
++                    iconHeight, fg, bg);
++            x += iconWidth + iconGap;
++            canvas.drawText(tail, x, baseline, mFooterPaint);
+         }
+ 
+         if (mEventTitle != null) {
+-            final float right = w - margin;
+-            final long now = System.currentTimeMillis();
+-            mCornerPaint.setTextAlign(Paint.Align.RIGHT);
+-            mCornerPaint.setTextSize(small);
+-            canvas.drawText(ellipsize(describeWhen(now), maxWidth), right, base, mCornerPaint);
+-            // The title: up to two lines, right-aligned, above the time.
+-            mCornerPaint.setTextAlign(Paint.Align.LEFT);
+-            mCornerPaint.setTextSize(w * 0.058f);
+-            StaticLayout title = StaticLayout.Builder.obtain(mEventTitle, 0,
+-                            mEventTitle.length(), mCornerPaint, Math.round(maxWidth))
+-                    .setAlignment(Layout.Alignment.ALIGN_OPPOSITE)
+-                    .setMaxLines(2)
+-                    .setEllipsize(TextUtils.TruncateAt.END)
+-                    .setIncludePad(false)
+-                    .build();
+-            final float lastBaseline = base - small * 0.75f - gap - w * 0.012f;
+-            canvas.save();
+-            canvas.translate(right - Math.round(maxWidth),
+-                    lastBaseline - title.getLineBaseline(title.getLineCount() - 1));
+-            title.draw(canvas);
+-            canvas.restore();
++            // Tomorrow 19:30 · Eat candy; the title gives way, the time never does.
++            final String when = describeWhen(System.currentTimeMillis()) + sep;
++            final float titleRoom = maxWidth - mFooterPaint.measureText(when);
++            final String line = when + ellipsize(mEventTitle, Math.max(0f, titleRoom));
++            canvas.drawText(line, (w - mFooterPaint.measureText(line)) / 2f, bottom,
++                    mFooterPaint);
+         }
+     }
+ 
++    /** Height of a capital letter at the footer paint's current size. */
++    private float capHeight() {
++        mFooterPaint.getTextBounds("H", 0, 1, mBounds);
++        return mBounds.height();
++    }
++
+     private String ellipsize(String text, float width) {
+-        return TextUtils.ellipsize(text, mCornerPaint, width, TextUtils.TruncateAt.END).toString();
++        return TextUtils.ellipsize(text, mFooterPaint, width, TextUtils.TruncateAt.END).toString();
+     }
+ 
+     /** "Today 14:00", "Tomorrow 09:30", "Thu 10:00"; "Today 14:00–15:00" while it runs. */
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java b/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java
+index 1dac0c43..4ddd2098 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java
+@@ -6,87 +6,159 @@
+ package com.android.systemui.shade;
+ 
+ import android.graphics.Canvas;
++import android.graphics.Matrix;
+ import android.graphics.Paint;
+ import android.graphics.Path;
+ import android.graphics.RectF;
+ 
++import java.util.ArrayList;
++import java.util.List;
++
+ /**
+  * Weather icons for the e-ink sleep screen: plain line drawings in one colour, with solid
+  * strokes and no grey, so a one-bit panel shows them without dither. Kinds (from HiBreakParts):
+  * clear, partly, cloudy, fog, drizzle, rain, snow, thunder; clear and partly have a night form.
++ *
++ * Each icon is placed by its ink, not by a padded square: its left edge is exactly at the given
++ * x and its ink is centred on the given y, so it lines up with the text next to and below it.
+  */
+ final class EinkWeatherIcon {
++    /** Line width as a share of the icon's height, the same for every icon. */
++    private static final float STROKE_OF_HEIGHT = 0.075f;
++    private static final int STROKED = 0;
++    private static final int FILLED = 1;
++    /** Filled with the background: hides what is behind (the sun behind a cloud). */
++    private static final int KNOCKOUT = 2;
++
+     private EinkWeatherIcon() {}
+ 
+-    /** Draws the icon into the square (x, y, x + s, y + s). */
+-    static void draw(Canvas canvas, String kind, boolean day, float x, float y, float s,
+-            int fg, int bg) {
++    /** The width {@link #draw} takes for this icon at this height. */
++    static float width(String kind, boolean day, float height) {
++        List<Path> paths = new ArrayList<>();
++        List<Integer> modes = new ArrayList<>();
++        build(kind, day, paths, modes);
++        RectF bare = inkBounds(paths, modes, 0f);
++        if (bare == null || bare.isEmpty()) return 0;
++        final float strokeUnits = height * STROKE_OF_HEIGHT
++                / Math.min(height / bare.height(), height * 1.3f / bare.width());
++        RectF ink = inkBounds(paths, modes, strokeUnits);
++        return ink.width() * Math.min(height / ink.height(), height * 1.3f / ink.width());
++    }
++
++    /**
++     * Draws the icon with its ink {@code height} tall (at most 1.3 times as wide), its left edge
++     * at {@code left} and centred on {@code centerY}. Returns the width it took.
++     */
++    static float draw(Canvas canvas, String kind, boolean day, float left, float centerY,
++            float height, int fg, int bg) {
++        List<Path> paths = new ArrayList<>();
++        List<Integer> modes = new ArrayList<>();
++        build(kind, day, paths, modes);
++
++        // Ink bounds in unit coordinates; strokes reach half their width beyond the path. The
++        // stroke is set in pixels, so size once without it and once with it.
++        RectF bare = inkBounds(paths, modes, 0f);
++        if (bare == null || bare.isEmpty()) return 0;
++        final float strokeUnits = height * STROKE_OF_HEIGHT
++                / Math.min(height / bare.height(), height * 1.3f / bare.width());
++        RectF ink = inkBounds(paths, modes, strokeUnits);
++        final float scale = Math.min(height / ink.height(), height * 1.3f / ink.width());
++
+         Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+         stroke.setStyle(Paint.Style.STROKE);
++        stroke.setStrokeWidth(strokeUnits);
+         stroke.setStrokeCap(Paint.Cap.ROUND);
+         stroke.setStrokeJoin(Paint.Join.ROUND);
+         stroke.setColor(fg);
+         Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+         fill.setStyle(Paint.Style.FILL);
+         fill.setColor(fg);
+-        Paint clear = new Paint(Paint.ANTI_ALIAS_FLAG);
+-        clear.setStyle(Paint.Style.FILL);
+-        clear.setColor(bg);
++        Paint knockout = new Paint(fill);
++        knockout.setColor(bg);
+ 
+         canvas.save();
+-        canvas.translate(x, y);
+-        canvas.scale(s, s);
+-        // Drawn in unit coordinates: the stroke is a fraction of the square.
+-        stroke.setStrokeWidth(0.065f);
++        canvas.translate(left, centerY);
++        canvas.scale(scale, scale);
++        canvas.translate(-ink.left, -ink.centerY());
++        for (int i = 0; i < paths.size(); i++) {
++            int mode = modes.get(i);
++            canvas.drawPath(paths.get(i),
++                    mode == STROKED ? stroke : mode == FILLED ? fill : knockout);
++        }
++        canvas.restore();
++        return ink.width() * scale;
++    }
+ 
++    private static RectF inkBounds(List<Path> paths, List<Integer> modes, float stroke) {
++        RectF ink = null;
++        RectF r = new RectF();
++        for (int i = 0; i < paths.size(); i++) {
++            if (modes.get(i) == KNOCKOUT) continue;
++            paths.get(i).computeBounds(r, true);
++            if (modes.get(i) == STROKED) r.inset(-stroke / 2, -stroke / 2);
++            if (ink == null) {
++                ink = new RectF(r);
++            } else {
++                ink.union(r);
++            }
++        }
++        return ink;
++    }
++
++    /** The icon as paths in a unit square, in drawing order. */
++    private static void build(String kind, boolean day, List<Path> paths, List<Integer> modes) {
+         switch (kind) {
+             case "clear":
+                 if (day) {
+-                    sun(canvas, 0.5f, 0.5f, 0.19f, stroke);
++                    add(paths, modes, sun(0.5f, 0.5f, 0.19f), STROKED);
+                 } else {
+-                    canvas.drawPath(moon(0.5f, 0.5f, 0.32f), stroke);
++                    add(paths, modes, moon(0.5f, 0.5f, 0.32f), STROKED);
+                 }
+                 break;
+             case "partly": {
+-                if (day) {
+-                    sun(canvas, 0.37f, 0.36f, 0.13f, stroke);
+-                } else {
+-                    canvas.drawPath(moon(0.38f, 0.36f, 0.2f), stroke);
+-                }
++                add(paths, modes, day ? sun(0.37f, 0.36f, 0.13f) : moon(0.38f, 0.36f, 0.2f),
++                        STROKED);
+                 Path cloud = cloud(0.08f, 0.1f, 0.92f);
+-                canvas.drawPath(cloud, clear);
+-                canvas.drawPath(cloud, stroke);
++                add(paths, modes, cloud, KNOCKOUT);
++                add(paths, modes, cloud, STROKED);
+                 break;
+             }
+-            case "cloudy":
+-                canvas.drawPath(cloud(0f, 0f, 1f), stroke);
++            case "fog": {
++                Path p = new Path();
++                line(p, 0.14f, 0.30f, 0.86f, 0.30f);
++                line(p, 0.24f, 0.45f, 0.80f, 0.45f);
++                line(p, 0.14f, 0.60f, 0.72f, 0.60f);
++                line(p, 0.30f, 0.75f, 0.86f, 0.75f);
++                add(paths, modes, p, STROKED);
+                 break;
+-            case "fog":
+-                line(canvas, 0.14f, 0.30f, 0.86f, 0.30f, stroke);
+-                line(canvas, 0.24f, 0.45f, 0.80f, 0.45f, stroke);
+-                line(canvas, 0.14f, 0.60f, 0.72f, 0.60f, stroke);
+-                line(canvas, 0.30f, 0.75f, 0.86f, 0.75f, stroke);
+-                break;
+-            case "drizzle":
+-                canvas.drawPath(cloud(0f, -0.14f, 1f), stroke);
+-                canvas.drawCircle(0.36f, 0.78f, 0.035f, fill);
+-                canvas.drawCircle(0.52f, 0.88f, 0.035f, fill);
+-                canvas.drawCircle(0.68f, 0.78f, 0.035f, fill);
++            }
++            case "drizzle": {
++                add(paths, modes, cloud(0f, -0.14f, 1f), STROKED);
++                Path p = new Path();
++                p.addCircle(0.36f, 0.78f, 0.035f, Path.Direction.CW);
++                p.addCircle(0.52f, 0.88f, 0.035f, Path.Direction.CW);
++                p.addCircle(0.68f, 0.78f, 0.035f, Path.Direction.CW);
++                add(paths, modes, p, FILLED);
+                 break;
+-            case "rain":
+-                canvas.drawPath(cloud(0f, -0.14f, 1f), stroke);
+-                for (float rx : new float[] {0.40f, 0.56f, 0.72f}) {
+-                    line(canvas, rx, 0.72f, rx - 0.07f, 0.92f, stroke);
+-                }
++            }
++            case "rain": {
++                add(paths, modes, cloud(0f, -0.14f, 1f), STROKED);
++                Path p = new Path();
++                for (float x : new float[] {0.40f, 0.56f, 0.72f}) line(p, x, 0.72f, x - 0.07f, 0.92f);
++                add(paths, modes, p, STROKED);
+                 break;
+-            case "snow":
+-                canvas.drawPath(cloud(0f, -0.14f, 1f), stroke);
+-                flake(canvas, 0.36f, 0.80f, stroke);
+-                flake(canvas, 0.53f, 0.89f, stroke);
+-                flake(canvas, 0.70f, 0.80f, stroke);
++            }
++            case "snow": {
++                add(paths, modes, cloud(0f, -0.14f, 1f), STROKED);
++                Path p = new Path();
++                flake(p, 0.36f, 0.80f);
++                flake(p, 0.53f, 0.89f);
++                flake(p, 0.70f, 0.80f);
++                add(paths, modes, p, STROKED);
+                 break;
++            }
+             case "thunder": {
+-                canvas.drawPath(cloud(0f, -0.14f, 1f), stroke);
++                add(paths, modes, cloud(0f, -0.14f, 1f), STROKED);
+                 Path bolt = new Path();
+                 bolt.moveTo(0.56f, 0.62f);
+                 bolt.lineTo(0.42f, 0.80f);
+@@ -96,30 +168,37 @@ final class EinkWeatherIcon {
+                 bolt.lineTo(0.54f, 0.74f);
+                 bolt.lineTo(0.62f, 0.62f);
+                 bolt.close();
+-                canvas.drawPath(bolt, clear);
+-                canvas.drawPath(bolt, fill);
++                add(paths, modes, bolt, FILLED);
+                 break;
+             }
++            case "cloudy":
+             default:
+-                canvas.drawPath(cloud(0f, 0f, 1f), stroke);
++                add(paths, modes, cloud(0f, 0f, 1f), STROKED);
+                 break;
+         }
+-        canvas.restore();
+     }
+ 
+-    private static void line(Canvas c, float x0, float y0, float x1, float y1, Paint p) {
+-        c.drawLine(x0, y0, x1, y1, p);
++    private static void add(List<Path> paths, List<Integer> modes, Path p, int mode) {
++        paths.add(p);
++        modes.add(mode);
+     }
+ 
+-    private static void sun(Canvas c, float cx, float cy, float r, Paint p) {
+-        c.drawCircle(cx, cy, r, p);
++    private static void line(Path p, float x0, float y0, float x1, float y1) {
++        p.moveTo(x0, y0);
++        p.lineTo(x1, y1);
++    }
++
++    private static Path sun(float cx, float cy, float r) {
++        Path p = new Path();
++        p.addCircle(cx, cy, r, Path.Direction.CW);
+         for (int i = 0; i < 8; i++) {
+             double a = Math.PI / 4 * i;
+             float dx = (float) Math.cos(a);
+             float dy = (float) Math.sin(a);
+-            c.drawLine(cx + dx * r * 1.5f, cy + dy * r * 1.5f,
+-                    cx + dx * r * 2.05f, cy + dy * r * 2.05f, p);
++            line(p, cx + dx * r * 1.5f, cy + dy * r * 1.5f, cx + dx * r * 2.05f,
++                    cy + dy * r * 2.05f);
+         }
++        return p;
+     }
+ 
+     /** A crescent: a disc with a smaller disc taken out at the upper right. */
+@@ -145,20 +224,20 @@ final class EinkWeatherIcon {
+         p.op(c2, Path.Op.UNION);
+         p.op(c3, Path.Op.UNION);
+         p.op(base, Path.Op.UNION);
+-        android.graphics.Matrix m = new android.graphics.Matrix();
++        Matrix m = new Matrix();
+         m.setScale(scale, scale, 0.5f, 0.5f);
+         m.postTranslate(dx, dy);
+         p.transform(m);
+         return p;
+     }
+ 
+-    private static void flake(Canvas c, float cx, float cy, Paint p) {
++    private static void flake(Path p, float cx, float cy) {
+         final float r = 0.055f;
+         for (int i = 0; i < 3; i++) {
+             double a = Math.PI / 3 * i + Math.PI / 2;
+             float dx = (float) Math.cos(a) * r;
+             float dy = (float) Math.sin(a) * r;
+-            c.drawLine(cx - dx, cy - dy, cx + dx, cy + dy, p);
++            line(p, cx - dx, cy - dy, cx + dx, cy + dy);
+         }
+     }
+ }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,101 @@
+From 4812e5fa0788ff82af29c6757c2ebaac227d59ef Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Sat, 21 Nov 2026 22:00:07 +0100
+Subject: [PATCH 2/2] RILUtils: optional modem profile id for IMS-only APNs
+
+MediaTek modems are reported to bring up the IMS PDN (and, with
+ro.vendor.md_auto_setup_ims=1, attach it themselves) only for a
+modem-cognitive data profile with the IMS profile id
+(RILConstants.DATA_PROFILE_IMS, 2). The APN database has IMS APNs
+non-persistent with profile id 0, so they reach the modem with
+DataProfileId.INVALID.
+
+When ro.telephony.ims_apn_profile_id is set (persist.debug.telephony.
+ims_apn_profile_id overrides it for testing, -1 turns it off), IMS-only
+APNs that are not persistent and have no profile id of their own go to
+the modem as persistent with that id, in setDataProfile and
+setupDataCall, for the HIDL 1.4/1.5 and AIDL data profile conversions.
+Unset (the default), nothing changes.
+---
+ .../android/internal/telephony/RILUtils.java  | 37 +++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/src/java/com/android/internal/telephony/RILUtils.java b/src/java/com/android/internal/telephony/RILUtils.java
+index 7179521..90c8528 100644
+--- a/src/java/com/android/internal/telephony/RILUtils.java
++++ b/src/java/com/android/internal/telephony/RILUtils.java
+@@ -313,6 +313,7 @@ import android.net.InetAddresses;
+ import android.net.LinkAddress;
+ import android.net.LinkProperties;
+ import android.os.SystemClock;
++import android.os.SystemProperties;
+ import android.service.carrier.CarrierIdentifier;
+ import android.telephony.AccessNetworkConstants;
+ import android.telephony.Annotation;
+@@ -898,6 +899,30 @@ public class RILUtils {
+         return new SmsMessage(addr, env);
+     }
+ 
++    /**
++     * Data profile id the modem expects for the IMS APN, or -1 to leave IMS profiles alone.
++     * MediaTek modems are reported to bring up (and auto-attach) the IMS PDN only for a
++     * modem-cognitive profile with the IMS profile id (DATA_PROFILE_IMS), while the APN database
++     * leaves IMS APNs non-persistent with no profile id. Devices set ro.telephony.ims_apn_profile_id;
++     * persist.debug.telephony.ims_apn_profile_id overrides it for testing (-1 turns it off).
++     */
++    private static int getImsProfileIdOverride() {
++        return SystemProperties.getInt("persist.debug.telephony.ims_apn_profile_id",
++                SystemProperties.getInt("ro.telephony.ims_apn_profile_id", -1));
++    }
++
++    /**
++     * Whether {@code dp} is an IMS-only APN without a modem profile of its own, which gets the
++     * device's IMS profile id (see {@link #getImsProfileIdOverride()}).
++     */
++    private static boolean useImsProfileOverride(DataProfile dp) {
++        if (getImsProfileIdOverride() < 0 || dp.isPersistent() || dp.getProfileId() != 0) {
++            return false;
++        }
++        ApnSetting apn = dp.getApnSetting();
++        return apn != null && apn.getApnTypeBitmask() == ApnSetting.TYPE_IMS;
++    }
++
+     /**
+      * Convert to DataProfileInfo defined in radio/1.4/types.hal
+      * @param dp Data profile
+@@ -932,6 +957,10 @@ public class RILUtils {
+         // profile id is only meaningful when it's persistent on the modem.
+         dpi.profileId = (dpi.persistent) ? dp.getProfileId()
+                 : android.hardware.radio.V1_0.DataProfileId.INVALID;
++        if (useImsProfileOverride(dp)) {
++            dpi.persistent = true;
++            dpi.profileId = getImsProfileIdOverride();
++        }
+ 
+         return dpi;
+     }
+@@ -971,6 +1000,10 @@ public class RILUtils {
+         // profile id is only meaningful when it's persistent on the modem.
+         dpi.profileId = (dpi.persistent) ? dp.getProfileId()
+                 : android.hardware.radio.V1_0.DataProfileId.INVALID;
++        if (useImsProfileOverride(dp)) {
++            dpi.persistent = true;
++            dpi.profileId = getImsProfileIdOverride();
++        }
+ 
+         return dpi;
+     }
+@@ -1018,6 +1051,10 @@ public class RILUtils {
+         // profile id is only meaningful when it's persistent on the modem.
+         dpi.profileId = (dpi.persistent) ? dp.getProfileId()
+                 : android.hardware.radio.data.DataProfileInfo.ID_INVALID;
++        if (useImsProfileOverride(dp)) {
++            dpi.persistent = true;
++            dpi.profileId = getImsProfileIdOverride();
++        }
+ 
+         return dpi;
+     }
+-- 
+2.50.1 (Apple Git-155)
+

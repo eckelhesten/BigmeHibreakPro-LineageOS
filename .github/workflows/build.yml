@@ -1,0 +1,192 @@
+name: build
+
+# Full LineageOS build on a throwaway Hetzner Cloud server (scripts/ci/hcloud-build.sh).
+# The GitHub runner only drives it; the server exists only while this job runs
+# (CPX62 in hel1 at €0.177/h: a full sync + build is ~2.5 h, about €0.45 excluding VAT).
+#
+# Setup (once):
+#   secrets.HCLOUD_TOKEN            Hetzner Cloud API token (read/write) for the build project
+#   secrets.VENDOR_DEPLOY_KEY       read-only deploy key for the PRIVATE vendor repo
+#   secrets.RELEASE_KEYS_PASSPHRASE passphrase for vendor/bigme/hibreakpro/release-keys.tar.gz.gpg
+#                                   (see docs/signing.md; encrypting the 160-file tarball in the
+#                                   private vendor repo avoids GitHub's 48 KB secret limit).
+#   vars.VENDOR_REPO                e.g. OWNER/proprietary_vendor_bigme_hibreakpro (Git LFS for prebuilt/*.img)
+on:
+  workflow_dispatch:
+    inputs:
+      lineage_branch:
+        description: LineageOS branch
+        default: lineage-23.2
+      build_type:
+        description: Build variant
+        type: choice
+        options: [userdebug, user]
+        default: userdebug
+      flavors:
+        description: "Flavours to build (vanilla microg gapps; docs/building.md)"
+        default: vanilla microg gapps
+      publish:
+        description: "Publish a GitHub release (needs version and build type user)"
+        type: boolean
+        default: false
+      version:
+        description: "Release version, e.g. 1.0.0 (tag v1.0.0); only used with publish"
+        default: ""
+  workflow_call:
+    inputs:
+      lineage_branch: { type: string, default: lineage-23.2 }
+      build_type: { type: string, default: userdebug }
+      flavors: { type: string, default: vanilla microg gapps }
+      publish: { type: boolean, default: false }
+      version: { type: string, default: "" }
+
+concurrency:
+  group: lineage-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330          # below GitHub's 6 h limit; hcloud-build.sh stops itself at MAX_HOURS=5
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      HCLOUD_VERSION: v1.70.2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
+
+      - name: Check out private vendor tree
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.VENDOR_REPO }}
+          ssh-key: ${{ secrets.VENDOR_DEPLOY_KEY }}
+          path: vendor/bigme/hibreakpro
+          lfs: true
+
+      - name: Check the release version
+        if: ${{ inputs.publish }}
+        env:
+          VERSION: ${{ inputs.version }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be like 1.0.0, not '$VERSION'"; exit 1; }
+          [ "$BUILD_TYPE" = user ] || { echo "::error::releases are user builds, not $BUILD_TYPE"; exit 1; }
+          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release v$VERSION exists already"; exit 1
+          fi
+
+      - name: Install hcloud CLI
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          curl -fsSL "https://github.com/hetznercloud/cli/releases/download/${HCLOUD_VERSION}/hcloud-linux-amd64.tar.gz" -o "$tmp/hcloud-linux-amd64.tar.gz"
+          curl -fsSL "https://github.com/hetznercloud/cli/releases/download/${HCLOUD_VERSION}/checksums.txt" -o "$tmp/checksums.txt"
+          expected=$(awk '$2 ~ /^(\.\/)?hcloud-linux-amd64\.tar\.gz$/ { print $1 }' "$tmp/checksums.txt")
+          [ -n "$expected" ]
+          echo "$expected  $tmp/hcloud-linux-amd64.tar.gz" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f "$tmp/hcloud-linux-amd64.tar.gz" hcloud
+          hcloud version
+
+      - name: Unpack release keys
+        env:
+          RELEASE_KEYS_PASSPHRASE: ${{ secrets.RELEASE_KEYS_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          KEY_ARCHIVE="vendor/bigme/hibreakpro/release-keys.tar.gz.gpg"
+          [ -f "$KEY_ARCHIVE" ] || { echo "::error::missing $KEY_ARCHIVE in vendor repo"; exit 1; }
+          [ -n "$RELEASE_KEYS_PASSPHRASE" ] || { echo "::error::secret RELEASE_KEYS_PASSPHRASE is not set"; exit 1; }
+          umask 077
+          mkdir -p "$RUNNER_TEMP/keys"
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --decrypt "$KEY_ARCHIVE" 3<<<"$RELEASE_KEYS_PASSPHRASE" \
+            | tar -C "$RUNNER_TEMP/keys" -xzf -
+          [ -f "$RUNNER_TEMP/keys/releasekey.pk8" ] || { echo "::error::no releasekey.pk8 in decrypted keys archive"; exit 1; }
+          [ -f "$RUNNER_TEMP/keys/avb2048.pem" ] || { echo "::error::no avb2048.pem in decrypted keys archive"; exit 1; }
+
+      # Three flavours of zip + images are ~12 GB: more than the runner's root disk has free.
+      - name: Artifact directory on the large disk
+        run: |
+          sudo mkdir -p /mnt/dist && sudo chown "$(id -u):$(id -g)" /mnt/dist
+          ln -sfn /mnt/dist dist
+
+      - name: Build on Hetzner
+        env:
+          LINEAGE_BRANCH: ${{ inputs.lineage_branch }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+          HIBREAK_FLAVORS: ${{ inputs.flavors }}
+          OUT_DIR: dist
+          RELEASE_KEYS_DIR: ${{ runner.temp }}/keys
+          CI_RUN_ID: ${{ github.run_id }}
+        run: scripts/ci/hcloud-build.sh
+
+      - name: Remove the release keys
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
+
+      - name: Make sure this run's build server is not left running
+        if: always()
+        # Only this run's server/keys: a build started from the Mac at the same time is labelled
+        # hibreak=ci too.
+        run: |
+          command -v hcloud >/dev/null 2>&1 && [ -n "${HCLOUD_TOKEN:-}" ] || exit 0
+          for s in $(hcloud server list -l "hibreak=ci,run=${{ github.run_id }}" -o noheader -o columns=name || true); do
+            echo "deleting leftover server $s"; hcloud server delete "$s" || true
+          done
+          for k in $(hcloud ssh-key list -l "hibreak=ci,run=${{ github.run_id }}" -o noheader -o columns=name || true); do
+            echo "deleting leftover key $k"; hcloud ssh-key delete "$k" || true
+          done
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hibreakpro-${{ github.run_number }}
+          path: |
+            dist/*/build.log
+            dist/*/sepolicy-check.log
+            dist/*/release-check.log
+            dist/*/sync3.log
+            dist/*/SHA256SUMS
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Publish release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # One release per version with every flavour: its zip (name carries the flavour), its
+          # images as <flavour>-<image>.img and SHA256SUMS-<flavour>. No update server: people
+          # download the zip and install it with Updater > "Install local update".
+          dirs=(dist/lineage-*-hibreakpro)
+          [ "${#dirs[@]}" -gt 0 ] || { echo "::error::no artifact directory in dist/"; exit 1; }
+          assets=(); notes=""
+          for d in "${dirs[@]}"; do
+            zips=("$d"/lineage-*-UNOFFICIAL-*-hibreakpro.zip)
+            [ "${#zips[@]}" -eq 1 ] || { echo "::error::expected one zip in $d"; exit 1; }
+            zip=${zips[0]}
+            f=$(basename "$zip" .zip); f=${f%-hibreakpro}; f=${f##*-}
+            [[ "$f" =~ ^(vanilla|microg|gapps)$ ]] || { echo "::error::no flavour in $zip"; exit 1; }
+            for img in "$d"/*.img; do mv "$img" "$d/$f-$(basename "$img")"; done
+            ( cd "$d" && sha256sum "$(basename "$zip")" "$f"-*.img > "SHA256SUMS-$f" )
+            assets+=("$zip" "$d"/"$f"-*.img "$d/SHA256SUMS-$f")
+            notes+="- **$f**: \`$(basename "$zip")\`"$'\n'
+          done
+          tag="v$VERSION"
+          {
+            echo "HiBreak Pro LineageOS $VERSION"
+            echo
+            echo "$notes"
+            echo "Changes:"
+            git log -20 --format='- %s'
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" --title "$VERSION" --notes-file "$RUNNER_TEMP/notes.md" "${assets[@]}"

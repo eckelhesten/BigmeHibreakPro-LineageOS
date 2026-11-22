@@ -1,0 +1,239 @@
+From 0e4918d9dae0ccc1fb68422012aec4f37f98d195 Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Fri, 13 Nov 2026 15:06:42 +0000
+Subject: [PATCH] sf: optionally send the client target's damage to the
+ composer
+
+HWC2 setClientTarget() always got an empty damage list ("whole buffer"),
+see the TODO in Display::setClientTarget. With
+debug.sf.hwc_client_target_damage=1 the frame's dirty region (mapped
+from layer-stack to framebuffer space) is attached to the GPU-composed
+buffer as surface damage, and FramebufferSurface forwards it to the HAL.
+
+The MT6877 e-ink composer on the Bigme HiBreak Pro, which we drive with
+forced client composition, uses this damage for partial panel updates.
+Without it every frame, even a single keyboard key press, refreshes the
+whole screen.
+
+Change-Id: I4315baf97b4d1699d17fc0b5923801a54e81adc9
+---
+ .../include/compositionengine/RenderSurface.h     |  5 +++++
+ .../compositionengine/impl/RenderSurface.h        |  2 ++
+ .../CompositionEngine/src/Output.cpp              |  9 +++++++++
+ .../CompositionEngine/src/RenderSurface.cpp       | 14 ++++++++++++++
+ .../DisplayHardware/FramebufferSurface.cpp        |  2 +-
+ services/surfaceflinger/DisplayHardware/HWC2.cpp  | 15 ++++++++++-----
+ services/surfaceflinger/DisplayHardware/HWC2.h    |  7 +++++--
+ .../surfaceflinger/DisplayHardware/HWComposer.cpp |  6 ++++--
+ .../surfaceflinger/DisplayHardware/HWComposer.h   |  6 ++++--
+ 9 files changed, 54 insertions(+), 12 deletions(-)
+
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/RenderSurface.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/RenderSurface.h
+index 02cea0d..3278a16 100644
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/RenderSurface.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/RenderSurface.h
+@@ -18,6 +18,7 @@
+ 
+ #include <renderengine/ExternalTexture.h>
+ #include <ui/Fence.h>
++#include <ui/Region.h>
+ #include <ui/GraphicTypes.h>
+ #include <ui/Size.h>
+ #include <utils/Errors.h>
+@@ -88,6 +89,10 @@ public:
+     // which will fire when the buffer is ready for consumption.
+     virtual void queueBuffer(base::unique_fd readyFence, float hdrSdrRatio) = 0;
+ 
++    // Damage of the next queued buffer, in buffer coordinates (top-left origin). Optional:
++    // without it the whole buffer counts as damaged.
++    virtual void setBufferDamage(const Region& /*damage*/) {}
++
+     // Called after the HWC calls are made to present the display
+     virtual void onPresentDisplayCompleted() = 0;
+ 
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/RenderSurface.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/RenderSurface.h
+index 202145e..31bbca3 100644
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/RenderSurface.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/RenderSurface.h
+@@ -61,6 +61,7 @@ public:
+     std::shared_ptr<renderengine::ExternalTexture> dequeueBuffer(
+             base::unique_fd* bufferFence) override;
+     void queueBuffer(base::unique_fd readyFence, float hdrSdrRatio) override;
++    void setBufferDamage(const Region& damage) override;
+     void onPresentDisplayCompleted() override;
+     bool supportsCompositionStrategyPrediction() const override;
+ 
+@@ -82,6 +83,7 @@ private:
+     std::vector<std::shared_ptr<renderengine::ExternalTexture>> mTextureCache;
+     // Current texture being rendered into
+     std::shared_ptr<renderengine::ExternalTexture> mTexture;
++    std::optional<Region> mBufferDamage;
+     const sp<DisplaySurface> mDisplaySurface;
+     ui::Size mSize;
+     const size_t mMaxTextureCacheSize;
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index 6809295..bea48f7 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -1340,6 +1340,15 @@ void Output::finishFrame(GpuCompositionResult&& result) {
+         setHintSessionGpuFence(
+                 std::make_unique<FenceTime>(sp<Fence>::make(dup(optReadyFence->get()))));
+     }
++    // Tell the composer which part of the client target changed. Partial-update panels (MT6877
++    // e-ink HWC on the Bigme HiBreak Pro) then refresh only that area instead of the whole screen.
++    static const bool kClientTargetDamage =
++            base::GetBoolProperty("debug.sf.hwc_client_target_damage", false);
++    if (kClientTargetDamage) {
++        const Region dirty = outputState.transform.transform(getDirtyRegion())
++                                     .intersect(outputState.framebufferSpace.getBoundsAsRect());
++        mRenderSurface->setBufferDamage(dirty);
++    }
+     // swap buffers (presentation)
+     mRenderSurface->queueBuffer(std::move(*optReadyFence), getHdrSdrRatio(buffer));
+ }
+diff --git a/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp b/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
+index d6028bf..b5aadd3 100644
+--- a/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
+@@ -198,6 +198,10 @@ std::shared_ptr<renderengine::ExternalTexture> RenderSurface::dequeueBuffer(
+     return mTexture;
+ }
+ 
++void RenderSurface::setBufferDamage(const Region& damage) {
++    mBufferDamage = damage;
++}
++
+ void RenderSurface::queueBuffer(base::unique_fd readyFence, float hdrSdrRatio) {
+     auto& state = mDisplay.getState();
+ 
+@@ -220,6 +224,17 @@ void RenderSurface::queueBuffer(base::unique_fd readyFence, float hdrSdrRatio) {
+         if (mTexture == nullptr) {
+             ALOGE("No buffer is ready for display [%s]", mDisplay.getName().c_str());
++            mBufferDamage.reset();
+         } else {
++            if (mBufferDamage && !mBufferDamage->isEmpty()) {
++                // ANativeWindow surface damage uses the OpenGL convention (bottom-left origin).
++                const int32_t height = static_cast<int32_t>(mTexture->getBuffer()->getHeight());
++                std::vector<android_native_rect_t> rects;
++                for (const Rect& r : *mBufferDamage) {
++                    rects.push_back({r.left, height - r.top, r.right, height - r.bottom});
++                }
++                native_window_set_surface_damage(mNativeWindow.get(), rects.data(), rects.size());
++            }
++            mBufferDamage.reset();
+             status_t result = mNativeWindow->queueBuffer(mNativeWindow.get(),
+                                                          mTexture->getBuffer()->getNativeBuffer(),
+                                                          dup(readyFence));
+diff --git a/services/surfaceflinger/DisplayHardware/FramebufferSurface.cpp b/services/surfaceflinger/DisplayHardware/FramebufferSurface.cpp
+index 709dd9b..41e79d8 100644
+--- a/services/surfaceflinger/DisplayHardware/FramebufferSurface.cpp
++++ b/services/surfaceflinger/DisplayHardware/FramebufferSurface.cpp
+@@ -136,7 +136,7 @@ status_t FramebufferSurface::advanceFrame(float hdrSdrRatio) {
+         hwcBuffer = mCurrentBuffer; // HWC hasn't previously seen this buffer in this slot
+     }
+     status_t result = mHwc.setClientTarget(mDisplayId, mCurrentBufferSlot, mCurrentFence, hwcBuffer,
+-                                           mDataspace, hdrSdrRatio);
++                                           mDataspace, hdrSdrRatio, item.mSurfaceDamage);
+     if (result != NO_ERROR) {
+         ALOGE("error posting framebuffer: %s (%d)", strerror(-result), result);
+         return result;
+diff --git a/services/surfaceflinger/DisplayHardware/HWC2.cpp b/services/surfaceflinger/DisplayHardware/HWC2.cpp
+index ecaf888..52a118d 100644
+--- a/services/surfaceflinger/DisplayHardware/HWC2.cpp
++++ b/services/surfaceflinger/DisplayHardware/HWC2.cpp
+@@ -468,12 +468,17 @@ Error Display::setActiveConfigWithConstraints(hal::HWConfigId configId,
+ 
+ Error Display::setClientTarget(uint32_t slot, const sp<GraphicBuffer>& target,
+                                const sp<Fence>& acquireFence, Dataspace dataspace,
+-                               float hdrSdrRatio) {
+-    // TODO: Properly encode client target surface damage
++                               float hdrSdrRatio, const Region& damage) {
++    // Full-buffer damage is encoded as zero rects for HWC.
++    std::vector<Hwc2::IComposerClient::Rect> hwcDamage;
++    if (!(damage.isRect() && damage.getBounds() == Rect::INVALID_RECT)) {
++        for (const Rect& r : damage) {
++            hwcDamage.push_back({r.left, r.top, r.right, r.bottom});
++        }
++    }
+     int32_t fenceFd = acquireFence->dup();
+-    auto intError =
+-            mComposer.setClientTarget(mId, slot, target, fenceFd, dataspace,
+-                                      std::vector<Hwc2::IComposerClient::Rect>(), hdrSdrRatio);
++    auto intError = mComposer.setClientTarget(mId, slot, target, fenceFd, dataspace, hwcDamage,
++                                              hdrSdrRatio);
+     return static_cast<Error>(intError);
+ }
+ 
+diff --git a/services/surfaceflinger/DisplayHardware/HWC2.h b/services/surfaceflinger/DisplayHardware/HWC2.h
+index 5b2c644..b6f3d66 100644
+--- a/services/surfaceflinger/DisplayHardware/HWC2.h
++++ b/services/surfaceflinger/DisplayHardware/HWC2.h
+@@ -158,7 +158,8 @@ public:
+     [[nodiscard]] virtual hal::Error setClientTarget(
+             uint32_t slot, const android::sp<android::GraphicBuffer>& target,
+             const android::sp<android::Fence>& acquireFence, hal::Dataspace dataspace,
+-            float hdrSdrRatio) = 0;
++            float hdrSdrRatio,
++            const android::Region& damage = android::Region::INVALID_REGION) = 0;
+     [[nodiscard]] virtual hal::Error setColorMode(hal::ColorMode mode,
+                                                   hal::RenderIntent renderIntent) = 0;
+     [[nodiscard]] virtual hal::Error setColorTransform(const android::mat4& matrix) = 0;
+@@ -262,7 +263,9 @@ public:
+     hal::Error present(android::sp<android::Fence>* outPresentFence) override;
+     hal::Error setClientTarget(uint32_t slot, const android::sp<android::GraphicBuffer>& target,
+                                const android::sp<android::Fence>& acquireFence,
+-                               hal::Dataspace dataspace, float hdrSdrRatio) override;
++                               hal::Dataspace dataspace, float hdrSdrRatio,
++                               const android::Region& damage =
++                                       android::Region::INVALID_REGION) override;
+     hal::Error setColorMode(hal::ColorMode, hal::RenderIntent) override;
+     hal::Error setColorTransform(const android::mat4& matrix) override;
+     hal::Error setOutputBuffer(const android::sp<android::GraphicBuffer>&,
+diff --git a/services/surfaceflinger/DisplayHardware/HWComposer.cpp b/services/surfaceflinger/DisplayHardware/HWComposer.cpp
+index f732d25..ffdf031 100644
+--- a/services/surfaceflinger/DisplayHardware/HWComposer.cpp
++++ b/services/surfaceflinger/DisplayHardware/HWComposer.cpp
+@@ -522,12 +522,14 @@ void HWComposer::setVsyncEnabled(PhysicalDisplayId displayId, hal::Vsync enabled
+ 
+ status_t HWComposer::setClientTarget(HalDisplayId displayId, uint32_t slot,
+                                      const sp<Fence>& acquireFence, const sp<GraphicBuffer>& target,
+-                                     ui::Dataspace dataspace, float hdrSdrRatio) {
++                                     ui::Dataspace dataspace, float hdrSdrRatio,
++                                     const Region& damage) {
+     RETURN_IF_INVALID_DISPLAY(displayId, BAD_INDEX);
+ 
+     ALOGV("%s for display %s", __FUNCTION__, to_string(displayId).c_str());
+     auto& hwcDisplay = mDisplayData[displayId].hwcDisplay;
+-    auto error = hwcDisplay->setClientTarget(slot, target, acquireFence, dataspace, hdrSdrRatio);
++    auto error = hwcDisplay->setClientTarget(slot, target, acquireFence, dataspace, hdrSdrRatio,
++                                             damage);
+     RETURN_IF_HWC_ERROR(error, displayId, BAD_VALUE);
+     return NO_ERROR;
+ }
+diff --git a/services/surfaceflinger/DisplayHardware/HWComposer.h b/services/surfaceflinger/DisplayHardware/HWComposer.h
+index bbdb2d5..957fdae 100644
+--- a/services/surfaceflinger/DisplayHardware/HWComposer.h
++++ b/services/surfaceflinger/DisplayHardware/HWComposer.h
+@@ -168,7 +168,8 @@ public:
+ 
+     virtual status_t setClientTarget(HalDisplayId, uint32_t slot, const sp<Fence>& acquireFence,
+                                      const sp<GraphicBuffer>& target, ui::Dataspace,
+-                                     float hdrSdrRatio) = 0;
++                                     float hdrSdrRatio,
++                                     const Region& damage = Region::INVALID_REGION) = 0;
+ 
+     // Present layers to the display and read releaseFences.
+     virtual status_t presentAndGetReleaseFences(
+@@ -391,7 +392,8 @@ public:
+ 
+     status_t setClientTarget(HalDisplayId, uint32_t slot, const sp<Fence>& acquireFence,
+                              const sp<GraphicBuffer>& target, ui::Dataspace,
+-                             float hdrSdrRatio) override;
++                             float hdrSdrRatio,
++                             const Region& damage = Region::INVALID_REGION) override;
+ 
+     // Present layers to the display and read releaseFences.
+     status_t presentAndGetReleaseFences(
+-- 
+2.43.0
+

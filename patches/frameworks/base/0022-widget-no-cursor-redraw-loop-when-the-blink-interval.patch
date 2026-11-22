@@ -1,0 +1,45 @@
+From 1544f07d11396f08e771be6e6e32ee92b44feed1 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Fri, 20 Nov 2026 16:12:20 +0000
+Subject: [PATCH] widget: no cursor redraw loop when the blink interval is 0
+
+With android.view.accessibility.Flags.textCursorBlinkInterval and the
+text cursor blink interval set to 0 (NO_BLINK_TEXT_CURSOR_BLINK_INTERVAL_MS,
+"don't blink"), shouldRenderCursor() correctly keeps the cursor on, but
+makeBlink() and Blink.run() still post the blink runnable with a delay of
+0 and invalidate the cursor path every time it runs. A focused text field
+then redraws at the full frame rate for as long as it has focus.
+
+The e-ink device defaults the interval to 0 (a blink costs a panel
+update): measured on the Settings search field, the app queued 52 frames
+a second and SurfaceFlinger composed each one, 2.3 s of UI-thread
+traversal in 4 s, with nothing changing on screen.
+
+Don't schedule the blink when the interval is NO_BLINK; the cursor is
+drawn as before (shouldRenderCursor() returns true) and is still redrawn
+whenever the text or the selection changes.
+
+Change-Id: Ie85dba3de1dc415a88ddde98281cc91c2c32fe36
+---
+ core/java/android/widget/Editor.java | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/core/java/android/widget/Editor.java b/core/java/android/widget/Editor.java
+index 88eb3392a..0e671cde3 100644
+--- a/core/java/android/widget/Editor.java
++++ b/core/java/android/widget/Editor.java
+@@ -2977,6 +2977,11 @@ public class Editor {
+     private boolean shouldBlink() {
+         if (!isCursorVisible() || !mTextView.isFocused()
+                 || mTextView.getWindowVisibility() != mTextView.VISIBLE) return false;
++        // A cursor that doesn't blink needs no blink runnable: with an interval of 0 it would
++        // invalidate the cursor on every frame (shouldRenderCursor() keeps it on).
++        if (mBlinkInterval == ViewConfiguration.NO_BLINK_TEXT_CURSOR_BLINK_INTERVAL_MS) {
++            return false;
++        }
+ 
+         final int start = mTextView.getSelectionStart();
+         if (start < 0) return false;
+-- 
+2.43.0
+

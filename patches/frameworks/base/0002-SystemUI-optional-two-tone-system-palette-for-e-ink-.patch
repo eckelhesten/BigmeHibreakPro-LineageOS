@@ -1,0 +1,135 @@
+From 221c84c6f0e3eb0869b81e989ecfba29b53acaa6 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Fri, 13 Nov 2026 15:49:53 +0000
+Subject: [PATCH 2/4] SystemUI: optional two-tone system palette for e-ink
+ panels
+
+With debug.sysui.eink_palette=1, ThemeOverlayController maps every
+system colour role to pure black or white instead of the
+wallpaper-derived Material scheme. Foreground roles (primary, outlines,
+inverse surface, ...) are ink, surfaces and containers are paper, and
+on_X is the opposite of X; tonal palettes split at shade 500. Dark mode
+is the inverse. Unknown roles keep the generated colour.
+
+E-ink panels render greys by dithering, so the default tonal UI
+(grey shade, grey secondary text, tinted containers) looks washed out
+and blurry. On the Bigme HiBreak Pro the quick settings panel was 80%
+mid-grey pixels before this change.
+
+Paper is 0xFFFEFEFE, not 0xFFFFFFFF: as an int pure white is -1, which
+apps use as "not set". Dialer's in-call screen asserts colorPrimary
+(system_neutral2_50) != -1 and crashed on every call. The render pass
+bleaches anything above ~0.76 to white, so the panel shows no difference.
+
+Change-Id: I4dc26bcd3b108734108ca35cf39ab8a7f5881348
+---
+ .../theme/ThemeOverlayController.java         | 82 ++++++++++++++++++-
+ 1 file changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/theme/ThemeOverlayController.java b/packages/SystemUI/src/com/android/systemui/theme/ThemeOverlayController.java
+index c655e648a..19d9ac136 100644
+--- a/packages/SystemUI/src/com/android/systemui/theme/ThemeOverlayController.java
++++ b/packages/SystemUI/src/com/android/systemui/theme/ThemeOverlayController.java
+@@ -736,17 +736,96 @@ public class ThemeOverlayController implements CoreStartable, Dumpable {
+ 
+             if (isFixed) {
+                 overlay.setResourceValue(prefix, TYPE_INT_COLOR_ARGB8,
+-                        p.second.getArgb(mLightColorScheme.getMaterialScheme()), null);
++                        EinkPalette.apply(p.first, false,
++                                p.second.getArgb(mLightColorScheme.getMaterialScheme())), null);
+                 return;
+             }
+ 
+             overlay.setResourceValue(prefix + "_light", TYPE_INT_COLOR_ARGB8,
+-                    p.second.getArgb(mLightColorScheme.getMaterialScheme()), null);
++                    EinkPalette.apply(p.first, false,
++                            p.second.getArgb(mLightColorScheme.getMaterialScheme())), null);
+             overlay.setResourceValue(prefix + "_dark", TYPE_INT_COLOR_ARGB8,
+-                    p.second.getArgb(mDarkColorScheme.getMaterialScheme()), null);
++                    EinkPalette.apply(p.first, true,
++                            p.second.getArgb(mDarkColorScheme.getMaterialScheme())), null);
+         });
+     }
+ 
++    /**
++     * Two-tone system palette for e-ink panels (debug.sysui.eink_palette=1): instead of the
++     * wallpaper-derived Material scheme, every colour role becomes pure black or white, so text,
++     * icons and outlines are crisp and surfaces are paper white (inverted in dark mode). Greys
++     * dither badly on e-ink and make secondary text and inactive states unreadable.
++     * Roles: foreground (black in light mode), background (white), "on_X" = opposite of X.
++     * Accent containers count as foreground; surface containers as background.
++     * Unknown names keep the generated colour.
++     */
++    static final class EinkPalette {
++        private static final boolean ENABLED =
++                android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false);
++        private static final int INK = 0xFF000000;
++        private static final int PAPER = 0xFFFEFEFE; // not 0xFFFFFFFF: that is -1, "unset" to apps
++
++        private static final java.util.Set<String> FOREGROUND = java.util.Set.of(
++                "primary", "secondary", "tertiary", "error", "outline", "outline_variant",
++                "inverse_surface", "scrim", "shadow", "palette_key_color",
++                "shade_active", "clock_hour", "clock_minute", "clock_second", "weather_temp",
++                "theme_app_ring", "brand_a", "brand_b", "brand_c", "brand_d");
++
++        private static final java.util.regex.Pattern ACCENT_CONTAINER = java.util.regex.Pattern
++                .compile("(primary|secondary|tertiary|error)_(container|fixed|fixed_dim)");
++
++        private EinkPalette() {}
++
++        static int apply(String name, boolean dark, int generated) {
++            if (!ENABLED) return generated;
++            // Scrims and shadows stay black in dark mode too (inverting them to white makes
++            // modal/drawer scrims pure white).
++            if ("scrim".equals(name) || "shadow".equals(name)) return INK;
++            Boolean fg = isForeground(name);
++            if (fg == null) return generated;
++            // Light mode: foreground = ink, background = paper. Dark mode: inverted.
++            return (fg ^ dark) ? INK : PAPER;
++        }
++
++        /** true = foreground role, false = background role, null = leave unchanged. */
++        private static Boolean isForeground(String name) {
++            // Tonal palettes: accent1_500, neutral2_10, ... (0 = white .. 1000 = black)
++            if (name.startsWith("accent") || name.startsWith("neutral")) {
++                int u = name.lastIndexOf('_');
++                if (u < 0) return null;
++                try {
++                    return Integer.parseInt(name.substring(u + 1)) >= 500;
++                } catch (NumberFormatException e) {
++                    return null;
++                }
++            }
++            if (name.startsWith("on_")) {
++                // on_surface_variant, on_shade_active_variant, ...: same as the plain on_ role
++                String base = name.substring(3);
++                if (base.endsWith("_variant")) {
++                    base = base.substring(0, base.length() - "_variant".length());
++                }
++                Boolean b = isForeground(base);
++                return b == null ? Boolean.TRUE : !b;
++            }
++            if (name.equals("inverse_on_surface")) return Boolean.FALSE;
++            if (name.equals("inverse_primary")) return Boolean.FALSE;
++            if (FOREGROUND.contains(name)) return Boolean.TRUE;
++            // Accent containers are ink too: apps use them both as fills (selected chips, tonal
++            // buttons, which become solid black like active tiles) and as text colour on the
++            // wallpaper (the DeskClock widget), where paper would be invisible.
++            if (ACCENT_CONTAINER.matcher(name).matches()) return Boolean.TRUE;
++            if (name.startsWith("surface") || name.equals("background")
++                    || name.endsWith("_container") || name.contains("_fixed")
++                    || name.startsWith("shade_") || name.equals("under_surface")
++                    || name.equals("widget_background") || name.equals("theme_app")
++                    || name.equals("theme_notif") || name.equals("overview_background")) {
++                return Boolean.FALSE;
++            }
++            return null;
++        }
++    }
++
+     /**
+      * Checks if the color scheme in mColorScheme matches the current system palettes.
+      *
+-- 
+2.43.0
+

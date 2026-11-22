@@ -1,0 +1,17 @@
+# Never commit device dumps: they contain IMEI/calibration (nvram, nvdata, proinfo),
+# per-panel e-ink calibration (waveform, vcom) and proprietary firmware.
+/backup/
+# Raw device info contains serial numbers and device IDs. Scrubbed findings live in docs/.
+/device-info/
+/.venv/
+/tools/mtkclient/
+/out/
+*.img
+*.bin
+.DS_Store
+# Proprietary binaries pulled from the device for reverse engineering
+/re/
+# Stock images and proprietary files extracted from the device
+/stock/
+# Proprietary prebuilts (vendor image, kernel, blobs): never public
+/vendor/

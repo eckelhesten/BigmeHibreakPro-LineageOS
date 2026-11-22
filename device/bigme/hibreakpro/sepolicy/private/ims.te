@@ -1,0 +1,14 @@
+# MediaTek's IMS service (com.mediatek.ims, shares android.uid.phone, so it runs as radio):
+# docs/volte.md.
+#
+# The vendor side needs nothing new: the stock vendor policy already lets radio find and call
+# the MediaTek RIL's IMtkRadioEx/imsSlotN (hal_telephony_client) and read the IMS feature
+# properties (vendor_mtk_ims_prop, vendor_mtk_volte_prop, ...).
+#
+# What stock added on its system_ext, and we repeat: labels for the properties the IMS service
+# sets (property_contexts), and for the binder services it registers (service_contexts,
+# radio_service, which AOSP lets radio add). SystemProperties.set() throws when the write is
+# denied, which kills the IMS service, so every property it sets needs a type radio may set.
+# Stock used one system_mtk_*_prop type per property; nobody else reads them, so one type does.
+system_internal_prop(mtk_ims_system_prop)
+set_prop(radio, mtk_ims_system_prop)

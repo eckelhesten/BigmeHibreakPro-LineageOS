@@ -1,0 +1,65 @@
+From 05da075c8e77a9293921b26f2f086679c0021313 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Mon, 16 Nov 2026 12:15:20 +0000
+Subject: [PATCH] wm: tell SurfaceFlinger while a finger is on the e-ink screen
+
+With debug.sf.eink_motion, DisplayPolicy sets vendor.xrz.hibreak_touch to 1
+on touch down and 0 on up or cancel (default display only), so the e-ink
+motion logic in SurfaceFlinger (frameworks/native 0007) can switch the
+panel to its fast mode from the first frame of a flick.
+
+Change-Id: I4e7b7090e37e5de523b08a19e49212485e3c857e
+---
+ .../com/android/server/wm/DisplayPolicy.java  | 22 +++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/services/core/java/com/android/server/wm/DisplayPolicy.java b/services/core/java/com/android/server/wm/DisplayPolicy.java
+index b05de11ff..9df7a6277 100644
+--- a/services/core/java/com/android/server/wm/DisplayPolicy.java
++++ b/services/core/java/com/android/server/wm/DisplayPolicy.java
+@@ -159,6 +159,26 @@ import java.util.function.Consumer;
+  * The policy that provides the basic behaviors and states of a display to show UI.
+  */
+ public class DisplayPolicy {
++    /**
++     * E-ink (HiBreak Pro): SurfaceFlinger switches the panel to its fast mode for frames
++     * composed while a finger is on the screen (frameworks/native EinkMotion), so a flick
++     * after idle does not start with slow normal-mode updates. Only on the default display.
++     */
++    private static final boolean EINK_MOTION =
++            SystemProperties.getBoolean("debug.sf.eink_motion", false);
++    private static final String EINK_TOUCH_PROPERTY = "vendor.xrz.hibreak_touch";
++
++    private void setEinkTouch(boolean down) {
++        if (!EINK_MOTION || mDisplayContent.getDisplayId() != android.view.Display.DEFAULT_DISPLAY) {
++            return;
++        }
++        try {
++            SystemProperties.set(EINK_TOUCH_PROPERTY, down ? "1" : "0");
++        } catch (RuntimeException e) {
++            Slog.w(TAG, "Could not set " + EINK_TOUCH_PROPERTY, e);
++        }
++    }
++
+     private static final String TAG = TAG_WITH_CLASS_NAME ? "DisplayPolicy" : TAG_WM;
+ 
+     // The panic gesture may become active only after the keyguard is dismissed and the immersive
+@@ -559,6 +579,7 @@ public class DisplayPolicy {
+ 
+                 @Override
+                 public void onDown() {
++                    setEinkTouch(true);
+                     final WindowOrientationListener listener = getOrientationListener();
+                     if (listener != null) {
+                         listener.onTouchStart();
+@@ -567,6 +588,7 @@ public class DisplayPolicy {
+ 
+                 @Override
+                 public void onUpOrCancel() {
++                    setEinkTouch(false);
+                     final WindowOrientationListener listener = getOrientationListener();
+                     if (listener != null) {
+                         listener.onTouchEnd();
+-- 
+2.43.0
+

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Settings > Display > E-ink & front light > Sleep screen. Stored as Settings.System
+     "hibreak_<key>" through SystemSettingsStore; SleepScreenInfo acts on the changes. -->
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <PreferenceCategory android:title="@string/sleep_cat_weather">
+        <SwitchPreferenceCompat
+            android:key="sleep_weather"
+            android:title="@string/sleep_weather"
+            android:summary="@string/sleep_weather_summary"
+            android:defaultValue="false" />
+        <Preference
+            android:key="sleep_weather_city"
+            android:title="@string/sleep_weather_city"
+            android:persistent="false" />
+        <ListPreference
+            android:key="sleep_weather_unit"
+            android:title="@string/sleep_weather_unit"
+            android:entries="@array/sleep_unit_entries"
+            android:entryValues="@array/sleep_unit_values"
+            android:persistent="false" />
+        <Preference
+            android:key="sleep_weather_source"
+            android:summary="@string/sleep_weather_source"
+            android:selectable="false"
+            android:persistent="false" />
+    </PreferenceCategory>
+
+    <PreferenceCategory android:title="@string/sleep_cat_calendar">
+        <SwitchPreferenceCompat
+            android:key="sleep_calendar"
+            android:title="@string/sleep_calendar"
+            android:summary="@string/sleep_calendar_summary"
+            android:defaultValue="true" />
+    </PreferenceCategory>
+</PreferenceScreen>

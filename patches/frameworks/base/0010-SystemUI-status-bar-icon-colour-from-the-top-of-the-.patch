@@ -1,0 +1,140 @@
+From 573d160c63ee0c439f54fb6add08ac873037b4c3 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Mon, 16 Nov 2026 12:10:54 +0000
+Subject: [PATCH] SystemUI: status bar icon colour from the top of the
+ wallpaper on e-ink
+
+With debug.sysui.eink_palette, the wallpaper dark-text hint (status bar
+icons, the launcher top scrim) comes from the strip under the status bar
+instead of the whole picture: a bright top over a dark subject keeps
+black icons. Only a really dark strip gets white icons.
+
+The same rule (dark text unless really dark) applies to local wallpaper
+colours, which the lock screen clock samples for its area, and the
+keyguard status bar, whose view theme doesn't follow the wallpaper, takes
+the lock wallpaper's hint directly.
+
+Change-Id: I61bb2644f360b04f072f777f101367831bf79ba9
+---
+ .../phone/KeyguardStatusBarView.java          | 16 ++++++
+ .../ImageWallpaperColorExtractor.java         | 49 ++++++++++++++++++-
+ 2 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/phone/KeyguardStatusBarView.java b/packages/SystemUI/src/com/android/systemui/statusbar/phone/KeyguardStatusBarView.java
+index 83e5db4db..ca45c07d1 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/phone/KeyguardStatusBarView.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/phone/KeyguardStatusBarView.java
+@@ -475,6 +475,22 @@ public class KeyguardStatusBarView extends RelativeLayout {
+     private void updateIconsAndTextColors(TintedIconManager iconManager) {
+         @ColorInt int textColor = Utils.getColorAttrDefaultColor(mContext,
+                 R.attr.wallpaperTextColor);
++        if (android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)) {
++            // E-ink: this view's theme doesn't follow the wallpaper, so take the lock wallpaper's
++            // dark-text hint (from the strip under the status bar, ImageWallpaperColorExtractor).
++            android.app.WallpaperManager wm =
++                    mContext.getSystemService(android.app.WallpaperManager.class);
++            android.app.WallpaperColors colors = wm == null ? null
++                    : wm.getWallpaperColors(android.app.WallpaperManager.FLAG_LOCK);
++            if (colors == null && wm != null) {
++                colors = wm.getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM);
++            }
++            if (colors != null) {
++                boolean darkText = (colors.getColorHints()
++                        & android.app.WallpaperColors.HINT_SUPPORTS_DARK_TEXT) != 0;
++                textColor = darkText ? Color.BLACK : Color.WHITE;
++            }
++        }
+         float luminance = Color.luminance(textColor);
+         @ColorInt int iconColor = Utils.getColorStateListDefaultColor(mContext,
+                     luminance < 0.5
+diff --git a/packages/SystemUI/src/com/android/systemui/wallpapers/ImageWallpaperColorExtractor.java b/packages/SystemUI/src/com/android/systemui/wallpapers/ImageWallpaperColorExtractor.java
+index 48f66bda8..7857735d0 100644
+--- a/packages/SystemUI/src/com/android/systemui/wallpapers/ImageWallpaperColorExtractor.java
++++ b/packages/SystemUI/src/com/android/systemui/wallpapers/ImageWallpaperColorExtractor.java
+@@ -20,7 +20,9 @@ package com.android.systemui.wallpapers;
+ import android.app.WallpaperColors;
+ import android.graphics.Bitmap;
+ import android.graphics.Rect;
++import android.graphics.Color;
+ import android.graphics.RectF;
++import android.os.SystemProperties;
+ import android.os.Trace;
+ import android.util.ArraySet;
+ import android.util.Log;
+@@ -245,7 +247,59 @@ public class ImageWallpaperColorExtractor {
+ 
+     @VisibleForTesting
+     WallpaperColors getWallpaperColors(@NonNull Bitmap bitmap, float dimAmount) {
+-        return WallpaperColors.fromBitmap(bitmap, dimAmount);
++        WallpaperColors colors = WallpaperColors.fromBitmap(bitmap, dimAmount);
++        if (!isEinkPalette()) return colors;
++        // E-ink: dark text (status bar icons, the launcher's top scrim) is decided by the strip
++        // under the status bar, not the whole picture; a bright sky over a dark subject keeps
++        // black icons. Only a really dark strip gets white ones.
++        int h = Math.max(1, Math.round(bitmap.getHeight() * EINK_STATUS_BAR_FRACTION));
++        return withEinkDarkText(colors, meanLuminance(bitmap, h) * (1f - dim(dimAmount)));
++    }
++
++    private static boolean isEinkPalette() {
++        return SystemProperties.getBoolean("debug.sysui.eink_palette", false);
++    }
++
++    private static float dim(float dimAmount) {
++        return MathUtils.constrain(dimAmount, 0f, 1f);
++    }
++
++    /** Dark text unless the sampled pixels are really dark (e-ink: black on paper by default). */
++    private static WallpaperColors withEinkDarkText(WallpaperColors colors, float luminance) {
++        int hints = colors.getColorHints() & ~WallpaperColors.HINT_SUPPORTS_DARK_TEXT;
++        if (luminance >= EINK_DARK_TEXT_MIN_LUMINANCE) {
++            hints |= WallpaperColors.HINT_SUPPORTS_DARK_TEXT;
++        }
++        return hints == colors.getColorHints() ? colors
++                : new WallpaperColors(colors.getAllColors(), hints);
++    }
++
++    /** Top part of the picture that the status bar covers, with some margin. */
++    private static final float EINK_STATUS_BAR_FRACTION = 0.06f;
++    /**
++     * Mean linear relative luminance (Color.luminance, sRGB #6B6B6B ~= 0.15) from which the icons
++     * are black. 0.3f linear would treat medium-light greys (#808080..#949494) as dark.
++     */
++    private static final float EINK_DARK_TEXT_MIN_LUMINANCE = 0.15f;
++
++    /** Mean relative luminance of the top {@code h} rows. */
++    private static float meanLuminance(Bitmap bitmap, int h) {
++        int w = bitmap.getWidth();
++        if (w <= 0 || h <= 0 || h > bitmap.getHeight()) return 1f;
++        Bitmap src = bitmap;
++        if (bitmap.getConfig() == Bitmap.Config.HARDWARE) {
++            src = bitmap.copy(Bitmap.Config.ARGB_8888, false);
++            if (src == null) return 1f;
++        }
++        try {
++            int[] pixels = new int[w * h];
++            src.getPixels(pixels, 0, w, 0, 0, w, h);
++            double sum = 0;
++            for (int c : pixels) sum += Color.luminance(c);
++            return (float) (sum / pixels.length);
++        } finally {
++            if (src != bitmap) src.recycle();
++        }
+     }
+ 
+     /**
+@@ -359,7 +413,11 @@ public class ImageWallpaperColorExtractor {
+         Assert.isNotMainThread();
+         Bitmap colorImg = Bitmap.createBitmap(mMiniBitmap,
+                 subImage.left, subImage.top, subImage.width(), subImage.height());
+-        return WallpaperColors.fromBitmap(colorImg);
++        WallpaperColors colors = WallpaperColors.fromBitmap(colorImg);
++        // E-ink: the same rule for a region (the lock screen clock, widgets) as for the status
++        // bar: dark text unless the region is really dark.
++        if (!isEinkPalette()) return colors;
++        return withEinkDarkText(colors, meanLuminance(colorImg, colorImg.getHeight()));
+     }
+ 
+     /**
+-- 
+2.43.0
+

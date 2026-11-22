@@ -1,0 +1,355 @@
+From 4422f27fd90be22963eef40fc9936954d8e09087 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 17 Nov 2026 02:53:06 +0000
+Subject: [PATCH 14/16] e-ink: a sleep screen, shown in one step
+
+With debug.sysui.eink_palette (and debug.sysui.eink_sleep, default on):
+- SystemUI covers the always-on display with EinkSleepScreen: the time in
+  large numerals, the date, the icons of waiting notifications and the
+  battery level, black on white (white on black in the dark theme). It
+  appears complete when dozing starts, is redrawn from the doze time tick
+  and disappears when dozing ends. Nothing animates.
+- PhoneWindowManager sets vendor.xrz.hibreak_sleep when the phone starts
+  going to sleep or waking up, before the keyguard hears of it, so that
+  SurfaceFlinger (frameworks/native EinkMotion) can hold the panel until
+  the screen has settled. The panel then goes from the app to the sleep
+  screen in one clean refresh, instead of showing the lock screen, the
+  doze transition and the always-on layout one after another.
+
+Change-Id: I4f7cbb5d4c84095495d144a38f74c2f7a9ff8f41
+---
+ .../systemui/shade/EinkSleepScreen.java       | 249 ++++++++++++++++++
+ ...NotificationShadeWindowViewController.java |   3 +
+ .../statusbar/phone/DozeServiceHost.java      |   1 +
+ .../server/policy/PhoneWindowManager.java     |  19 ++
+ 4 files changed, 272 insertions(+)
+ create mode 100644 packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+new file mode 100644
+index 000000000..d1873634d
+--- /dev/null
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+@@ -0,0 +1,249 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package com.android.systemui.shade;
++
++import android.app.NotificationManager;
++import android.content.Context;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.content.res.Configuration;
++import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.Paint;
++import android.graphics.PorterDuff;
++import android.graphics.Rect;
++import android.graphics.Typeface;
++import android.graphics.drawable.Drawable;
++import android.graphics.drawable.Icon;
++import android.os.BatteryManager;
++import android.os.SystemProperties;
++import android.service.notification.NotificationListenerService;
++import android.service.notification.StatusBarNotification;
++import android.text.format.DateFormat;
++import android.util.Log;
++import android.view.View;
++import android.view.ViewGroup;
++
++import com.android.systemui.plugins.statusbar.StatusBarStateController;
++import com.android.systemui.statusbar.notification.collection.EntryAdapter;
++import com.android.systemui.statusbar.notification.collection.NotificationEntry;
++import com.android.systemui.statusbar.notification.row.ExpandableNotificationRow;
++import com.android.systemui.statusbar.notification.shared.NotificationBundleUi;
++import com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayoutController;
++
++import java.util.ArrayList;
++import java.util.Calendar;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++
++/**
++ * E-ink sleep screen (debug.sysui.eink_palette): what the panel shows while the phone sleeps.
++ *
++ * An e-ink panel keeps its picture without power, so "screen off" is a picture too. This view
++ * covers the whole notification shade window while the phone dozes (always-on display): the
++ * time in large numerals, the date, the icons of waiting notifications and the battery level,
++ * black on white (white on black in the dark theme). Nothing animates: it appears complete when
++ * dozing starts, is redrawn once a minute from the doze time tick, and disappears when dozing
++ * ends. SurfaceFlinger (frameworks/native EinkMotion) holds the panel while the keyguard
++ * rearranges itself underneath, so the panel goes from the app straight to this screen in one
++ * clean refresh.
++ *
++ * Tuning without a build (read when the screen appears), debug.sysui.eink_sleep.*:
++ * weight (font weight of the numerals, 500), size (numeral height as a share of the screen
++ * width in percent, 52), icons (0 hides the notification icons), battery (0 hides it).
++ */
++public final class EinkSleepScreen extends View implements StatusBarStateController.StateListener {
++    private static final String TAG = "EinkSleepScreen";
++    public static final boolean ENABLED =
++            SystemProperties.getBoolean("debug.sysui.eink_palette", false)
++                    && SystemProperties.getBoolean("debug.sysui.eink_sleep", true);
++    private static final String FONT = "google-sans-flex";
++    private static final int MAX_ICONS = 6;
++
++    private static EinkSleepScreen sInstance;
++
++    private final NotificationStackScrollLayoutController mNotifications;
++    private final Paint mTimePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final Paint mTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final Rect mBounds = new Rect();
++    private final List<Drawable> mIcons = new ArrayList<>();
++    private int mWeight = 500;
++    private float mSize = 0.52f;
++    private boolean mShowIcons = true;
++    private boolean mShowBattery = true;
++
++    /** Adds the (hidden) sleep screen on top of the shade window's content. */
++    public static void attach(ViewGroup root, StatusBarStateController stateController,
++            NotificationStackScrollLayoutController notifications) {
++        if (!ENABLED || sInstance != null) return;
++        EinkSleepScreen view = new EinkSleepScreen(root.getContext(), notifications);
++        root.addView(view, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
++                ViewGroup.LayoutParams.MATCH_PARENT));
++        stateController.addCallback(view);
++        sInstance = view;
++        if (stateController.isDozing()) view.onDozingChanged(true);
++    }
++
++    /** The doze time tick (once a minute, with the CPU awake for it). */
++    public static void timeTick() {
++        if (sInstance != null) sInstance.refresh();
++    }
++
++    private EinkSleepScreen(Context context, NotificationStackScrollLayoutController notifs) {
++        super(context);
++        mNotifications = notifs;
++        setVisibility(GONE);
++        setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
++        // Above everything else in the window, whatever is added later.
++        setTranslationZ(10000f);
++    }
++
++    @Override
++    public void onDozingChanged(boolean isDozing) {
++        if (isDozing) {
++            mWeight = SystemProperties.getInt("debug.sysui.eink_sleep.weight", 500);
++            mSize = SystemProperties.getInt("debug.sysui.eink_sleep.size", 52) / 100f;
++            mShowIcons = SystemProperties.getBoolean("debug.sysui.eink_sleep.icons", true);
++            mShowBattery = SystemProperties.getBoolean("debug.sysui.eink_sleep.battery", true);
++            bringToFront();
++            setVisibility(VISIBLE);
++            refresh();
++        } else {
++            setVisibility(GONE);
++            mIcons.clear();
++        }
++    }
++
++    @Override
++    public void onPulsingChanged(boolean pulsing) {
++        // A notification arrived (or left) while asleep: its icon joins the row.
++        refresh();
++    }
++
++    private void refresh() {
++        if (getVisibility() != VISIBLE) return;
++        loadIcons();
++        invalidate();
++    }
++
++    /** Small icons of the notifications that would make a sound, one per app. */
++    private void loadIcons() {
++        mIcons.clear();
++        if (!mShowIcons) return;
++        try {
++            ViewGroup stack = mNotifications.getView();
++            Set<String> seen = new HashSet<>();
++            for (int i = 0; i < stack.getChildCount() && mIcons.size() < MAX_ICONS; i++) {
++                if (!(stack.getChildAt(i) instanceof ExpandableNotificationRow row)) continue;
++                // The two notification pipelines (bundle UI flag) hand out the entry differently.
++                StatusBarNotification sbn;
++                NotificationListenerService.Ranking ranking;
++                if (NotificationBundleUi.isEnabled()) {
++                    EntryAdapter adapter = row.getEntryAdapter();
++                    if (adapter == null || adapter.isBundle()) continue;
++                    sbn = adapter.getSbn();
++                    ranking = adapter.getRanking();
++                } else {
++                    NotificationEntry entry = row.getEntryLegacy();
++                    if (entry == null) continue;
++                    sbn = entry.getSbn();
++                    ranking = entry.getRanking();
++                }
++                if (sbn == null || ranking == null
++                        || ranking.getImportance() < NotificationManager.IMPORTANCE_DEFAULT) {
++                    continue;
++                }
++                if (!seen.add(sbn.getPackageName())) continue;
++                Icon icon = sbn.getNotification().getSmallIcon();
++                Drawable d = icon != null ? icon.loadDrawable(sbn.getPackageContext(mContext))
++                        : null;
++                if (d != null) mIcons.add(d.mutate());
++            }
++        } catch (RuntimeException e) {
++            Log.w(TAG, "notification icons", e);
++        }
++    }
++
++    private Typeface typeface(int weight) {
++        return Typeface.create(Typeface.create(FONT, Typeface.NORMAL), weight, false);
++    }
++
++    @Override
++    protected void onDraw(Canvas canvas) {
++        final int w = getWidth();
++        final int h = getHeight();
++        final boolean night = (getResources().getConfiguration().uiMode
++                & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
++        final int bg = night ? Color.BLACK : Color.WHITE;
++        final int fg = night ? Color.WHITE : Color.BLACK;
++        canvas.drawColor(bg);
++
++        Calendar now = Calendar.getInstance();
++        final boolean is24 = DateFormat.is24HourFormat(mContext);
++        int hour = is24 ? now.get(Calendar.HOUR_OF_DAY) : now.get(Calendar.HOUR);
++        if (!is24 && hour == 0) hour = 12;
++        String[] lines = {
++                String.format(Locale.ROOT, is24 ? "%02d" : "%d", hour),
++                String.format(Locale.ROOT, "%02d", now.get(Calendar.MINUTE))};
++
++        // The numerals: two lines, centred, their block starting at 17 % of the height.
++        mTimePaint.setColor(fg);
++        mTimePaint.setTypeface(typeface(mWeight));
++        mTimePaint.setFontVariationSettings("'wght' " + mWeight + ", 'opsz' 144");
++        mTimePaint.setFontFeatureSettings("tnum");
++        mTimePaint.setTextSize(w * mSize);
++        mTimePaint.setTextAlign(Paint.Align.CENTER);
++        float y = h * 0.17f;
++        for (String line : lines) {
++            mTimePaint.getTextBounds("0", 0, 1, mBounds);
++            final float digit = mBounds.height();
++            canvas.drawText(line, w / 2f, y + digit, mTimePaint);
++            y += digit * 1.16f;
++        }
++
++        // The date.
++        mTextPaint.setColor(fg);
++        mTextPaint.setTypeface(typeface(500));
++        mTextPaint.setTextAlign(Paint.Align.CENTER);
++        mTextPaint.setTextSize(w * 0.058f);
++        String pattern = DateFormat.getBestDateTimePattern(Locale.getDefault(), "EEEEdMMMM");
++        y += w * 0.07f + mTextPaint.getTextSize() * 0.75f;
++        canvas.drawText(DateFormat.format(pattern, now).toString(), w / 2f, y, mTextPaint);
++
++        // Notification icons, in the text colour.
++        if (!mIcons.isEmpty()) {
++            final int size = Math.round(w * 0.068f);
++            final int gap = Math.round(w * 0.045f);
++            final int n = mIcons.size();
++            int x = (w - (n * size + (n - 1) * gap)) / 2;
++            final int top = Math.round(y + w * 0.075f);
++            for (Drawable d : mIcons) {
++                d.setColorFilter(fg, PorterDuff.Mode.SRC_IN);
++                d.setBounds(x, top, x + size, top + size);
++                d.draw(canvas);
++                x += size + gap;
++            }
++        }
++
++        // Battery, small, at the bottom.
++        if (mShowBattery) {
++            Intent battery = mContext.registerReceiver(null,
++                    new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
++            if (battery != null) {
++                int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
++                int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
++                boolean charging = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
++                if (level >= 0 && scale > 0) {
++                    mTextPaint.setTextSize(w * 0.042f);
++                    String text = (charging ? "⚡︎ " : "") + (level * 100 / scale) + " %";
++                    canvas.drawText(text, w / 2f, h - w * 0.12f, mTextPaint);
++                }
++            }
++        }
++    }
++}
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/NotificationShadeWindowViewController.java b/packages/SystemUI/src/com/android/systemui/shade/NotificationShadeWindowViewController.java
+index 64f510247..fb37039bc 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/NotificationShadeWindowViewController.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/NotificationShadeWindowViewController.java
+@@ -258,6 +258,9 @@ public class NotificationShadeWindowViewController implements Dumpable {
+         mNotificationInsetsController = notificationInsetsController;
+         mKeyguardTransitionInteractor = keyguardTransitionInteractor;
+         mGlanceableHubContainerController = glanceableHubContainerController;
++        // E-ink: the sleep screen that covers this window while the phone dozes.
++        EinkSleepScreen.attach(mView, statusBarStateController,
++                notificationStackScrollLayoutController);
+         mWindowRootViewKeyEventHandler = windowRootViewKeyEventHandler;
+         mPrimaryBouncerInteractor = primaryBouncerInteractor;
+         mAlternateBouncerInteractor = alternateBouncerInteractor;
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/phone/DozeServiceHost.java b/packages/SystemUI/src/com/android/systemui/statusbar/phone/DozeServiceHost.java
+index fd706f052..c010f8d3d 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/phone/DozeServiceHost.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/phone/DozeServiceHost.java
+@@ -383,6 +383,7 @@ public final class DozeServiceHost implements DozeHost {
+     public void dozeTimeTick() {
+         TraceUtils.trace("DozeServiceHost#dozeTimeTick", () -> {
+             mDozeInteractor.dozeTimeTick();
++            com.android.systemui.shade.EinkSleepScreen.timeTick();
+             mAuthController.dozeTimeTick();
+             if (mAmbientIndicationContainer instanceof DozeReceiver) {
+                 ((DozeReceiver) mAmbientIndicationContainer).dozeTimeTick();
+diff --git a/services/core/java/com/android/server/policy/PhoneWindowManager.java b/services/core/java/com/android/server/policy/PhoneWindowManager.java
+index 69fefe33b..9010b94b9 100644
+--- a/services/core/java/com/android/server/policy/PhoneWindowManager.java
++++ b/services/core/java/com/android/server/policy/PhoneWindowManager.java
+@@ -6148,13 +6148,31 @@ public class PhoneWindowManager implements WindowManagerPolicy {
+         return isAnyDefaultAdjacentGroupInteractive || isDefaultGroupInteractive;
+     }
+ 
++    /**
++     * E-ink (HiBreak Pro): tells SurfaceFlinger that the phone is going to sleep or waking up,
++     * before the keyguard hears of it. SurfaceFlinger (frameworks/native EinkMotion) then holds
++     * the panel until the screen has settled, so the steps in between never show.
++     */
++    private static final boolean EINK_SLEEP =
++            SystemProperties.getBoolean("debug.sf.eink_motion", false);
++
++    private static void setEinkAsleep(int displayGroupId, boolean asleep) {
++        if (!EINK_SLEEP || displayGroupId != Display.DEFAULT_DISPLAY_GROUP) return;
++        try {
++            SystemProperties.set("vendor.xrz.hibreak_sleep", asleep ? "1" : "0");
++        } catch (RuntimeException e) {
++            Slog.w(TAG, "Could not set vendor.xrz.hibreak_sleep", e);
++        }
++    }
++
+     // Called on the PowerManager's Notifier thread.
+     @Override
+     public void startedGoingToSleep(int displayGroupId,
+             @PowerManager.GoToSleepReason int pmSleepReason) {
+         if (!isReadyToSignalSleep(displayGroupId)) {
+             return;
+         }
++        setEinkAsleep(displayGroupId, true);
+ 
+         if (DEBUG_WAKEUP) {
+             Slog.i(TAG, "Started going to sleep... (groupId=" + displayGroupId + " why="
+@@ -6226,6 +6244,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
+     // Called on the PowerManager's Notifier thread.
+     @Override
+     public void startedWakingUp(int displayGroupId, @WakeReason int pmWakeReason) {
++        setEinkAsleep(displayGroupId, false);
+         if (DEBUG_WAKEUP) {
+             Slog.i(TAG, "Started waking up... (groupId=" + displayGroupId + " why="
+                     + WindowManagerPolicyConstants.onReasonToString(
+-- 
+2.43.0
+

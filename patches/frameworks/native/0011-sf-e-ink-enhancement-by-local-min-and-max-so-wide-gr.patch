@@ -1,0 +1,236 @@
+From fbd770aa4a100f305ad2f5812f6b17d766c5c983 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Thu, 19 Nov 2026 17:33:31 +0000
+Subject: [PATCH] sf: e-ink enhancement by local min and max, so wide grey
+ strokes stay solid
+
+The e-ink enhancement compared each pixel with the mean of two rings of
+taps around it. Inside a stroke wider than the rings (bold or large grey
+text, disabled buttons, hints) every tap had the same grey, so the pixel
+was left grey while the stroke edges went black: the panel showed hollow,
+faint letters with a black outline.
+
+Each pixel now looks at the darkest and lightest tap instead. Where that
+range is large it goes to whichever side it is nearer: a glyph takes the
+colour of its darkest pixels and its background that of its lightest, so
+the whole stroke is one tone. From a range of solid1 to solid2 the two
+sides become pure black and white, so grey and coloured text is drawn
+solid. A gate keeps photos out: the pass only acts where most taps sit on
+one of the two sides (text and lines on a flat background), not on the
+continuous tones of a picture. Same 13 taps as before; the rings are at 3.5 and 7 px, so strokes up to ~12 px
+wide (bold headlines) are covered.
+
+Tunable without a build: debug.sf.eink_enhance.{radius_x10 (35),
+t1_x1000 (40), t2_x1000 (120), solid1_x1000 (120), solid2_x1000 (400),
+gate0_x1000 (550), gate1_x1000 (800; 0 = no gate)}.
+
+Change-Id: I30f9bbb46bd6a040f1008a1b6bc71aa79a87b994
+
+debug.sf.eink_enhance.fast=0 leaves the pass out in the FAST mode, which
+is also the motion mode, to measure whether the shorter composition makes
+scrolling steadier (default 1: unchanged).
+
+Change-Id: I230e2917c6f83ad48c177d5901e7f9bbc5a00f5f
+---
+ .../include/renderengine/DisplaySettings.h    | 28 ++++++----
+ libs/renderengine/skia/SkiaRenderEngine.cpp   | 52 +++++++++++++++----
+ .../CompositionEngine/src/Output.cpp          | 37 ++++++++++---
+ 3 files changed, 91 insertions(+), 26 deletions(-)
+
+diff --git a/libs/renderengine/include/renderengine/DisplaySettings.h b/libs/renderengine/include/renderengine/DisplaySettings.h
+index 5c8bf01..2fb5e0d 100644
+--- a/libs/renderengine/include/renderengine/DisplaySettings.h
++++ b/libs/renderengine/include/renderengine/DisplaySettings.h
+@@ -69,19 +69,27 @@ struct DisplaySettings {
+     bool deviceHandlesColorTransform = false;
+ 
+     // E-ink (Bigme HiBreak Pro): sharpen the composed frame for a panel that shows only black
+-    // and white. Each pixel is compared with the mean of its surroundings (two rings of six
+-    // taps, at einkEnhanceRadius and twice that, in pixels); the further it is from that mean
+-    // (from einkEnhanceT1, fully at einkEnhanceT2), the more it is pushed to pure black or
+-    // white. Text and lines of any colour on any background become solid, anti-aliased edges
+-    // become hard, and flat or smooth areas (photos, fills) are left to the panel's dither.
+-    // Strength 0 = off.
++    // and white. Each pixel looks at the darkest and lightest value around it (two rings of six
++    // taps, at einkEnhanceRadius and twice that, in pixels). Where that range is large (from
++    // einkEnhanceT1, fully at einkEnhanceT2) the pixel goes to the dark or the light side,
++    // whichever it is nearer: a glyph takes the colour of its darkest pixels, its background
++    // that of its lightest, so anti-aliased edges become hard and wide strokes stay solid
++    // (comparing with the local mean, as before, left the inside of wide grey strokes grey:
++    // "hollow" text). With a range of einkSolid1 to einkSolid2 and more, the two sides become
++    // pure black and white: text of any grey or colour is drawn solid. einkGate0/1: only where
++    // most taps sit on one of the two sides (text and lines on a flat background, not the
++    // continuous tones of a photo); einkGate1 = 0 turns that test off. Strength 0 = off.
+     // Afterwards the greys between einkBlack and einkWhite are stretched over the full range
+     // (text contrast; 0 and 1 = off). Done here and not with the colour transform, so that the
+     // enhancement still sees light hairlines that the stretch turns white.
+     float einkEnhanceStrength = 0.f;
+-    float einkEnhanceRadius = 2.f;
+-    float einkEnhanceT1 = 0.03f;
+-    float einkEnhanceT2 = 0.14f;
++    float einkEnhanceRadius = 3.5f;
++    float einkEnhanceT1 = 0.04f;
++    float einkEnhanceT2 = 0.12f;
++    float einkSolid1 = 0.12f;
++    float einkSolid2 = 0.40f;
++    float einkGate0 = 0.55f;
++    float einkGate1 = 0.80f;
+     float einkBlack = 0.f;
+     float einkWhite = 1.f;
+ 
+@@ -141,6 +149,8 @@ static inline bool operator==(const DisplaySettings& lhs, const DisplaySettings&
+             lhs.einkEnhanceStrength == rhs.einkEnhanceStrength &&
+             lhs.einkEnhanceRadius == rhs.einkEnhanceRadius &&
+             lhs.einkEnhanceT1 == rhs.einkEnhanceT1 && lhs.einkEnhanceT2 == rhs.einkEnhanceT2 &&
++            lhs.einkSolid1 == rhs.einkSolid1 && lhs.einkSolid2 == rhs.einkSolid2 &&
++            lhs.einkGate0 == rhs.einkGate0 && lhs.einkGate1 == rhs.einkGate1 &&
+             lhs.einkBlack == rhs.einkBlack && lhs.einkWhite == rhs.einkWhite;
+ }
+ 
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+index e54bd37..aac5596 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -786,24 +786,50 @@ static const char* const kEinkEnhanceSkSL = R"(
+     uniform float r;
+     uniform float t1;
+     uniform float t2;
++    uniform float s1;
++    uniform float s2;
++    uniform float g0;
++    uniform float g1;
+     uniform float strength;
+     uniform float black;
+     uniform float white;
+     const half3 W = half3(0.299, 0.587, 0.114);
+     half luma(float2 p) { return dot(img.eval(p).rgb, W); }
++    half onSide(half t, half lo, half hi, half e) { return (t - lo <= e || hi - t <= e) ? 1.0 : 0.0; }
+     half4 main(float2 xy) {
+         half4 c = img.eval(xy);
+         half l = dot(c.rgb, W);
+-        half m = luma(xy + r * float2(1.0, 0.0)) + luma(xy + r * float2(0.5, 0.866)) +
+-                 luma(xy + r * float2(-0.5, 0.866)) + luma(xy + r * float2(-1.0, 0.0)) +
+-                 luma(xy + r * float2(-0.5, -0.866)) + luma(xy + r * float2(0.5, -0.866)) +
+-                 luma(xy + r * float2(1.732, 1.0)) + luma(xy + r * float2(0.0, 2.0)) +
+-                 luma(xy + r * float2(-1.732, 1.0)) + luma(xy + r * float2(-1.732, -1.0)) +
+-                 luma(xy + r * float2(0.0, -2.0)) + luma(xy + r * float2(1.732, -1.0));
+-        half d = l - m / 12.0;
+-        half s = smoothstep(t1, t2, abs(d)) * strength;
+-        half e = mix(l, d < 0.0 ? 0.0 : 1.0, s);
+-        return half4(saturate((c.rgb + (e - l) - black) / (white - black)), c.a);
++        half a0 = luma(xy + r * float2(1.0, 0.0));
++        half a1 = luma(xy + r * float2(0.5, 0.866));
++        half a2 = luma(xy + r * float2(-0.5, 0.866));
++        half a3 = luma(xy + r * float2(-1.0, 0.0));
++        half a4 = luma(xy + r * float2(-0.5, -0.866));
++        half a5 = luma(xy + r * float2(0.5, -0.866));
++        half b0 = luma(xy + r * float2(1.732, 1.0));
++        half b1 = luma(xy + r * float2(0.0, 2.0));
++        half b2 = luma(xy + r * float2(-1.732, 1.0));
++        half b3 = luma(xy + r * float2(-1.732, -1.0));
++        half b4 = luma(xy + r * float2(0.0, -2.0));
++        half b5 = luma(xy + r * float2(1.732, -1.0));
++        half lo = min(min(min(min(a0, a1), min(a2, a3)), min(min(a4, a5), min(b0, b1))),
++                      min(min(min(b2, b3), min(b4, b5)), l));
++        half hi = max(max(max(max(a0, a1), max(a2, a3)), max(max(a4, a5), max(b0, b1))),
++                      max(max(max(b2, b3), max(b4, b5)), l));
++        half spread = hi - lo;
++        half s = smoothstep(t1, t2, spread) * strength;
++        if (g1 > 0.0 && s > 0.0) {
++            half e = 0.25 * spread;
++            half n = onSide(l, lo, hi, e) + onSide(a0, lo, hi, e) + onSide(a1, lo, hi, e) +
++                     onSide(a2, lo, hi, e) + onSide(a3, lo, hi, e) + onSide(a4, lo, hi, e) +
++                     onSide(a5, lo, hi, e) + onSide(b0, lo, hi, e) + onSide(b1, lo, hi, e) +
++                     onSide(b2, lo, hi, e) + onSide(b3, lo, hi, e) + onSide(b4, lo, hi, e) +
++                     onSide(b5, lo, hi, e);
++            s *= smoothstep(g0, g1, n / 13.0);
++        }
++        half full = smoothstep(s1, s2, spread);
++        half target = l < 0.5 * (lo + hi) ? lo * (1.0 - full) : hi + (1.0 - hi) * full;
++        half en = mix(l, target, s);
++        return half4(saturate((c.rgb + (en - l) - black) / (white - black)), c.a);
+     }
+ )";
+ 
+@@ -824,6 +850,12 @@ void SkiaRenderEngine::drawEinkEnhance(const DisplaySettings& display,
+     builder.uniform("r") = display.einkEnhanceRadius;
+     builder.uniform("t1") = display.einkEnhanceT1;
+     builder.uniform("t2") = std::max(display.einkEnhanceT2, display.einkEnhanceT1 + 0.001f);
++    builder.uniform("s1") = display.einkSolid1;
++    builder.uniform("s2") = std::max(display.einkSolid2, display.einkSolid1 + 0.001f);
++    builder.uniform("g0") = display.einkGate0;
++    builder.uniform("g1") = display.einkGate1 > 0.f
++            ? std::max(display.einkGate1, display.einkGate0 + 0.001f)
++            : 0.f;
+     builder.uniform("strength") = std::min(display.einkEnhanceStrength, 1.f);
+     builder.uniform("black") = display.einkBlack;
+     builder.uniform("white") = std::max(display.einkWhite, display.einkBlack + 0.01f);
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index 2131cde..df7f1a1 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -1519,13 +1519,18 @@ namespace {
+ 
+ // E-ink enhancement and contrast (renderengine::DisplaySettings::einkEnhanceStrength), from
+ // properties so they can be tuned on the device: debug.sf.eink_enhance (strength in percent, 0 = off) and
+-// debug.sf.eink_enhance.{radius_x10,t1_x1000,t2_x1000}. Only while the composer's refresh mode
++// debug.sf.eink_enhance.{radius_x10,t1_x1000,t2_x1000,solid1_x1000,solid2_x1000,
++// gate0_x1000,gate1_x1000}. Only while the composer's refresh mode
+ // is a black-and-white one (NORMAL, FAST): the grey modes show anti-aliased edges as they are.
+ struct EinkEnhance {
+     float strength = 0.f;
+-    float radius = 2.f;
+-    float t1 = 0.03f;
+-    float t2 = 0.14f;
++    float radius = 3.5f;
++    float t1 = 0.04f;
++    float t2 = 0.12f;
++    float solid1 = 0.12f;
++    float solid2 = 0.40f;
++    float gate0 = 0.55f;
++    float gate1 = 0.80f;
+     // Text contrast, set by the HiBreakParts app: grey levels (0-255) that become black and
+     // white (vendor.xrz.hibreak_contrast_black / _white).
+     float black = 0.f;
+@@ -1547,10 +1552,24 @@ EinkEnhance getEinkEnhance() {
+                 mode == 0x10 || mode == 0x11;
+         if (blackAndWhite) {
+             c.strength = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance", 0u) / 100.f;
++            // FAST (0xb3) is also the motion mode: debug.sf.eink_enhance.fast=0 leaves the pass
++            // out while the screen moves, for a shorter composition (the repaint in the normal
++            // mode at the end of the motion has it again).
++            if (mode == 0xb3 && !base::GetBoolProperty("debug.sf.eink_enhance.fast", true)) {
++                c.strength = 0.f;
++            }
+         }
+-        c.radius = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.radius_x10", 20u) / 10.f;
+-        c.t1 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t1_x1000", 30u) / 1000.f;
+-        c.t2 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t2_x1000", 140u) / 1000.f;
++        c.radius = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.radius_x10", 35u) / 10.f;
++        c.t1 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t1_x1000", 40u) / 1000.f;
++        c.t2 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t2_x1000", 120u) / 1000.f;
++        c.solid1 =
++                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid1_x1000", 120u) / 1000.f;
++        c.solid2 =
++                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid2_x1000", 400u) / 1000.f;
++        c.gate0 =
++                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.gate0_x1000", 550u) / 1000.f;
++        c.gate1 =
++                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.gate1_x1000", 800u) / 1000.f;
+         c.black = std::min(120u, base::GetUintProperty<uint32_t>(
+                                          "vendor.xrz.hibreak_contrast_black", 0u)) / 255.f;
+         c.white = std::max(135u, std::min(255u, base::GetUintProperty<uint32_t>(
+@@ -1611,6 +1630,10 @@ void Output::applyEinkEnhance(renderengine::DisplaySettings& settings) {
+     settings.einkEnhanceRadius = eink.radius;
+     settings.einkEnhanceT1 = eink.t1;
+     settings.einkEnhanceT2 = eink.t2;
++    settings.einkSolid1 = eink.solid1;
++    settings.einkSolid2 = eink.solid2;
++    settings.einkGate0 = eink.gate0;
++    settings.einkGate1 = eink.gate1;
+     settings.einkBlack = eink.black;
+     settings.einkWhite = eink.white;
+ }
+-- 
+2.43.0
+

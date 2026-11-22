@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- E-ink: the ringer mode drawer of the volume panel. The surface is as white as what is behind it, so it gets a solid outline. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <corners android:radius="30dp" />
+    <solid android:color="@*android:color/materialColorSurface" />
+    <stroke
+        android:width="2dp"
+        android:color="@*android:color/materialColorOnSurface" />
+</shape>

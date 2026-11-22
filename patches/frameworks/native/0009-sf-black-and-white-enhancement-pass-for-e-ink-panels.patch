@@ -1,0 +1,309 @@
+From 2d4c7b69305f31a1209c8c18fa625858ed45e760 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 17 Nov 2026 02:53:07 +0000
+Subject: [PATCH 9/9] sf: black-and-white enhancement pass for e-ink panels
+
+The HiBreak Pro's panel shows black and white only in its normal and fast
+modes; the kernel dithers everything in between. Grey or coloured text,
+thin grey icons, hairlines and every anti-aliased edge therefore come out
+as dither noise, in every app.
+
+With debug.sf.eink_enhance (strength in percent), the render engine runs one
+more pass over the composed frame of the built-in display: each pixel is
+compared with the mean of its surroundings (12 taps on two rings), and the
+further it is from that mean, the more it is pushed to pure black or white.
+Text and lines of any colour on any background become solid, edges become
+hard, and flat or smooth areas (fills, photos) are left to the dither.
+Only while the composer's refresh mode is a black-and-white one; the grey
+modes keep their anti-aliasing. Screenshots and virtual displays are not
+touched (debug.sf.eink_enhance.capture=1 includes it, for tuning).
+
+The same pass applies the text contrast (vendor.xrz.hibreak_contrast_black /
+_white, set by HiBreakParts), after the enhancement, so that light
+hairlines are still seen before the stretch turns them white.
+
+Change-Id: I853f6b44f3c34023f3440a8705e4c23b2805c372
+---
+ .../include/renderengine/DisplaySettings.h    | 27 +++++++-
+ libs/renderengine/skia/SkiaRenderEngine.cpp   | 60 +++++++++++++++++
+ libs/renderengine/skia/SkiaRenderEngine.h     |  2 +
+ .../include/compositionengine/impl/Output.h   |  2 +
+ .../CompositionEngine/src/Output.cpp          | 65 +++++++++++++++++++
+ .../surfaceflinger/ScreenCaptureOutput.cpp    | 12 ++++
+ 6 files changed, 167 insertions(+), 1 deletion(-)
+
+diff --git a/libs/renderengine/include/renderengine/DisplaySettings.h b/libs/renderengine/include/renderengine/DisplaySettings.h
+index 280ec19..5c8bf01 100644
+--- a/libs/renderengine/include/renderengine/DisplaySettings.h
++++ b/libs/renderengine/include/renderengine/DisplaySettings.h
+@@ -68,6 +68,27 @@ struct DisplaySettings {
+     // ignore it. Some draws (e.g. screen decorations) may need it, though.
+     bool deviceHandlesColorTransform = false;
+ 
++    // E-ink (Bigme HiBreak Pro): sharpen the composed frame for a panel that shows only black
++    // and white. Each pixel is compared with the mean of its surroundings (two rings of six
++    // taps, at einkEnhanceRadius and twice that, in pixels); the further it is from that mean
++    // (from einkEnhanceT1, fully at einkEnhanceT2), the more it is pushed to pure black or
++    // white. Text and lines of any colour on any background become solid, anti-aliased edges
++    // become hard, and flat or smooth areas (photos, fills) are left to the panel's dither.
++    // Strength 0 = off.
++    // Afterwards the greys between einkBlack and einkWhite are stretched over the full range
++    // (text contrast; 0 and 1 = off). Done here and not with the colour transform, so that the
++    // enhancement still sees light hairlines that the stretch turns white.
++    float einkEnhanceStrength = 0.f;
++    float einkEnhanceRadius = 2.f;
++    float einkEnhanceT1 = 0.03f;
++    float einkEnhanceT2 = 0.14f;
++    float einkBlack = 0.f;
++    float einkWhite = 1.f;
++
++    bool einkPass() const {
++        return einkEnhanceStrength > 0.f || einkBlack > 0.f || einkWhite < 1.f;
++    }
++
+     // An additional orientation flag to be applied after clipping the output.
+     // By way of example, this may be used for supporting fullscreen screenshot
+     // capture of a device in landscape while the buffer is in portrait
+@@ -116,7 +137,11 @@ static inline bool operator==(const DisplaySettings& lhs, const DisplaySettings&
+             lhs.deviceHandlesColorTransform == rhs.deviceHandlesColorTransform &&
+             lhs.orientation == rhs.orientation &&
+             lhs.targetLuminanceNits == rhs.targetLuminanceNits &&
+-            lhs.dimmingStage == rhs.dimmingStage && lhs.renderIntent == rhs.renderIntent;
++            lhs.dimmingStage == rhs.dimmingStage && lhs.renderIntent == rhs.renderIntent &&
++            lhs.einkEnhanceStrength == rhs.einkEnhanceStrength &&
++            lhs.einkEnhanceRadius == rhs.einkEnhanceRadius &&
++            lhs.einkEnhanceT1 == rhs.einkEnhanceT1 && lhs.einkEnhanceT2 == rhs.einkEnhanceT2 &&
++            lhs.einkBlack == rhs.einkBlack && lhs.einkWhite == rhs.einkWhite;
+ }
+ 
+ static const char* orientation_to_string(uint32_t orientation) {
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+index daa0ecc..e54bd37 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -780,6 +780,61 @@ private:
+     AutoBackendTexture::CleanupManager& mMgr;
+ };
+ 
++// E-ink enhancement, see DisplaySettings::einkEnhanceStrength. One pass over the composed frame.
++static const char* const kEinkEnhanceSkSL = R"(
++    uniform shader img;
++    uniform float r;
++    uniform float t1;
++    uniform float t2;
++    uniform float strength;
++    uniform float black;
++    uniform float white;
++    const half3 W = half3(0.299, 0.587, 0.114);
++    half luma(float2 p) { return dot(img.eval(p).rgb, W); }
++    half4 main(float2 xy) {
++        half4 c = img.eval(xy);
++        half l = dot(c.rgb, W);
++        half m = luma(xy + r * float2(1.0, 0.0)) + luma(xy + r * float2(0.5, 0.866)) +
++                 luma(xy + r * float2(-0.5, 0.866)) + luma(xy + r * float2(-1.0, 0.0)) +
++                 luma(xy + r * float2(-0.5, -0.866)) + luma(xy + r * float2(0.5, -0.866)) +
++                 luma(xy + r * float2(1.732, 1.0)) + luma(xy + r * float2(0.0, 2.0)) +
++                 luma(xy + r * float2(-1.732, 1.0)) + luma(xy + r * float2(-1.732, -1.0)) +
++                 luma(xy + r * float2(0.0, -2.0)) + luma(xy + r * float2(1.732, -1.0));
++        half d = l - m / 12.0;
++        half s = smoothstep(t1, t2, abs(d)) * strength;
++        half e = mix(l, d < 0.0 ? 0.0 : 1.0, s);
++        return half4(saturate((c.rgb + (e - l) - black) / (white - black)), c.a);
++    }
++)";
++
++void SkiaRenderEngine::drawEinkEnhance(const DisplaySettings& display,
++                                       const sk_sp<SkSurface>& surface, SkCanvas* canvas) {
++    SFTRACE_CALL();
++    static const sk_sp<SkRuntimeEffect> sEffect = [] {
++        auto [effect, error] = SkRuntimeEffect::MakeForShader(SkString(kEinkEnhanceSkSL));
++        if (!effect) ALOGE("e-ink enhance shader: %s", error.c_str());
++        return effect;
++    }();
++    if (!sEffect) return;
++    sk_sp<SkImage> frame = surface->makeImageSnapshot();
++    if (!frame) return;
++    SkRuntimeShaderBuilder builder(sEffect);
++    builder.child("img") = frame->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
++                                             SkSamplingOptions(SkFilterMode::kNearest));
++    builder.uniform("r") = display.einkEnhanceRadius;
++    builder.uniform("t1") = display.einkEnhanceT1;
++    builder.uniform("t2") = std::max(display.einkEnhanceT2, display.einkEnhanceT1 + 0.001f);
++    builder.uniform("strength") = std::min(display.einkEnhanceStrength, 1.f);
++    builder.uniform("black") = display.einkBlack;
++    builder.uniform("white") = std::max(display.einkWhite, display.einkBlack + 0.01f);
++    SkPaint paint;
++    paint.setShader(builder.makeShader());
++    paint.setBlendMode(SkBlendMode::kSrc);
++    SkAutoCanvasRestore restore(canvas, true);
++    canvas->resetMatrix();
++    canvas->drawPaint(paint);
++}
++
+ void SkiaRenderEngine::drawLayersInternal(
+         const std::shared_ptr<std::promise<FenceResult>>&& resultPromise,
+         const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+@@ -1352,6 +1407,11 @@ void SkiaRenderEngine::drawLayersInternal(
+     }
+ 
+     surfaceAutoSaveRestore.restore();
++
++    if (display.einkPass()) {
++        drawEinkEnhance(display, dstSurface, dstCanvas);
++    }
++
+     mCapture->endCapture();
+ 
+     LOG_ALWAYS_FATAL_IF(activeSurface != dstSurface);
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.h b/libs/renderengine/skia/SkiaRenderEngine.h
+index 26fab27..4fee3b4 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.h
++++ b/libs/renderengine/skia/SkiaRenderEngine.h
+@@ -156,6 +156,8 @@ private:
+     void initCanvas(SkCanvas* canvas, const DisplaySettings& display);
+     void drawShadow(SkCanvas* canvas, const SkRRect& casterRRect,
+                     const ShadowSettings& shadowSettings);
++    void drawEinkEnhance(const DisplaySettings& display, const sk_sp<SkSurface>& surface,
++                         SkCanvas* canvas);
+     void drawLayersInternal(const std::shared_ptr<std::promise<FenceResult>>&& resultPromise,
+                             const DisplaySettings& display,
+                             const std::vector<LayerSettings>& layers,
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+index 5a4cfcd..25d2d5b 100644
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+@@ -145,6 +145,8 @@ protected:
+     bool getSkipColorTransform() const override;
+     compositionengine::Output::FrameFences presentFrame() override;
+     void executeCommands() override {}
++    // E-ink (Bigme HiBreak Pro): fills in the enhancement settings from the properties.
++    static void applyEinkEnhance(renderengine::DisplaySettings&);
+     virtual renderengine::DisplaySettings generateClientCompositionDisplaySettings(
+             const std::shared_ptr<renderengine::ExternalTexture>& buffer) const;
+     std::vector<LayerFE::LayerSettings> generateClientCompositionRequests(
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index bea48f7..2131cde 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -55,6 +55,8 @@
+ #pragma clang diagnostic pop // ignored "-Wconversion"
+ 
+ #include <android-base/properties.h>
++#include <sys/system_properties.h>
++#include <mutex>
+ #include <ui/DebugUtils.h>
+ #include <ui/HdrCapabilities.h>
+ 
+@@ -1513,6 +1515,54 @@ std::optional<base::unique_fd> Output::composeSurfaces(
+     return base::unique_fd(fence->dup());
+ }
+ 
++namespace {
++
++// E-ink enhancement and contrast (renderengine::DisplaySettings::einkEnhanceStrength), from
++// properties so they can be tuned on the device: debug.sf.eink_enhance (strength in percent, 0 = off) and
++// debug.sf.eink_enhance.{radius_x10,t1_x1000,t2_x1000}. Only while the composer's refresh mode
++// is a black-and-white one (NORMAL, FAST): the grey modes show anti-aliased edges as they are.
++struct EinkEnhance {
++    float strength = 0.f;
++    float radius = 2.f;
++    float t1 = 0.03f;
++    float t2 = 0.14f;
++    // Text contrast, set by the HiBreakParts app: grey levels (0-255) that become black and
++    // white (vendor.xrz.hibreak_contrast_black / _white).
++    float black = 0.f;
++    float white = 1.f;
++};
++
++EinkEnhance getEinkEnhance() {
++    static std::mutex sMutex;
++    static uint32_t sSerial = 0xffffffffu;
++    static EinkEnhance sConfig;
++    std::lock_guard lock(sMutex);
++    const uint32_t serial = __system_property_area_serial();
++    if (serial != sSerial) {
++        sSerial = serial;
++        EinkEnhance c;
++        const uint32_t mode =
++                base::GetUintProperty<uint32_t>("vendor.xrz.global_refresh_mode", 0u) & 0xff;
++        const bool blackAndWhite = mode == 0 || mode == 0xb2 || mode == 0xb3 || mode == 0x02 ||
++                mode == 0x10 || mode == 0x11;
++        if (blackAndWhite) {
++            c.strength = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance", 0u) / 100.f;
++        }
++        c.radius = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.radius_x10", 20u) / 10.f;
++        c.t1 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t1_x1000", 30u) / 1000.f;
++        c.t2 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t2_x1000", 140u) / 1000.f;
++        c.black = std::min(120u, base::GetUintProperty<uint32_t>(
++                                         "vendor.xrz.hibreak_contrast_black", 0u)) / 255.f;
++        c.white = std::max(135u, std::min(255u, base::GetUintProperty<uint32_t>(
++                                                        "vendor.xrz.hibreak_contrast_white",
++                                                        255u))) / 255.f;
++        sConfig = c;
++    }
++    return sConfig;
++}
++
++} // namespace
++
+ renderengine::DisplaySettings Output::generateClientCompositionDisplaySettings(
+         const std::shared_ptr<renderengine::ExternalTexture>& buffer) const {
+     const auto& outputState = getState();
+@@ -1547,9 +1597,24 @@ renderengine::DisplaySettings Output::generateClientCompositionDisplaySettings(
+     clientCompositionDisplay.colorTransform = outputState.colorTransformMatrix;
+     clientCompositionDisplay.deviceHandlesColorTransform =
+             outputState.usesDeviceComposition || getSkipColorTransform();
++
++    // E-ink: only for the built-in panel, not for virtual displays (recordings, mirroring).
++    if (getDisplayIdVariant().and_then(asPhysicalDisplayId)) {
++        applyEinkEnhance(clientCompositionDisplay);
++    }
+     return clientCompositionDisplay;
+ }
+ 
++void Output::applyEinkEnhance(renderengine::DisplaySettings& settings) {
++    const EinkEnhance eink = getEinkEnhance();
++    settings.einkEnhanceStrength = eink.strength;
++    settings.einkEnhanceRadius = eink.radius;
++    settings.einkEnhanceT1 = eink.t1;
++    settings.einkEnhanceT2 = eink.t2;
++    settings.einkBlack = eink.black;
++    settings.einkWhite = eink.white;
++}
++
+ std::vector<LayerFE::LayerSettings> Output::generateClientCompositionRequests(
+       bool supportsProtectedContent, ui::Dataspace outputDataspace, std::vector<LayerFE*>& outLayerFEs) {
+     std::vector<LayerFE::LayerSettings> clientCompositionLayers;
+diff --git a/services/surfaceflinger/ScreenCaptureOutput.cpp b/services/surfaceflinger/ScreenCaptureOutput.cpp
+index f7a7709..caf0957 100644
+--- a/services/surfaceflinger/ScreenCaptureOutput.cpp
++++ b/services/surfaceflinger/ScreenCaptureOutput.cpp
+@@ -15,6 +15,8 @@
+  */
+ 
+ #include "ScreenCaptureOutput.h"
++
++#include <android-base/properties.h>
+ #include "ScreenCaptureRenderSurface.h"
+ #include "common/include/common/FlagManager.h"
+ #include "ui/Rotation.h"
+@@ -85,6 +87,16 @@ renderengine::DisplaySettings ScreenCaptureOutput::generateClientCompositionDisp
+             compositionengine::impl::Output::generateClientCompositionDisplaySettings(buffer);
+     clientCompositionDisplay.clip = mSourceCrop;
+ 
++    // E-ink: a screenshot shows what the apps drew, not the panel's black-and-white version of
++    // it; debug.sf.eink_enhance.capture=1 keeps the enhancement, for tuning it.
++    if (base::GetBoolProperty("debug.sf.eink_enhance.capture", false)) {
++        applyEinkEnhance(clientCompositionDisplay);
++    } else {
++        clientCompositionDisplay.einkEnhanceStrength = 0.f;
++        clientCompositionDisplay.einkBlack = 0.f;
++        clientCompositionDisplay.einkWhite = 1.f;
++    }
++
+     auto renderIntent = static_cast<ui::RenderIntent>(clientCompositionDisplay.renderIntent);
+     if (mDimInGammaSpaceForEnhancedScreenshots && renderIntent != ui::RenderIntent::COLORIMETRIC &&
+         renderIntent != ui::RenderIntent::TONE_MAP_COLORIMETRIC) {
+-- 
+2.43.0
+

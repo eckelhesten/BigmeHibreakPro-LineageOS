@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hibreakpro <hibreakpro@localhost>
+Date: Thu, 12 Nov 2026 20:24:54 +0100
+Subject: [PATCH] bpf: allow Android 16 on legacy 4.19 kernels
+
+NetBpfLoad and netd's BpfHandler refuse to start on 25Q2+ with a kernel
+older than 5.4. The Bigme HiBreak Pro (MT6877) ships a prebuilt 4.19.191
+kernel without source. Every netd program still has a 4.19 variant (or
+is KVER-gated and skipped), and BpfHandler keeps its 4.19 attach paths,
+so turn both hard failures into warnings.
+
+Lost on 4.19: local-network protection (5.4+ cgroup programs), tethering
+hardware offload (5.4/5.10), get/setsockopt cgroup hooks.
+---
+ bpf/loader/NetBpfLoad.cpp | 5 +++--
+ bpf/netd/BpfHandler.cpp   | 3 ++-
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/bpf/loader/NetBpfLoad.cpp b/bpf/loader/NetBpfLoad.cpp
+index 2388647..50c0c62 100644
+--- a/bpf/loader/NetBpfLoad.cpp
++++ b/bpf/loader/NetBpfLoad.cpp
+@@ -1626,9 +1626,10 @@ static int doLoad(char** argv, char * const envp[]) {
+ 
+     // 25Q2 bumps the kernel requirement up to 5.4
+     // see also: //system/netd/tests/kernel_test.cpp TestKernel54
++    // Legacy-kernel devices (e.g. MT6877 with a prebuilt 4.19 vendor kernel): warn only.
++    // All programs keep 4.19 variants (or are KVER-gated and skipped), see netd.c.
+     if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4)) {
+-        ALOGE("Android 25Q2 requires kernel 5.4.");
+-        return 6;
++        ALOGW("Android 25Q2 requires kernel 5.4, continuing on legacy kernel.");
+     }
+ 
+     // 25Q4 bumps the kernel requirement up to 5.10
+diff --git a/bpf/netd/BpfHandler.cpp b/bpf/netd/BpfHandler.cpp
+index 7367ec5..404829d 100644
+--- a/bpf/netd/BpfHandler.cpp
++++ b/bpf/netd/BpfHandler.cpp
+@@ -102,8 +102,9 @@ static Status initPrograms(const char* cg2_path) {
+     }
+ 
+     // 25Q2 bumps the kernel requirement up to 5.4
++    // Legacy-kernel devices: the 4.19 cgroup programs are attached below as on V.
+     if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4)) {
+-        return Status("25Q2+ platform with kernel version < 5.4.0 is unsupported");
++        ALOGW("25Q2+ platform with kernel version < 5.4.0 is unsupported, continuing");
+     }
+ 
+     unique_fd cg_fd(open(cg2_path, O_DIRECTORY | O_RDONLY | O_CLOEXEC));
+-- 
+2.50.1 (Apple Git-155)
+

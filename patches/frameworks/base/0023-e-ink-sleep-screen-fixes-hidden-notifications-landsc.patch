@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000023 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Fri, 20 Nov 2026 23:45:00 +0100
+Subject: [PATCH] e-ink: sleep screen fixes (hidden notifications, landscape
+ sizing, footer overflow, caching)
+
+Fixes several edge cases in EinkSleepScreen:
+- Skip hidden or removed ExpandableNotificationRow children in loadIcons()
+  so notifications hidden on the lock screen do not leak as sleep-screen
+  icons.
+- Scale numerals, date, icons, battery and footer from min(w, h) instead
+  of w so locking in landscape does not overflow the screen.
+- Reject non-finite weather temperatures (NaN/Infinity), ellipsize long
+  weather condition tails, and omit the trailing middot separator when an
+  event time leaves no room for a title.
+- Cache the base Typefaces instead of calling Typeface.create() on every
+  onDraw(), and unregister the StatusBarStateController callback / clear
+  sInstance on detach.
+---
+ .../systemui/shade/EinkSleepScreen.java       | 75 +++++++++++++------
+ 1 file changed, 52 insertions(+), 23 deletions(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+index f021459d..99999999 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+@@ -89,10 +89,15 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+     private static EinkSleepScreen sInstance;
+ 
++    private final StatusBarStateController mStateController;
+     private final NotificationStackScrollLayoutController mNotifications;
+     private final Paint mTimePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+     private final Paint mTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+     private final Rect mBounds = new Rect();
+     private final List<Drawable> mIcons = new ArrayList<>();
++    private Typeface mTimeTypeface;
++    private int mTimeTypefaceWeight = -1;
++    private final Typeface mTextTypeface = typeface(500);
++    private final Typeface mFooterTypeface = typeface(400);
+     private int mWeight = 500;
+     private float mSize = 0.52f;
+     private boolean mShowIcons = true;
+@@ -122,7 +127,7 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+     public static void attach(ViewGroup root, StatusBarStateController stateController,
+             NotificationStackScrollLayoutController notifications) {
+         if (!ENABLED || sInstance != null) return;
+-        EinkSleepScreen view = new EinkSleepScreen(root.getContext(), notifications);
++        EinkSleepScreen view = new EinkSleepScreen(root.getContext(), stateController, notifications);
+         root.addView(view, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                 ViewGroup.LayoutParams.MATCH_PARENT));
+         stateController.addCallback(view);
+@@ -135,8 +140,10 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         if (sInstance != null) sInstance.refresh();
+     }
+ 
+-    private EinkSleepScreen(Context context, NotificationStackScrollLayoutController notifs) {
++    private EinkSleepScreen(Context context, StatusBarStateController stateController,
++            NotificationStackScrollLayoutController notifs) {
+         super(context);
++        mStateController = stateController;
+         mNotifications = notifs;
+         setVisibility(GONE);
+         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+@@ -144,6 +151,13 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         setTranslationZ(10000f);
+     }
+ 
++    @Override
++    protected void onDetachedFromWindow() {
++        mStateController.removeCallback(this);
++        if (sInstance == this) sInstance = null;
++        super.onDetachedFromWindow();
++    }
++
+     @Override
+     public void onDozingChanged(boolean isDozing) {
+         if (isDozing) {
+@@ -191,6 +205,7 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+             Set<String> seen = new HashSet<>();
+             for (int i = 0; i < stack.getChildCount() && mIcons.size() < MAX_ICONS; i++) {
+                 if (!(stack.getChildAt(i) instanceof ExpandableNotificationRow row)) continue;
++                if (row.getVisibility() != View.VISIBLE || row.isRemoved()) continue;
+                 // The two notification pipelines (bundle UI flag) hand out the entry differently.
+                 StatusBarNotification sbn;
+                 NotificationListenerService.Ranking ranking;
+@@ -234,7 +249,8 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+             if (f != null && f.length == 9 && ("1".equals(f[0]) || "2".equals(f[0]))
+                     && now - Long.parseLong(f[5]) < WEATHER_MAX_AGE && !f[8].isEmpty()) {
+                 final boolean fahrenheit = "f".equals(f[4]);
+                 final double celsius = Double.parseDouble(f[3]);
++                if (!Double.isFinite(celsius)) throw new NumberFormatException("non-finite temp");
+                 final long t = Math.round(fahrenheit ? celsius * 9 / 5 + 32 : celsius);
+                 mWeatherKind = f[1];
+                 mWeatherDay = "1".equals(f[2]);
+@@ -267,6 +283,7 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+     protected void onDraw(Canvas canvas) {
+         final int w = getWidth();
+         final int h = getHeight();
++        final int ref = Math.min(w, h);
+         final boolean night = (getResources().getConfiguration().uiMode
+                 & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+         final int bg = night ? Color.BLACK : Color.WHITE;
+@@ -282,11 +299,15 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+                 String.format(Locale.ROOT, "%02d", now.get(Calendar.MINUTE))};
+ 
+         // The numerals: two lines, centred, their block starting at 17 % of the height.
++        if (mTimeTypeface == null || mTimeTypefaceWeight != mWeight) {
++            mTimeTypeface = typeface(mWeight);
++            mTimeTypefaceWeight = mWeight;
++        }
+         mTimePaint.setColor(fg);
+-        mTimePaint.setTypeface(typeface(mWeight));
++        mTimePaint.setTypeface(mTimeTypeface);
+         mTimePaint.setFontVariationSettings("'wght' " + mWeight + ", 'opsz' 144");
+         mTimePaint.setFontFeatureSettings("tnum");
+-        mTimePaint.setTextSize(w * mSize);
++        mTimePaint.setTextSize(ref * mSize);
+         mTimePaint.setTextAlign(Paint.Align.CENTER);
+         float y = h * 0.17f;
+         for (String line : lines) {
+@@ -298,20 +319,20 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+ 
+         // The date.
+         mTextPaint.setColor(fg);
+-        mTextPaint.setTypeface(typeface(500));
++        mTextPaint.setTypeface(mTextTypeface);
+         mTextPaint.setTextAlign(Paint.Align.CENTER);
+-        mTextPaint.setTextSize(w * 0.058f);
++        mTextPaint.setTextSize(ref * 0.058f);
+         String pattern = DateFormat.getBestDateTimePattern(Locale.getDefault(), "EEEEdMMMM");
+-        y += w * 0.07f + mTextPaint.getTextSize() * 0.75f;
++        y += ref * 0.07f + mTextPaint.getTextSize() * 0.75f;
+         canvas.drawText(DateFormat.format(pattern, now).toString(), w / 2f, y, mTextPaint);
+ 
+         // Notification icons, in the text colour.
+         if (!mIcons.isEmpty()) {
+-            final int size = Math.round(w * 0.068f);
+-            final int gap = Math.round(w * 0.045f);
++            final int size = Math.round(ref * 0.068f);
++            final int gap = Math.round(ref * 0.045f);
+             final int n = mIcons.size();
+             int x = (w - (n * size + (n - 1) * gap)) / 2;
+-            final int top = Math.round(y + w * 0.075f);
++            final int top = Math.round(y + ref * 0.075f);
+             for (Drawable d : mIcons) {
+                 d.setColorFilter(fg, PorterDuff.Mode.SRC_IN);
+                 d.setBounds(x, top, x + size, top + size);
+@@ -332,9 +353,9 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+                 int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                 boolean charging = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
+                 if (level >= 0 && scale > 0) {
+-                    mTextPaint.setTextSize(w * 0.042f);
++                    mTextPaint.setTextSize(ref * 0.042f);
+                     String text = (charging ? "⚡︎ " : "") + (level * 100 / scale) + " %";
+-                    canvas.drawText(text, w / 2f, footer ? w * 0.10f : h - w * 0.12f,
++                    canvas.drawText(text, w / 2f, footer ? ref * 0.10f : h - ref * 0.12f,
+                             mTextPaint);
+                 }
+             }
+@@ -343,45 +364,50 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+ 
+     /** The footer (see the class comment): one size, one weight, each item on one line. */
+     private void drawFooter(Canvas canvas, int w, int h, int fg, int bg) {
++        final int ref = Math.min(w, h);
+         final float maxWidth = w * 0.86f;
+-        final float bottom = h - w * 0.085f;
++        final float bottom = h - ref * 0.085f;
+         mFooterPaint.setColor(fg);
+-        mFooterPaint.setTypeface(typeface(400));
++        mFooterPaint.setTypeface(mFooterTypeface);
+         mFooterPaint.setTextAlign(Paint.Align.LEFT);
+-        mFooterPaint.setTextSize(w * mFooterSize);
++        mFooterPaint.setTextSize(ref * mFooterSize);
+         final String sep = " \u00b7 ";
+         final boolean both = mWeatherCity != null && mEventTitle != null;
+ 
+         if (mWeatherCity != null) {
+             // Berlin · [icon] 5°C · Cloudy; the city gives way first.
+-            final float baseline = both ? bottom - w * mFooterLeading : bottom;
++            final float baseline = both ? bottom - ref * mFooterLeading : bottom;
+             final float cap = capHeight();
+             final float iconHeight = cap * mFooterIcon;
+             final float iconWidth = EinkWeatherIcon.width(mWeatherKind, mWeatherDay, iconHeight);
+             final float iconGap = mFooterPaint.measureText(" ");
+-            final String tail = mWeatherTemp
+-                    + (mWeatherCondition != null ? sep + mWeatherCondition : "");
++            final String rawTail = mWeatherTemp
++                    + (mWeatherCondition != null ? sep + mWeatherCondition : "");
++            final String tail = ellipsize(rawTail, Math.max(0f, maxWidth - iconWidth - iconGap));
+             final float fixed = iconWidth + iconGap + mFooterPaint.measureText(tail)
+                     + mFooterPaint.measureText(sep);
+             final float cityRoom = maxWidth - fixed;
+             final String head = cityRoom > mFooterPaint.getTextSize() * 2
+                     ? ellipsize(mWeatherCity, cityRoom) + sep : "";
+             final float headWidth = mFooterPaint.measureText(head);
+             float x = (w - (headWidth + iconWidth + iconGap
+                     + mFooterPaint.measureText(tail))) / 2f;
+             canvas.drawText(head, x, baseline, mFooterPaint);
+             x += headWidth;
+             EinkWeatherIcon.draw(canvas, mWeatherKind, mWeatherDay, x, baseline - cap / 2f,
+                     iconHeight, fg, bg);
+             x += iconWidth + iconGap;
+             canvas.drawText(tail, x, baseline, mFooterPaint);
+         }
+ 
+         if (mEventTitle != null) {
+             // Tomorrow 19:30 · Eat candy; the title gives way, the time never does.
+-            final String when = describeWhen(System.currentTimeMillis()) + sep;
+-            final float titleRoom = maxWidth - mFooterPaint.measureText(when);
+-            final String line = when + ellipsize(mEventTitle, Math.max(0f, titleRoom));
++            final String whenOnly = describeWhen(System.currentTimeMillis());
++            final String when = whenOnly + sep;
++            final float titleRoom = maxWidth - mFooterPaint.measureText(when);
++            final String line = titleRoom > mFooterPaint.getTextSize()
++                    ? when + ellipsize(mEventTitle, titleRoom)
++                    : ellipsize(whenOnly, maxWidth);
+             canvas.drawText(line, (w - mFooterPaint.measureText(line)) / 2f, bottom,
+                     mFooterPaint);
+         }
+-- 
+2.43.0

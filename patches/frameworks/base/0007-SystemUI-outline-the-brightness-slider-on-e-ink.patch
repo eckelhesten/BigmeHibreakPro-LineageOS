@@ -1,0 +1,71 @@
+From bd2ce9ec5c0e8118dfda00ce4f904c0f143fa80d Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 14 Nov 2026 14:48:37 +0100
+Subject: [PATCH 3/4] SystemUI: outline the brightness slider on e-ink
+
+With debug.sysui.eink_palette=1 the brightness slider's track gets a 2dp
+outline in the on-surface colour. With the two-tone palette the inactive
+part of the track is as white as the shade around it, so the slider's
+extent was invisible.
+
+Change-Id: I9f8e7d6c5b4a39281706f5e4d3c2b1a098765432
+---
+ .../brightness/ui/compose/BrightnessSlider.kt | 21 +++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt b/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt
+index 9ee47cf1..6ed17b23 100644
+--- a/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt
++++ b/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt
+@@ -77,6 +77,7 @@ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.ColorFilter
+ import androidx.compose.ui.graphics.asImageBitmap
+ import androidx.compose.ui.graphics.drawscope.DrawScope
++import androidx.compose.ui.graphics.drawscope.Stroke
+ import androidx.compose.ui.graphics.drawscope.scale
+ import androidx.compose.ui.graphics.drawscope.translate
+ import androidx.compose.ui.graphics.painter.BitmapPainter
+@@ -171,6 +172,7 @@ fun BrightnessSlider(
+             )
+         }
+     val colors = colors()
++    val einkOutlineColor = MaterialTheme.colorScheme.onSurface
+ 
+     // The value state is recreated every time gammaValue changes, so we recreate this derivedState
+     // We have to use value as that's the value that changes when the user is dragging (gammaValue
+@@ -340,6 +342,20 @@ fun BrightnessSlider(
+                             .drawWithContent {
+                                 drawContent()
+ 
++                                if (EINK_SLIDER_OUTLINE) {
++                                    // E-ink: the inactive part of the track is as white as the
++                                    // shade, so draw the edge of the whole track.
++                                    val stroke = EinkSliderOutlineWidth.toPx()
++                                    drawRoundRect(
++                                        color = einkOutlineColor,
++                                        topLeft = Offset(stroke / 2, stroke / 2),
++                                        size = Size(size.width - stroke, size.height - stroke),
++                                        cornerRadius =
++                                            CornerRadius(SliderTrackRoundedCorner.toPx()),
++                                        style = Stroke(stroke),
++                                    )
++                                }
++
+                                 val yOffset = size.height / 2 - IconSize.toSize().height / 2
+                                 val activeTrackStart = 0f
+                                 val activeTrackEnd =
+@@ -612,6 +628,11 @@ private suspend fun Animatable<Float, AnimationVector1D>.disappear() =
+     animateTo(targetValue = 0f, animationSpec = IconDisappearSpec)
+ 
+ @VisibleForTesting
++/** E-ink panels (debug.sysui.eink_palette=1): outline the slider track. */
++private val EINK_SLIDER_OUTLINE: Boolean =
++    android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)
++private val EinkSliderOutlineWidth = 2.dp
++
+ object BrightnessSliderMotionTestKeys {
+     val AnimatingIcon = MotionTestValueKey<Boolean>("animatingIcon")
+     val ActiveIconAlpha = MotionTestValueKey<Float>("activeIconAlpha")
+-- 
+2.50.1 (Apple Git-155)
+

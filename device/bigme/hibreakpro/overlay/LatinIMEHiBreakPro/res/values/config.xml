@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- E-ink: the key preview popup appears and fades over several frames, which costs two or
+         three panel updates per key press on top of the text change. Off by default; the
+         keyboard settings ("Popup on keypress") can still turn it on. -->
+    <bool name="config_default_key_preview_popup">false</bool>
+</resources>

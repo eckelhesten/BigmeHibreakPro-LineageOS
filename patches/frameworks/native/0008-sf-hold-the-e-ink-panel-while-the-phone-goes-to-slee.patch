@@ -1,0 +1,271 @@
+From d8872ac6adbfb4129ab84300c617ed486bb40e44 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 17 Nov 2026 02:53:07 +0000
+Subject: [PATCH 8/9] sf: hold the e-ink panel while the phone goes to sleep or
+ wakes up
+
+Going to sleep and waking up rearrange the whole screen in several steps
+(keyguard, doze transition, the sleep screen), and the XRZ composer sent
+each of them to the panel. system_server sets vendor.xrz.hibreak_sleep at
+the start of either change (frameworks/base). From the next composite on,
+EinkMotion holds back the composer's panel updates (vendor.xrz.disable_commit,
+the composer still presents) until no frame came for a while, then lets the
+finished screen out in one update: going to sleep as one GC16 clean refresh,
+waking up as one normal update.
+
+How the composer has to be driven (measured 2026-11-17):
+- It commits only frames with new damage and forgets the damage of the
+  frames it skipped, so the first picture after the hold is a forced
+  one-shot (vendor.xrz.force_global_refresh_mode). It is armed during the
+  hold, 100 ms after it began: it then applies to the first commit after
+  the release, whatever frame that is. Set at the release, a frame arriving
+  right after went out in the composer's mode first.
+- Right after going to sleep the composer re-commits the last frame in its
+  own mode once commits are allowed again; holding at least 600 ms avoids
+  that (only the GC16 in 10 of 10 tries).
+- Writing GC16 or the grey mode as the composer's mode right after a Normal
+  commit makes it schedule a GC16 of its own ("delay clean"), a second
+  flash. Asleep, the mode is Normal (one-bit, only the changed pixels move,
+  no flash), whatever the user chose for apps: with "Clear" (GC16) every
+  minute update of the sleep screen was a full flashing refresh. A mode
+  written while asleep (the e-ink settings app) is put back on waking up.
+  debug.sf.eink_sleep.mode sets another one (0 = the user's).
+
+Also: a fast mode still set from scrolling is put back when the hold
+starts, so it does not stay for the whole sleep.
+
+debug.sf.eink_sleep=0 turns it off; debug.sf.eink_sleep.{clean,mode,arm_ms,
+quiet_ms,min_ms,max_ms,wake_mode,wake_min_ms,wake_max_ms} tune it.
+
+Change-Id: I563b265acf3f5104cb498d567142cc8051652cf5
+---
+ .../DisplayHardware/EinkMotion.cpp            | 110 ++++++++++++++++++
+ .../DisplayHardware/EinkMotion.h              |  35 ++++++
+ 2 files changed, 145 insertions(+)
+
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index 63aa5d1..77f2609 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -31,6 +31,10 @@ namespace android {
+ namespace {
+ 
+ constexpr char kModeProperty[] = "vendor.xrz.global_refresh_mode";
++// One-shot mode for the composer's next commit.
++constexpr char kForceModeProperty[] = "vendor.xrz.force_global_refresh_mode";
++// The composer skips its panel update while this is 1 (it still presents the frame).
++constexpr char kDisableCommitProperty[] = "vendor.xrz.disable_commit";
+ 
+ uint32_t readUint(const prop_info* pi, uint32_t fallback) {
+     if (!pi) return fallback;
+@@ -63,6 +67,11 @@ void EinkMotion::setRepaint(std::function<void()> repaint) {
+     mRepaint = std::move(repaint);
+     if (!mStarted) {
+         mStarted = true;
++        // A SurfaceFlinger that died while holding the panel must not leave it frozen.
++        if (base::GetBoolProperty("debug.sf.eink_sleep", true) &&
++            !base::GetBoolProperty("debug.sf.eink_engine", false)) {
++            base::SetProperty(kDisableCommitProperty, "0");
++        }
+         std::thread([this] { threadLoop(); }).detach(); // lives as long as SurfaceFlinger
+     }
+ }
+@@ -85,6 +94,21 @@ void EinkMotion::reloadConfigIfChanged() {
+     // The kernel cleans up after the last FAST frame in passes that take ~600 ms; a mode change
+     // before they finish cancels them and leaves ghosts.
+     c.end = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.end_ms", 700));
++    c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true) &&
++            !base::GetBoolProperty("debug.sf.eink_engine", false);
++    c.asleep = base::GetBoolProperty("vendor.xrz.hibreak_sleep", false);
++    c.sleepMode = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.mode", 0xb2);
++    c.sleepClean = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.clean", 4);
++    c.sleepQuiet = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.quiet_ms", 120));
++    // At least 600 ms: right after going to sleep the composer re-commits the last frame in its
++    // own mode once commits are allowed again, before the one-shot (300-360 ms: a normal update
++    // of the clock before the GC16 in 3 of 5 tries; 600 ms: only the GC16 in 10 of 10).
++    c.sleepMin = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.min_ms", 600));
++    c.sleepMax = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.max_ms", 1500));
++    c.armDelay = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.arm_ms", 100));
++    c.wakeMode = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.wake_mode", 0xb2);
++    c.wakeMin = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.wake_min_ms", 150));
++    c.wakeMax = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.wake_max_ms", 450));
+     mConfig = c;
+ }
+ 
+@@ -104,13 +128,61 @@ bool EinkMotion::isFast(uint32_t mode) const {
+     return m == (mConfig.fastMode & 0xff) || m == 0xb3 || m == 0x10 || m == 0x11;
+ }
+ 
++void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now) {
++    mAsleep = asleep;
++    const uint32_t current = readMode();
++    if (asleep) {
++        // The mode to come back to: the user's, not a fast mode of ours that is still set.
++        mSleepBase = (mFast && current == mWritten) ? mBase : current;
++        if (mFast && current == mWritten) writeMode(mBase);
++        mFast = false;
++        mStreak = 0;
++        applySleepMode();
++    } else if (mSleepModeSet) {
++        // Unless someone else changed the mode meanwhile.
++        if (current == mSleepWritten) writeMode(mSleepBase);
++        mSleepModeSet = false;
++    }
++    base::SetProperty(kDisableCommitProperty, "1");
++    mForceArmed = false;
++    mFrozen = true;
++    mFreezeForSleep = asleep;
++    mFreezeStart = now;
++    ALOGI("%s: panel held", asleep ? "going to sleep" : "waking up");
++}
++
++void EinkMotion::applySleepMode() {
++    // Asleep: the sleep screen's own mode (Normal: one-bit, only the changed pixels move), not
++    // the mode the user chose for apps. With "Clear" (GC16) every minute update was a full
++    // flashing refresh. A mode written by someone else meanwhile (the e-ink settings app) is the
++    // one to put back when waking up.
++    if (mConfig.sleepMode == 0) return;
++    const uint32_t current = readMode();
++    if (current == mConfig.sleepMode) return;
++    mSleepBase = current;
++    mSleepWritten = mConfig.sleepMode;
++    writeMode(mSleepWritten);
++    mSleepModeSet = true;
++}
++
+ void EinkMotion::onComposite(bool imeVisible) {
+     std::lock_guard lock(mMutex);
+     reloadConfigIfChanged();
+     const nsecs_t now = systemTime();
++    if (mConfig.sleep && mConfig.asleep != mAsleep) beginSleepTransition(mConfig.asleep, now);
+     mStreak = (mLastFrame != 0 && now - mLastFrame <= mConfig.gap) ? mStreak + 1 : 1;
+     mLastFrame = now;
+     mImeVisible = imeVisible;
++    if (mFrozen) {
++        // The thread lets the panel go once the frames stop.
++        mCondition.notify_one();
++        return;
++    }
++    // The sleep screen keeps its own mode.
++    if (mAsleep) {
++        applySleepMode();
++        return;
++    }
+ 
+     const bool wantFast = (mConfig.motion && mStreak >= mConfig.frames) || mConfig.touchDown ||
+             (mConfig.ime && imeVisible);
+@@ -134,6 +206,44 @@ void EinkMotion::onComposite(bool imeVisible) {
+ void EinkMotion::threadLoop() {
+     std::unique_lock lock(mMutex);
+     while (true) {
++        if (mFrozen) {
++            const nsecs_t now = systemTime();
++            const nsecs_t minHold = mFreezeForSleep ? mConfig.sleepMin : mConfig.wakeMin;
++            const nsecs_t maxHold = mFreezeForSleep ? mConfig.sleepMax : mConfig.wakeMax;
++            // The first picture after the hold is a forced one-shot (going to sleep: the clean
++            // refresh; waking up: the normal mode). The composer skips a commit without new
++            // damage, and it lost the damage of the frames it skipped. The one-shot is armed
++            // during the hold, after the frame in flight when the hold began: armed there, it
++            // stays until the first commit after the release and applies to it, whatever frame
++            // that is. Set at the release, a frame that came right after went out in the
++            // composer's mode first (measured 2026-11-17, hand tests man3/man4).
++            const nsecs_t armAt = mFreezeStart + mConfig.armDelay;
++            if (!mForceArmed && now >= armAt) {
++                const uint32_t show = mFreezeForSleep ? mConfig.sleepClean : mConfig.wakeMode;
++                if (show != 0) base::SetProperty(kForceModeProperty, std::to_string(show));
++                mForceArmed = true;
++            }
++            nsecs_t due = std::min(mFreezeStart + maxHold,
++                                   std::max(mFreezeStart + minHold,
++                                            mLastFrame + mConfig.sleepQuiet));
++            if (!mForceArmed) due = std::min(due, armAt);
++            if (now < due) {
++                mCondition.wait_for(lock, std::chrono::nanoseconds(due - now));
++                continue;
++            }
++            // The screen has settled: show it in one update.
++            base::SetProperty(kDisableCommitProperty, "0");
++            ALOGI("%s: panel released after %d ms", mFreezeForSleep ? "asleep" : "awake",
++                  static_cast<int>(ns2ms(now - mFreezeStart)));
++            mFrozen = false;
++            mStreak = 0;
++            mLastFrame = 0; // the repaint must not count as motion
++            const auto repaint = mRepaint;
++            lock.unlock();
++            if (repaint) repaint();
++            lock.lock();
++            continue;
++        }
+         if (!mFast) {
+             mCondition.wait(lock);
+             continue;
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index 7d40b48..f80a657 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -32,6 +32,16 @@ namespace android {
+ // kernel's self-cleaning path. This class switches the property to FAST while frames arrive in a
+ // row or while the input method is visible, then puts the previous mode back and asks for one
+ // repaint, so the still screen is drawn in the mode the user chose.
++//
++// Sleep screen: going to sleep and waking up rearrange the whole screen in several steps
++// (keyguard, doze transition, the sleep screen itself), and the panel would show each of them.
++// system_server sets vendor.xrz.hibreak_sleep at the very start of either change. From the next
++// composite on, the composer's panel updates are held back (vendor.xrz.disable_commit) until the
++// frames stop, then the finished screen is shown in one update: going to sleep as one clean
++// full refresh (GC16, no ghosts of the app left under the clock); the minute updates then go
++// out in the Normal mode (one-bit, only the changed pixels move, no flash), whatever mode the
++// user chose for apps. Waking up shows the unlocked screen in one
++// normal update.
+ class EinkMotion {
+ public:
+     // debug.sf.eink_motion, read once.
+@@ -57,6 +67,20 @@ private:
+         uint32_t frames = 3;     // debug.sf.eink_motion.frames
+         nsecs_t gap = 0;         // debug.sf.eink_motion.gap_ms
+         nsecs_t end = 0;         // debug.sf.eink_motion.end_ms
++
++        // Sleep screen (see the class comment). vendor.xrz.hibreak_sleep is set by
++        // system_server; the rest are debug.sf.eink_sleep.* for tuning without a build.
++        bool sleep = true;           // debug.sf.eink_sleep
++        bool asleep = false;         // vendor.xrz.hibreak_sleep
++        uint32_t sleepMode = 0xb2;   // .mode: refresh mode while asleep, 0 = the user's
++        uint32_t sleepClean = 4;     // .clean: one-shot waveform for the sleep image, 0 = none
++        nsecs_t armDelay = 0;       // .arm_ms: when the one-shot is armed during the hold
++        uint32_t wakeMode = 0xb2;    // .wake_mode: one-shot mode for the first picture awake
++        nsecs_t sleepQuiet = 0;      // .quiet_ms: no frame for this long = the UI has settled
++        nsecs_t sleepMin = 0;        // .min_ms / .max_ms: bounds of the freeze going to sleep
++        nsecs_t sleepMax = 0;
++        nsecs_t wakeMin = 0;         // .wake_min_ms / .wake_max_ms: the same when waking up
++        nsecs_t wakeMax = 0;
+     };
+ 
+     void reloadConfigIfChanged();
+@@ -64,6 +88,8 @@ private:
+     void writeMode(uint32_t mode);
+     bool isFast(uint32_t mode) const;
+     void threadLoop();
++    void beginSleepTransition(bool asleep, nsecs_t now);
++    void applySleepMode();
+ 
+     std::mutex mMutex;
+     std::condition_variable mCondition;
+@@ -79,6 +105,15 @@ private:
+     bool mFast = false;    // the property holds our fast mode
+     uint32_t mBase = 0;    // the mode to put back
+     uint32_t mWritten = 0; // what we wrote, to notice when someone else changes the mode
++
++    bool mAsleep = false;         // the last vendor.xrz.hibreak_sleep acted on
++    bool mFrozen = false;         // the composer's panel updates are held back
++    bool mFreezeForSleep = false; // the freeze is for going to sleep (not for waking up)
++    nsecs_t mFreezeStart = 0;
++    bool mSleepModeSet = false;   // the property holds our sleep mode
++    uint32_t mSleepBase = 0;      // the mode to put back when waking up
++    uint32_t mSleepWritten = 0;
++    bool mForceArmed = false;     // the one-shot for the first picture after the hold is set
+ };
+ 
+ } // namespace android
+-- 
+2.43.0
+

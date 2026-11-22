@@ -1,0 +1,94 @@
+From a9b02daa69d595bed4f73631bf62a79073f02ae1 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Mon, 16 Nov 2026 12:08:34 +0000
+Subject: [PATCH] hwui: e-ink text in pure black or white
+
+With debug.hwui.eink_text=1, text drawn with a plain colour snaps to black
+or white by its lightness, and becomes opaque unless it is clearly faded
+(alpha < 0.5: hints, disabled text). No outline and no backdrop, unlike
+high-contrast text, whose backing rectangles look like grey pills on
+e-ink. Text with a shader or colour filter is left alone.
+
+Change-Id: I480ad5ebb8b4f3a49505fa485f84b16508fc1b65
+---
+ libs/hwui/Properties.cpp         |  2 ++
+ libs/hwui/Properties.h           |  3 +++
+ libs/hwui/hwui/DrawTextFunctor.h | 21 +++++++++++++++++++++
+ 3 files changed, 26 insertions(+)
+
+diff --git a/libs/hwui/Properties.cpp b/libs/hwui/Properties.cpp
+index 6d81a0fab..ef4ebd35d 100644
+--- a/libs/hwui/Properties.cpp
++++ b/libs/hwui/Properties.cpp
+@@ -80,6 +80,7 @@ ProfileType Properties::sProfileType = ProfileType::None;
+ bool Properties::sDisableProfileBars = false;
+ RenderPipelineType Properties::sRenderPipelineType = RenderPipelineType::NotInitialized;
+ bool Properties::enableHighContrastText = false;
++bool Properties::einkText = false;
+ 
+ bool Properties::waitForGpuCompletion = false;
+ 
+@@ -145,6 +146,7 @@ bool Properties::load() {
+     }
+ 
+     debugLayersUpdates = base::GetBoolProperty(PROPERTY_DEBUG_LAYERS_UPDATES, false);
++    einkText = base::GetBoolProperty("debug.hwui.eink_text", false);
+     INIT_LOGD("  Layers updates debug enabled: %d", debugLayersUpdates);
+ 
+     showDirtyRegions = base::GetBoolProperty(PROPERTY_DEBUG_SHOW_DIRTY_REGIONS, false);
+diff --git a/libs/hwui/Properties.h b/libs/hwui/Properties.h
+index 9b8465fee..7964bcf9f 100644
+--- a/libs/hwui/Properties.h
++++ b/libs/hwui/Properties.h
+@@ -309,6 +309,9 @@ public:
+     static RenderPipelineType getRenderPipelineType();
+ 
+     static bool enableHighContrastText;
++    // E-ink panels: text is drawn in pure black or white (by its lightness), with no outline or
++    // backdrop. Set once per process from debug.hwui.eink_text.
++    static bool einkText;
+ 
+     // Should be used only by test apps
+     static bool waitForGpuCompletion;
+diff --git a/libs/hwui/hwui/DrawTextFunctor.h b/libs/hwui/hwui/DrawTextFunctor.h
+index 6a82578cc..e05c2766b 100644
+--- a/libs/hwui/hwui/DrawTextFunctor.h
++++ b/libs/hwui/hwui/DrawTextFunctor.h
+@@ -109,6 +109,23 @@ static void adjustHighContrastInnerTextColor(uirenderer::Lab* lab) {
+     }
+ }
+ 
++// E-ink text: plain colours snap to black or white by their lightness (the panel shows greys
++// and colours only as dither patterns, which break up thin glyph strokes). Translucent text
++// keeps its alpha when it is clearly faded (hints, disabled), otherwise it becomes opaque.
++// Text with a shader or colour filter is left alone (gradients, tinted emoji effects).
++static bool snapTextColorForEink(const Paint& paint, Paint* out) {
++    if (paint.getShader() != nullptr || paint.getColorFilter() != nullptr) return false;
++    SkColor4f c = paint.getColor4f();
++    if (c.fA == 0.f) return false;
++    uirenderer::Lab lab = uirenderer::sRGBToLab(c);
++    SkColor4f snapped = lab.L <= 55 ? SkColors::kBlack : SkColors::kWhite;
++    snapped.fA = c.fA >= 0.5f ? 1.f : c.fA;
++    if (snapped == c) return false;
++    *out = paint;
++    out->setColor(snapped);
++    return true;
++}
++
+ class DrawTextFunctor {
+ public:
+     /**
+@@ -164,6 +181,10 @@ public:
+             innerPaint.setStyle(SkPaint::kFill_Style);
+             canvas->drawGlyphs(glyphFunc, glyphCount, innerPaint, x, y, totalAdvance);
+             gDrawTextBlobMode = DrawTextBlobMode::Normal;
++        } else if (CC_UNLIKELY(uirenderer::Properties::einkText)) {
++            Paint einkPaint;
++            const Paint& p = snapTextColorForEink(paint, &einkPaint) ? einkPaint : paint;
++            canvas->drawGlyphs(glyphFunc, glyphCount, p, x, y, totalAdvance);
+         } else {
+             // standard draw path
+             canvas->drawGlyphs(glyphFunc, glyphCount, paint, x, y, totalAdvance);
+-- 
+2.43.0
+

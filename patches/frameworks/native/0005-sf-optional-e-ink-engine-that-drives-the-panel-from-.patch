@@ -1,0 +1,1477 @@
+From 100d76016462d60d1c6da1e1bda84ea72dcbfe95 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Fri, 13 Nov 2026 17:12:56 +0000
+Subject: [PATCH] sf: optional e-ink engine that drives the panel from the
+ client target
+
+With debug.sf.eink_engine=1, the client target queued to the display is
+also converted to 8-bit grey in a persistent ION buffer (inside its
+surface damage) and handed to the XRZ e-ink kernel driver with
+DRM_IOCTL_EINK_UPDATE. Only the 32x32 tiles whose grey value really
+changed are updated: apps often report their whole window as damaged,
+and the IME window is full height.
+
+The engine converts frames on its own thread. Converting a full client
+target takes ~50 ms; done in advanceFrame on SurfaceFlinger's main
+thread it held composition to about ten frames a second (atrace:
+finishFrame 50-79 ms of each composite). FramebufferSurface now only
+waits before releasing the one buffer that is being read.
+The conversion loop works on tile-wide chunks without a table lookup
+(vectorised) and compares each chunk with the shadow at once; up to
+four threads share the rows (debug.sf.eink.convert_threads).
+
+Policy 3 (the default) is policy 2 with the update shapes and ghost
+handling of e-readers (Kindle, Kobo, KOReader and Onyx refresh a
+widget's or a page's rectangle, never a grid of cells):
+- The tile diff only says what changed. Changed tiles closer than
+  96 px form one region (a button, a row, the status bar), at most two
+  per change, and each region is one update in one mode: grey when a
+  quarter of its changed tiles have greys, otherwise the fast mode.
+  Policy 2 sent one button as A2 and GL16 tiles that arrived at
+  different times, and the "Clear" app mode flashed every tile with
+  GC16 on its own.
+- A ghost budget counts what was drawn without a flash: fast modes per
+  panel, GL16 at half, a gesture once at twice its area. Once 4 panels
+  have built up (8 with the kernel's auto-clean on), the next new
+  screen is one GC16 of the whole panel, or the next settle a GC16
+  over its gesture: the "full refresh every N pages" of e-readers.
+  GL16 screen changes left visible ghosts of the previous screens with
+  and without auto-clean (camera).
+- Every large GC16 is followed by the invisible flush, so the "Clear"
+  app mode scrolls in A2 instead of DU.
+
+Policy 2 sorts changes into three classes, built on what
+the kernel driver does (measured, see the device tree's
+docs/eink-interface.md):
+- Tap: black and white tiles go out in A2 (~145 ms), tiles with greys
+  in GL16, as at most four rectangles. A change over half the panel (a
+  new screen) is collected for up to 120 ms of quiet (360 ms at most),
+  since apps draw a new screen in two or three frames, and goes out as
+  one GL16 update; a third change in that time makes it motion. No cleanup pass follows: the kernel
+  cleans A2 ghosting itself (eink_debug/clean_a2).
+- Motion: changes arriving less than 100 ms apart. One update per panel
+  slot (90 ms) over one rectangle that only grows during the gesture,
+  so the kernel replaces a queued update with the newer one instead of
+  replaying a backlog; frames in between are not converted at all.
+  Motion ends 250 ms after the last frame, or after the last frame
+  that changed pixels.
+- Settle: one GL16 over the gesture rectangle 150 ms after the motion.
+GC16 is never used automatically, because A2 falls back to a slow
+dithered waveform while a GC16 of the area is among the kernel's last
+ten updates; after a forced GC16 the engine sends ten invisible updates
+to push it out. Policy 1 keeps the previous behaviour (DU motion,
+per-tile GL16/GC16 cleanup 800 ms after a change).
+
+Every tunable is a debug.sf.eink.* property, re-read whenever a
+property changes, so tuning needs no restart. Per-app and forced
+refresh modes come from the vendor.xrz.* properties the vendor composer
+used.
+
+The vendor composer on the Bigme HiBreak Pro refreshes the whole panel
+for every frame, so small changes such as a key press wait for a
+full-panel waveform. The vendor composer commits the first frames after
+boot, because the kernel driver sets up its pipeline on those (an
+earlier engine update spins in the kernel); then the engine sets
+vendor.xrz.disable_commit and takes over.
+
+The client target buffers get GRALLOC_USAGE_SW_READ_OFTEN while the
+engine is on, which also keeps them linear.
+
+Change-Id: I581122fb79e97467ff21ae4e2ec7d2e21e3bac5d
+---
+ services/surfaceflinger/Android.bp            |   1 +
+ .../DisplayHardware/EinkEngine.cpp            | 961 ++++++++++++++++++
+ .../DisplayHardware/EinkEngine.h              | 237 ++++++++++++++++++
+ .../DisplayHardware/FramebufferSurface.cpp    |  10 +-
+ 4 files changed, 1059 insertions(+), 1 deletion(-)
+ create mode 100644 services/surfaceflinger/DisplayHardware/EinkEngine.cpp
+ create mode 100644 services/surfaceflinger/DisplayHardware/EinkEngine.h
+
+diff --git a/services/surfaceflinger/Android.bp b/services/surfaceflinger/Android.bp
+index d39f7ad..27c7042 100644
+--- a/services/surfaceflinger/Android.bp
++++ b/services/surfaceflinger/Android.bp
+@@ -186,6 +186,7 @@ filegroup {
+     srcs: [
+         "DisplayHardware/AidlComposerHal.cpp",
+         "DisplayHardware/ComposerHal.cpp",
++        "DisplayHardware/EinkEngine.cpp",
+         "DisplayHardware/FramebufferSurface.cpp",
+         "DisplayHardware/HWC2.cpp",
+         "DisplayHardware/HWComposer.cpp",
+diff --git a/services/surfaceflinger/DisplayHardware/EinkEngine.cpp b/services/surfaceflinger/DisplayHardware/EinkEngine.cpp
+new file mode 100644
+index 0000000..e7c72ca
+--- /dev/null
++++ b/services/surfaceflinger/DisplayHardware/EinkEngine.cpp
+@@ -0,0 +1,1053 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#undef LOG_TAG
++#define LOG_TAG "EinkEngine"
++
++#include "EinkEngine.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cinttypes>
++#include <cstdlib>
++#include <cstring>
++#include <thread>
++#include <vector>
++
++#include <android-base/properties.h>
++#include <fcntl.h>
++#include <hardware/gralloc.h>
++#include <log/log.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/system_properties.h>
++#include <unistd.h>
++
++namespace android {
++namespace {
++
++// DRM_IOCTL_EINK_UPDATE of the XRZ e-ink driver; layout from the vendor composer
++// (hwcomposer.mt6877.so, mtk_commit), see docs/eink-interface.md.
++struct drm_eink_update {
++    uint32_t mode;
++    uint32_t left, top, right, bottom; // inclusive
++    uint32_t dither;
++    uint64_t zero0[2];
++    int32_t fd;      // dma-buf, 8-bit grey in panel orientation
++    uint32_t format; // 0 = 8-bit grey
++    uint64_t zero1;
++    uint32_t width, height;
++    uint32_t zero2;
++} __attribute__((packed));
++static_assert(sizeof(drm_eink_update) == 0x44, "drm_eink_update size");
++constexpr unsigned long kEinkUpdate = 0xc04464cfu;
++
++// Legacy ION API of the MediaTek 4.19 kernel.
++struct ion_heap_data {
++    char name[32];
++    uint32_t type, heap_id, reserved0, reserved1, reserved2;
++};
++struct ion_heap_query {
++    uint32_t cnt, reserved0;
++    uint64_t heaps;
++    uint32_t reserved1, reserved2;
++};
++struct ion_allocation_data_legacy {
++    uint64_t len, align;
++    uint32_t heap_id_mask, flags;
++    int32_t handle;
++    uint32_t pad;
++};
++struct ion_fd_data {
++    int32_t handle, fd;
++};
++constexpr unsigned long kIonHeapQuery = 0xc0184908u;
++constexpr unsigned long kIonAllocLegacy = 0xc0204900u;
++constexpr unsigned long kIonShare = 0xc0084904u;
++constexpr uint32_t kIonHeapTypeSystem = 0;
++
++constexpr uint32_t kModeGL16 = 32;
++constexpr uint32_t kModeGC16 = 4;
++constexpr uint32_t kModeA2 = 16;
++constexpr uint32_t kModeDU = 2;
++constexpr size_t kMaxRectsV1 = 6;
++constexpr size_t kTile = 32;
++constexpr uint32_t kHandoverFrames = 5; // frames the vendor composer commits after boot
++// Policy 1 motion detection (fixed, as flashed on 2026-11-13).
++constexpr nsecs_t kMotionGapV1 = 100 * 1000 * 1000;
++constexpr int64_t kMotionAreaDiv = 12;
++constexpr uint32_t kMotionFramesV1 = 3;
++// After a GC16, this many invisible updates push it out of the kernel's last-ten list.
++constexpr uint32_t kFlushUpdates = 10;
++constexpr nsecs_t kFlushSpacing = 60 * 1000 * 1000;
++
++Rect unite(const Rect& a, const Rect& b) {
++    return Rect(std::min(a.left, b.left), std::min(a.top, b.top), std::max(a.right, b.right),
++                std::max(a.bottom, b.bottom));
++}
++
++int64_t area(const Rect& r) {
++    return int64_t{r.getWidth()} * r.getHeight();
++}
++
++// Merges the pair whose bounding box adds the least area until at most maxRects remain.
++void reduceRects(std::vector<Rect>* rects, size_t maxRects) {
++    while (rects->size() > std::max<size_t>(1, maxRects)) {
++        size_t bi = 0, bj = 1;
++        int64_t best = INT64_MAX;
++        for (size_t i = 0; i < rects->size(); i++) {
++            for (size_t j = i + 1; j < rects->size(); j++) {
++                const int64_t added = area(unite((*rects)[i], (*rects)[j])) - area((*rects)[i]) -
++                        area((*rects)[j]);
++                if (added < best) {
++                    best = added;
++                    bi = i;
++                    bj = j;
++                }
++            }
++        }
++        (*rects)[bi] = unite((*rects)[bi], (*rects)[bj]);
++        rects->erase(rects->begin() + static_cast<std::ptrdiff_t>(bj));
++    }
++}
++
++// Ghosting a waveform leaves behind, per full panel drawn, in thousandths: the fast modes leave
++// ghosts that only GC16 removes (docs/eink-interface.md, rule 8). GL16 screen changes leave
++// visible ghosts of the previous screen too (camera, 2026-11-14), with or without auto-clean.
++uint32_t ghostWeight(uint32_t mode) {
++    switch (mode & 0xff) {
++        case 2: case 3: case 0x10: case 0x11: case 0x89: case 0xb2: case 0xb3: case 0xb7:
++            return 1000;
++        case 0x20: case 0x21: case 0x40: case 0x84: case 0xb1: case 0xb4:
++            return 500;
++        default:
++            return 0;
++    }
++}
++
++bool isGc16(uint32_t mode) {
++    const uint32_t m = mode & 0xff;
++    return m == kModeGC16 || m == 7 || m == 0xb0;
++}
++
++uint32_t readUint(const prop_info* pi, uint32_t fallback) {
++    if (!pi) return fallback;
++    uint32_t value = fallback;
++    __system_property_read_callback(
++            pi,
++            [](void* cookie, const char*, const char* v, uint32_t) {
++                char* end = nullptr;
++                unsigned long parsed = strtoul(v, &end, 0);
++                if (end != v) *static_cast<uint32_t*>(cookie) = static_cast<uint32_t>(parsed);
++            },
++            &value);
++    return value;
++}
++
++uint32_t prop(const char* name, uint32_t fallback) {
++    return base::GetUintProperty<uint32_t>(name, fallback);
++}
++
++nsecs_t propMs(const char* name, uint32_t fallbackMs) {
++    return ms2ns(base::GetUintProperty<uint32_t>(name, fallbackMs));
++}
++
++} // namespace
++
++bool EinkEngine::enabled() {
++    static const bool sEnabled = base::GetBoolProperty("debug.sf.eink_engine", false);
++    return sEnabled;
++}
++
++bool EinkEngine::clientTargetWithoutFb() {
++    // Experiment: HW_FB in the client target's usage may give it an uncached mapping, which
++    // makes reading it ~50 ms per frame. Read once, when FramebufferSurface is created.
++    return enabled() && base::GetBoolProperty("debug.sf.eink.no_hw_fb", false);
++}
++
++EinkEngine& EinkEngine::get() {
++    static EinkEngine sEngine;
++    return sEngine;
++}
++
++EinkEngine::EinkEngine() {
++    loadConfig();
++}
++
++void EinkEngine::loadConfig() {
++    Config c;
++    c.policy = prop("debug.sf.eink.policy", 3);
++    c.mergeDist = static_cast<int32_t>(std::min(prop("debug.sf.eink.merge_px", 96), 2000u));
++    c.maxRegions = std::clamp(prop("debug.sf.eink.max_regions", 2), 1u, 4u);
++    c.greyShare = std::min(prop("debug.sf.eink.grey_share", 25), 100u);
++    // Without the kernel's own A2 cleanup, ghosting builds up until a GC16 removes it; like an
++    // e-reader's "full refresh every N pages", one GC16 follows once enough has built up.
++    // About every 4th new screen (8th with auto-clean), like KOReader's default of every 6th page.
++    c.fullAfter = prop("debug.sf.eink.full_after",
++                       base::GetBoolProperty("vendor.xrz.auto_clean_enabled", true) ? 8 : 4);
++    c.defaultMode = prop("debug.sf.eink.mode", 0xb2);
++    c.cleanDelay = propMs("debug.sf.eink.clean_ms", c.policy < 2 ? 800 : 0);
++    c.tapBw = prop("debug.sf.eink.tap_bw", kModeA2);
++    c.tapGrey = prop("debug.sf.eink.tap_grey", kModeGL16);
++    c.screenMode = prop("debug.sf.eink.screen_mode", kModeGL16);
++    c.screenWait = propMs("debug.sf.eink.screen_wait_ms", 120);
++    c.greyPixels = std::max(1u, prop("debug.sf.eink.grey_px", 48));
++    c.maxRects = std::clamp(prop("debug.sf.eink.max_rects", 4), 1u, 8u);
++    // DU, as the stock firmware scrolls: the kernel's auto-clean removes DU's ghosts, but A2
++    // leaves ghosts that no grey settle removes (camera, Settings flings, 2026-11-14). Only
++    // "Fast" (A2 everywhere) and "Clear" (a GC16 settle) use A2 for motion.
++    c.motionMode = prop("debug.sf.eink.motion_mode", kModeDU);
++    c.motionInterval = propMs("debug.sf.eink.motion_ms", 90);
++    c.motionGap = propMs("debug.sf.eink.motion_gap_ms", 100);
++    c.motionEnd = propMs("debug.sf.eink.motion_end_ms", 250);
++    c.motionFrames = std::max(2u, prop("debug.sf.eink.motion_frames", 3));
++    c.settleMode = prop("debug.sf.eink.settle_mode", kModeGL16);
++    c.settleDelay = propMs("debug.sf.eink.settle_ms", 150);
++    c.deepFrames = prop("debug.sf.eink.deep_frames", 0);
++    c.log = base::GetBoolProperty("debug.sf.eink.log", false);
++    c.convertThreads = std::clamp(prop("debug.sf.eink.convert_threads", 4), 1u, 8u);
++    c.black = base::GetIntProperty("debug.sf.eink.black", 48, 0, 254);
++    c.white = std::max(c.black + 1, base::GetIntProperty("debug.sf.eink.white", 208, 1, 255));
++    for (int v = 0; v < 256; v++) {
++        int out = v <= c.black ? 0 : v >= c.white ? 255 : (v - c.black) * 255 / (c.white - c.black);
++        mLut[v] = static_cast<uint8_t>(out);
++    }
++    if (c.policy != mConfig.policy) ALOGI("policy %u", c.policy);
++    mConfig = c;
++}
++
++void EinkEngine::reloadConfigIfChanged() {
++    // The global serial changes with every property write anywhere; reloading is cheap.
++    const uint32_t serial = __system_property_area_serial();
++    if (serial == mPropSerial) return;
++    mPropSerial = serial;
++    loadConfig();
++}
++
++bool EinkEngine::allocate(uint32_t size) {
++    int ion = open("/dev/ion", O_RDONLY | O_CLOEXEC);
++    if (ion < 0) {
++        ALOGE("open /dev/ion: %s", strerror(errno));
++        return false;
++    }
++    ion_heap_data heaps[32];
++    ion_heap_query query = {.cnt = 32, .heaps = reinterpret_cast<uintptr_t>(heaps)};
++    int heap = -1;
++    if (ioctl(ion, kIonHeapQuery, &query) == 0) {
++        for (uint32_t i = 0; i < query.cnt && heap < 0; i++) {
++            if (heaps[i].type == kIonHeapTypeSystem) heap = static_cast<int>(heaps[i].heap_id);
++        }
++    }
++    if (heap < 0) {
++        ALOGE("no ION system heap");
++        close(ion);
++        return false;
++    }
++    ion_allocation_data_legacy alloc = {.len = size, .align = 4096,
++                                        .heap_id_mask = 1u << heap};
++    ion_fd_data share = {};
++    if (ioctl(ion, kIonAllocLegacy, &alloc) != 0) {
++        ALOGE("ION alloc: %s", strerror(errno));
++        close(ion);
++        return false;
++    }
++    share.handle = alloc.handle;
++    const int rc = ioctl(ion, kIonShare, &share);
++    close(ion);
++    if (rc != 0) {
++        ALOGE("ION share: %s", strerror(errno));
++        return false;
++    }
++    // The kernel caches mapped buffers by fd number across processes, so a number used by an
++    // earlier SurfaceFlinger would show that (dead) buffer. Pick a free fd starting from our pid
++    // without clobbering any existing descriptor.
++    const int wanted = 512 + static_cast<int>(getpid() % 400);
++    const int moved = fcntl(share.fd, F_DUPFD_CLOEXEC, wanted);
++    if (moved < 0) {
++        ALOGE("F_DUPFD_CLOEXEC from %d: %s", wanted, strerror(errno));
++        close(share.fd);
++        return false;
++    }
++    close(share.fd);
++    mBufferFd = moved;
++    void* map = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, mBufferFd, 0);
++    if (map == MAP_FAILED) {
++        ALOGE("mmap: %s", strerror(errno));
++        close(mBufferFd);
++        mBufferFd = -1;
++        return false;
++    }
++    mGrey = static_cast<uint8_t*>(map);
++    memset(mGrey, 0xff, size);
++    mShadow.assign(size, 0xff);
++    return true;
++}
++
++bool EinkEngine::init(uint32_t width, uint32_t height) {
++    if (mInitDone) return !mInitFailed && width == mWidth && height == mHeight;
++    mInitDone = true;
++    mInitFailed = true;
++    mWidth = width;
++    mHeight = height;
++    mCard = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
++    if (mCard < 0) {
++        ALOGE("open /dev/dri/card0: %s", strerror(errno));
++        return false;
++    }
++    if (!allocate(width * height)) {
++        close(mCard);
++        mCard = -1;
++        return false;
++    }
++    mTilesX = (width + kTile - 1) / kTile;
++    mTilesY = (height + kTile - 1) / kTile;
++    mTileChanged.assign(mTilesX * mTilesY, 0);
++    mGreyCount.assign(mTilesX * mTilesY, 0);
++    mModeProp = __system_property_find("vendor.xrz.global_refresh_mode");
++    mForceProp = __system_property_find("vendor.xrz.force_global_refresh_mode");
++    if (mForceProp) mForceSerial = __system_property_serial(mForceProp);
++    // The engine is a process-lifetime singleton, so the thread is never joined.
++    std::thread(&EinkEngine::workLoop, this).detach();
++    mInitFailed = false;
++    ALOGI("e-ink engine on: %ux%u, buffer fd %d, policy %u", width, height, mBufferFd,
++          mConfig.policy);
++    return true;
++}
++
++Region EinkEngine::convert(const sp<GraphicBuffer>& buffer, const Region& region,
++                           std::vector<uint8_t>* greyTiles) {
++    Region changed;
++    const PixelFormat format = buffer->getPixelFormat();
++    const bool bgra = format == PIXEL_FORMAT_BGRA_8888;
++    if (!bgra && format != PIXEL_FORMAT_RGBA_8888 && format != PIXEL_FORMAT_RGBX_8888) {
++        ALOGE("unsupported client target format %d", format);
++        return changed;
++    }
++    void* vaddr = nullptr;
++    const Rect bounds = region.getBounds();
++    if (buffer->lock(GRALLOC_USAGE_SW_READ_OFTEN, bounds, &vaddr) != NO_ERROR || !vaddr) {
++        ALOGE("lock client target failed");
++        return changed;
++    }
++    const uint8_t* src = static_cast<const uint8_t*>(vaddr);
++    const size_t stride = buffer->getStride() * 4;
++    const int ri = bgra ? 2 : 0, bi = bgra ? 0 : 2;
++    std::vector<uint8_t> dirty(mTilesX * mTilesY, 0);
++    if (greyTiles) std::fill(mGreyCount.begin(), mGreyCount.end(), 0);
++    const nsecs_t start = systemTime();
++    const std::vector<Rect> rects(region.begin(), region.end());
++    const bool countGrey = greyTiles != nullptr;
++    const int32_t black = mConfig.black;
++    // Fixed-point form of the black/white clamp (mLut), so the loop has no table lookup.
++    const int32_t scale = (255 << 16) / std::max(16, mConfig.white - mConfig.black);
++    // Reading the uncached mapping is bound by memory latency, not by one core's speed, so
++    // several threads read faster together. Each thread takes whole tile rows (row / kTile %
++    // threads), so no two threads write the same tile counters, shadow rows or buffer rows.
++    const auto work = [&](size_t part, size_t parts) {
++        std::vector<uint8_t> line;
++        for (const Rect& r : rects) {
++            const size_t left = static_cast<size_t>(r.left);
++            const size_t bytes = static_cast<size_t>(r.getWidth()) * 4;
++            if (line.size() < bytes) line.resize(bytes);
++            for (int32_t y = r.top; y < r.bottom; y++) {
++                const size_t row = static_cast<size_t>(y);
++                if ((row / kTile) % parts != part) continue;
++                // The client target mapping is uncached: byte reads from it cost ~100 ns each.
++                // One memcpy per row (wide loads) into a cached line buffer is ~50x faster.
++                memcpy(line.data(), src + row * stride + left * 4, bytes);
++                const uint8_t* s = line.data();
++                const size_t offset = row * mWidth + left;
++                // Compared against the cached shadow: the ION buffer is mapped uncached too.
++                uint8_t* tileRow = dirty.data() + (row / kTile) * mTilesX;
++                uint16_t* greyRow = mGreyCount.data() + (row / kTile) * mTilesX;
++                bool rowChanged = false;
++                // One tile-wide chunk at a time: the grey values are computed branch-free (the
++                // compiler vectorises this), then compared with the shadow as a whole.
++                for (size_t x0 = left; x0 < static_cast<size_t>(r.right);) {
++                    const size_t x1 = std::min((x0 / kTile + 1) * kTile,
++                                               static_cast<size_t>(r.right));
++                    const size_t n = x1 - x0;
++                    uint8_t out[kTile];
++                    uint32_t greys = 0;
++                    for (size_t i = 0; i < n; i++, s += 4) {
++                        // BT.601 luma, then the black/white clamp for crisp text.
++                        const int32_t luma = (s[ri] * 77 + s[1] * 150 + s[bi] * 29) >> 8;
++                        const int32_t v = std::clamp(((luma - black) * scale) >> 16, 0, 255);
++                        out[i] = static_cast<uint8_t>(v);
++                        greys += static_cast<uint32_t>(v != 0 && v != 255);
++                    }
++                    uint8_t* d = mShadow.data() + row * mWidth + x0;
++                    if (memcmp(out, d, n) != 0) {
++                        memcpy(d, out, n);
++                        tileRow[x0 / kTile] = 1;
++                        rowChanged = true;
++                    }
++                    if (countGrey) {
++                        greyRow[x0 / kTile] = static_cast<uint16_t>(greyRow[x0 / kTile] + greys);
++                    }
++                    x0 = x1;
++                }
++                if (rowChanged) {
++                    memcpy(mGrey + offset, mShadow.data() + offset,
++                           static_cast<size_t>(r.getWidth()));
++                }
++            }
++        }
++    };
++    const int64_t pixels = area(bounds);
++    const size_t parts = pixels >= 128 * 1024 ? mConfig.convertThreads : 1;
++    std::vector<std::thread> helpers;
++    for (size_t i = 1; i < parts; i++) helpers.emplace_back(work, i, parts);
++    work(0, parts);
++    for (std::thread& t : helpers) t.join();
++    buffer->unlock();
++    const nsecs_t took = systemTime() - start;
++    mConvertTotal += took;
++    mConvertMax = std::max(mConvertMax, took);
++    if (++mConvertCount == 300) {
++        ALOGI("convert: %" PRId64 " us average, %" PRId64 " us max over 300 frames",
++              ns2us(mConvertTotal / 300), ns2us(mConvertMax));
++        mConvertCount = 0;
++        mConvertTotal = 0;
++        mConvertMax = 0;
++    }
++    if (greyTiles) {
++        greyTiles->assign(mTilesX * mTilesY, 0);
++        for (size_t i = 0; i < greyTiles->size(); i++) {
++            (*greyTiles)[i] = dirty[i] && mGreyCount[i] >= mConfig.greyPixels;
++        }
++    }
++    changed = tileRegion(dirty);
++    mDirty.swap(dirty);
++    return changed;
++}
++
++Region EinkEngine::tileRegion(const std::vector<uint8_t>& tiles) const {
++    // Horizontal runs of set tiles per tile row; Region merges equal runs vertically.
++    Region region;
++    for (size_t ty = 0; ty < mTilesY; ty++) {
++        size_t tx = 0;
++        while (tx < mTilesX) {
++            if (!tiles[ty * mTilesX + tx]) {
++                tx++;
++                continue;
++            }
++            const size_t start = tx;
++            while (tx < mTilesX && tiles[ty * mTilesX + tx]) tx++;
++            region.orSelf(Rect(static_cast<int32_t>(start * kTile),
++                               static_cast<int32_t>(ty * kTile),
++                               static_cast<int32_t>(std::min(tx * kTile, size_t{mWidth})),
++                               static_cast<int32_t>(std::min((ty + 1) * kTile,
++                                                             size_t{mHeight}))));
++        }
++    }
++    return region;
++}
++
++void EinkEngine::markChanged(const Region& region, nsecs_t when) {
++    for (const Rect& r : region) {
++        if (r.isEmpty()) continue;
++        const size_t x0 = static_cast<size_t>(r.left) / kTile;
++        const size_t x1 = static_cast<size_t>(r.right - 1) / kTile;
++        const size_t y0 = static_cast<size_t>(r.top) / kTile;
++        const size_t y1 = static_cast<size_t>(r.bottom - 1) / kTile;
++        for (size_t ty = y0; ty <= y1 && ty < mTilesY; ty++) {
++            for (size_t tx = x0; tx <= x1 && tx < mTilesX; tx++) {
++                nsecs_t& t = mTileChanged[ty * mTilesX + tx];
++                if (t == 0) mPendingClean++;
++                t = when;
++            }
++        }
++    }
++}
++
++void EinkEngine::submit(const Rect& r, uint32_t mode, const char* why, bool countGhost) {
++    drm_eink_update update = {};
++    update.mode = mode;
++    update.left = static_cast<uint32_t>(r.left);
++    update.top = static_cast<uint32_t>(r.top);
++    update.right = static_cast<uint32_t>(r.right - 1);
++    update.bottom = static_cast<uint32_t>(r.bottom - 1);
++    update.fd = mBufferFd;
++    update.format = 0;
++    update.width = mWidth;
++    update.height = mHeight;
++    if (ioctl(mCard, kEinkUpdate, &update) != 0) {
++        ALOGE("EINK_UPDATE mode 0x%x [%d,%d,%d,%d]: %s", mode, r.left, r.top, r.right, r.bottom,
++              strerror(errno));
++        return;
++    }
++    if (mConfig.log) {
++        ALOGI("%s: mode 0x%x [%d,%d,%d,%d] ghost %u", why, mode, r.left, r.top, r.right,
++              r.bottom, mGhost);
++    }
++    if (mConfig.policy < 3) return;
++    // Ghost bookkeeping (policy 3): a GC16 removes the ghosting under it and must be pushed out
++    // of the kernel's last-ten list before A2 works there again (rule 5).
++    const int64_t panel = int64_t{mWidth} * mHeight;
++    if (isGc16(mode)) {
++        mGhost = static_cast<uint32_t>(mGhost - mGhost * area(r) / panel);
++        if (area(r) * 50 > panel) scheduleFlush(systemTime());
++    } else if (countGhost) {
++        mGhost += static_cast<uint32_t>(ghostWeight(mode) * area(r) / panel);
++    }
++}
++
++void EinkEngine::submitRegion(const Region& region, uint32_t mode, size_t maxRects,
++                              const char* why) {
++    if (region.isEmpty()) return;
++    std::vector<Rect> rects(region.begin(), region.end());
++    if (rects.size() > 64) { // scattered changes: the pairwise merge below would be too slow
++        submit(region.getBounds(), mode, why);
++        return;
++    }
++    // Too many updates cost more than they save.
++    reduceRects(&rects, maxRects);
++    for (const Rect& r : rects) submit(r, mode, why);
++}
++
++std::vector<Rect> EinkEngine::regions(const Region& changed) const {
++    // One rectangle per UI element, the way e-readers refresh a widget: changed tiles closer
++    // than merge_px belong together, overlapping boxes merge, and at most max_regions remain.
++    // Never a set of tiles that each refresh on their own.
++    std::vector<Rect> rects(changed.begin(), changed.end());
++    if (rects.size() > 256) return {changed.getBounds()};
++    const int32_t d = mConfig.mergeDist;
++    for (bool merged = true; merged;) {
++        merged = false;
++        for (size_t i = 0; i < rects.size(); i++) {
++            for (size_t j = i + 1; j < rects.size(); j++) {
++                const Rect& a = rects[i];
++                const Rect& b = rects[j];
++                if (a.left < b.right + d && b.left < a.right + d && a.top < b.bottom + d &&
++                    b.top < a.bottom + d) {
++                    rects[i] = unite(a, b);
++                    rects.erase(rects.begin() + static_cast<std::ptrdiff_t>(j));
++                    merged = true;
++                    j = i; // compare the grown rectangle with all others again
++                }
++            }
++        }
++    }
++    reduceRects(&rects, mConfig.maxRegions);
++    return rects;
++}
++
++bool EinkEngine::isGreyRect(const Rect& r, const std::vector<uint8_t>& grey) const {
++    // Grey when at least grey_share percent of the changed tiles in it have greys: one mode for
++    // the whole element, so its parts don't arrive at different times and in different looks.
++    size_t dirty = 0, greyTiles = 0;
++    for (size_t ty = static_cast<size_t>(r.top) / kTile;
++         ty * kTile < static_cast<size_t>(r.bottom) && ty < mTilesY; ty++) {
++        for (size_t tx = static_cast<size_t>(r.left) / kTile;
++             tx * kTile < static_cast<size_t>(r.right) && tx < mTilesX; tx++) {
++            const size_t i = ty * mTilesX + tx;
++            if (i < mDirty.size() && mDirty[i]) dirty++;
++            if (i < grey.size() && grey[i]) greyTiles++;
++        }
++    }
++    return dirty > 0 && greyTiles * 100 >= dirty * std::max(1u, mConfig.greyShare);
++}
++
++void EinkEngine::submitScreen(const Rect& rect, nsecs_t now, const char* why) {
++    const Modes m = modes();
++    const Rect panel(static_cast<int32_t>(mWidth), static_cast<int32_t>(mHeight));
++    if (mConfig.policy >= 3 && mConfig.fullAfter > 0 && mGhost >= mConfig.fullAfter * 1000 &&
++        !isGc16(m.screen)) {
++        // Like an e-reader's page-turn flash: the screen changes anyway, so the one flashing
++        // update that clears the ghosting goes here, over the whole panel.
++        submit(panel, kModeGC16, "screen full (ghost limit)");
++        return;
++    }
++    (void)now;
++    submit(rect, m.screen, why);
++}
++
++bool EinkEngine::takeForcedMode(uint32_t* mode) {
++    if (!mForceProp) mForceProp = __system_property_find("vendor.xrz.force_global_refresh_mode");
++    if (!mForceProp) return false;
++    const uint32_t serial = __system_property_serial(mForceProp);
++    if (serial == mForceSerial) return false;
++    mForceSerial = serial;
++    *mode = readUint(mForceProp, 0);
++    return *mode != 0 && *mode != 0xffffffffu;
++}
++
++uint32_t EinkEngine::frameMode() {
++    if (!mModeProp) mModeProp = __system_property_find("vendor.xrz.global_refresh_mode");
++    const uint32_t appMode = readUint(mModeProp, 0);
++    if (appMode == 0 || appMode == 0xffffffffu) return mConfig.defaultMode;
++    // Policy 1 maps "fast" (A2) to DU, as flashed on 2026-11-13.
++    return appMode == kModeA2 ? kModeDU : appMode;
++}
++
++EinkEngine::Modes EinkEngine::modes() {
++    if (!mModeProp) mModeProp = __system_property_find("vendor.xrz.global_refresh_mode");
++    const uint32_t appMode = readUint(mModeProp, 0);
++    Modes m{mConfig.tapBw, mConfig.tapGrey, mConfig.screenMode, mConfig.motionMode,
++            mConfig.settleMode};
++    switch (appMode) {
++        case 0:
++        case 0xffffffffu:
++            break;
++        case kModeA2: // "Fast": A2 except for new screens and the settle
++            m.bw = m.grey = m.motion = kModeA2;
++            break;
++        case kModeGC16:
++            // "Clear": GC16 for every change. Policy 3 flushes each GC16 out of the kernel's
++            // last-ten list afterwards, so motion can use A2 (otherwise it falls back to GU16).
++            m = {kModeGC16, kModeGC16, kModeGC16, mConfig.policy >= 3 ? kModeA2 : kModeDU,
++                 kModeGC16};
++            break;
++        default: // e.g. GL16: greys and new screens in that mode, black and white in DU
++            m.bw = kModeDU;
++            m.grey = m.screen = appMode;
++            break;
++    }
++    return m;
++}
++
++void EinkEngine::scheduleFlush(nsecs_t now) {
++    mFlushLeft = kFlushUpdates;
++    mFlushNext = now + 500 * 1000 * 1000; // after the GC16 itself (~400 ms)
++    mCondition.notify_one();
++}
++
++void EinkEngine::onFrame(const sp<GraphicBuffer>& buffer, const sp<Fence>& acquireFence,
++                         const Region& damage) {
++    if (!buffer) return;
++    std::lock_guard lock(mMutex);
++    // The vendor composer must commit first: the kernel driver sets up its pipeline on those
++    // commits, and an engine update before that spins in the kernel (seen at boot). Then the
++    // engine takes over and the composer stops its own e-ink commits.
++    if (mFramesSeen < kHandoverFrames) {
++        ++mFramesSeen;
++        return;
++    }
++    const bool firstInit = !mInitDone;
++    if (!init(buffer->getWidth(), buffer->getHeight())) return;
++    if (firstInit) {
++        base::SetProperty("vendor.xrz.disable_commit", "1");
++    }
++    if (mConfig.policy < 2) {
++        // Policy 1 converts here; otherwise only the work thread reloads the configuration,
++        // so the conversion it runs without the lock never sees the LUT change under it.
++        reloadConfigIfChanged();
++        onFrameV1(buffer, acquireFence, damage);
++    } else {
++        onFrameV2(buffer, acquireFence, damage);
++    }
++    mCondition.notify_one();
++}
++
++// ---------------------------------------------------------------------------------------------
++// Policy 2
++
++void EinkEngine::onFrameV2(const sp<GraphicBuffer>& buffer, const sp<Fence>& acquireFence,
++                           const Region& damage) {
++    // SurfaceFlinger's main thread only hands the frame over: reading the client target takes
++    // ~50 ms for a full frame, and doing it here held composition to about ten frames a second.
++    // The work thread converts the newest frame; frames in between are never looked at.
++    const Rect screen(static_cast<int32_t>(mWidth), static_cast<int32_t>(mHeight));
++    const nsecs_t now = systemTime();
++    uint32_t forcedMode = 0;
++    const bool forced = takeForcedMode(&forcedMode);
++    Region region = damage.intersect(screen);
++    if (forced || region.isEmpty() || !mHadFrame) region = Region(screen);
++    mPendingDamage.orSelf(region);
++    mDeferred = buffer;
++    mDeferredFence = acquireFence;
++    mDeferredTime = now;
++    if (forced || !mHadFrame) {
++        // A forced refresh, or the first frame: the whole panel, so the grey buffer and the
++        // panel agree from here on.
++        mForcedPending = true;
++        mForcedMode = forced ? forcedMode : kModeGL16;
++    }
++    if (mMotion) mLastFrame = now;
++}
++
++void EinkEngine::waitUntilReleased(const GraphicBuffer* buffer) {
++    if (!buffer) return;
++    std::unique_lock lock(mMutex);
++    mReadDone.wait(lock, [this, buffer] { return mReading != buffer; });
++}
++
++bool EinkEngine::convertNewest(std::unique_lock<std::mutex>& lock) {
++    // Called with the lock held; converts without it, so SurfaceFlinger never waits for the
++    // conversion unless it is about to give this very buffer back (waitUntilReleased).
++    const sp<GraphicBuffer> buffer = mDeferred;
++    const sp<Fence> fence = mDeferredFence;
++    const Region region = mPendingDamage;
++    const nsecs_t when = mDeferredTime;
++    const bool forced = mForcedPending;
++    const uint32_t forcedMode = mForcedMode;
++    mDeferred.clear();
++    mDeferredFence.clear();
++    mPendingDamage.clear();
++    mForcedPending = false;
++    mReading = buffer.get();
++    lock.unlock();
++    bool ok = true;
++    if (fence && fence->wait(500) != NO_ERROR) {
++        ALOGW("client target fence timeout, skipping frame");
++        ok = false;
++    }
++    std::vector<uint8_t> grey;
++    Region changed;
++    if (ok) changed = convert(buffer, region, forced ? nullptr : &grey);
++    lock.lock();
++    mReading = nullptr;
++    mReadDone.notify_all();
++    if (!ok) {
++        mPendingDamage.orSelf(region); // converted with the next frame
++        if (forced && !mForcedPending) {
++            mForcedPending = true;
++            mForcedMode = forcedMode;
++        }
++        return false;
++    }
++    const nsecs_t now = systemTime();
++    if (forced) {
++        const Rect screen(static_cast<int32_t>(mWidth), static_cast<int32_t>(mHeight));
++        const char* why = mHadFrame ? "forced" : "first";
++        mHadFrame = true;
++        mMotion = false;
++        mSettlePending = false;
++        mGestureValid = false;
++        mScreenPending = false;
++        mStreak = 0;
++        submit(screen, forcedMode, why);
++        if (isGc16(forcedMode)) scheduleFlush(now);
++        if (mConfig.cleanDelay > 0) {
++            std::fill(mTileChanged.begin(), mTileChanged.end(), 0);
++            mPendingClean = 0;
++        }
++        return true;
++    }
++    if (mMotion) {
++        processMotion(changed, now);
++    } else {
++        // Motion and streak timing go by when the frame arrived, not when it was converted.
++        processTap(changed, grey, when);
++    }
++    return true;
++}
++
++void EinkEngine::processTap(const Region& changed, const std::vector<uint8_t>& grey,
++                            nsecs_t now) {
++    if (changed.isEmpty()) return;
++    const Rect bounds = changed.getBounds();
++    const int64_t panel = int64_t{mWidth} * mHeight;
++    if (mScreenPending || (area(bounds) * 2 > panel && mConfig.screenWait > 0)) {
++        // A new screen (over half the panel): collect the frames that draw it, then one update
++        // (workLoop). Changes in the meantime join it.
++        if (!mScreenPending) {
++            mScreenPending = true;
++            mScreenStart = now;
++            mScreen = bounds;
++            mScreenFrames = 1;
++        } else {
++            mScreen = unite(mScreen, bounds);
++            mScreenFrames++;
++        }
++        mLastChange = now;
++        mStreak = 1;
++        if (mConfig.cleanDelay > 0) markChanged(changed, now);
++        if (mScreenFrames >= mConfig.motionFrames && now - mScreenStart >= mConfig.screenWait) {
++            // Still changing frame after frame, for longer than the collection window: a scroll
++            // or a swipe, not a new screen (apps draw a new screen in two or three frames, which
++            // can come 16 ms apart).
++            mScreenPending = false;
++            startMotion(mScreen, now, "motion (from screen)");
++            return;
++        }
++        mScreenDue = std::min(now + mConfig.screenWait, mScreenStart + 3 * mConfig.screenWait);
++        return;
++    }
++    mStreak = now - mLastChange < mConfig.motionGap ? mStreak + 1 : 1;
++    mLastChange = now;
++    const bool big = area(bounds) * kMotionAreaDiv >= panel;
++    const Modes m = modes();
++    if (mStreak >= mConfig.motionFrames || (big && mStreak >= 2)) {
++        // This change starts an animation: from here on, one update per panel slot.
++        startMotion(bounds, now, "motion start");
++        return;
++    }
++    if (mConfig.cleanDelay > 0) markChanged(changed, now);
++    if (mConfig.policy >= 3) {
++        if (area(bounds) * 2 > panel) {
++            submitScreen(bounds, now, "tap screen");
++            return;
++        }
++        // A second change right after the first is probably the start of an animation: the
++        // fast mode, so the next frames don't wait for a slow grey waveform.
++        for (const Rect& r : regions(changed)) {
++            if (mStreak >= 2) {
++                submit(r, m.motion, "tap fast");
++            } else {
++                const bool greyRect = isGreyRect(r, grey);
++                submit(r, greyRect ? m.grey : m.bw, greyRect ? "tap grey" : "tap bw");
++            }
++        }
++        return;
++    }
++    if (mStreak >= 2) {
++        // A second change right after the first: probably the start of an animation, so no
++        // slow grey waveform that the next frames would have to wait for.
++        submitRegion(changed, m.motion, mConfig.maxRects, "tap fast");
++        return;
++    }
++    if (area(bounds) * 2 > panel) {
++        // A new screen: one update, so it doesn't build up in pieces.
++        submit(bounds, m.screen, "tap screen");
++        return;
++    }
++    std::vector<uint8_t> bw(grey.size(), 0);
++    {
++        // Tiles from the conversion are "changed" exactly when tileRegion() includes them.
++        std::vector<uint8_t> dirty(grey.size(), 0);
++        for (const Rect& r : changed) {
++            for (int32_t ty = r.top / int32_t{kTile}; ty * int32_t{kTile} < r.bottom; ty++) {
++                for (int32_t tx = r.left / int32_t{kTile}; tx * int32_t{kTile} < r.right; tx++) {
++                    dirty[static_cast<size_t>(ty) * mTilesX + static_cast<size_t>(tx)] = 1;
++                }
++            }
++        }
++        for (size_t i = 0; i < grey.size(); i++) bw[i] = dirty[i] && !grey[i];
++    }
++    const Region bwRegion = tileRegion(bw);
++    const Region greyRegion = tileRegion(grey);
++    const size_t bwRects = greyRegion.isEmpty() ? mConfig.maxRects
++                                                : std::max<size_t>(1, mConfig.maxRects / 2);
++    const size_t greyRects = bwRegion.isEmpty() ? mConfig.maxRects
++                                                : std::max<size_t>(1, mConfig.maxRects - bwRects);
++    submitRegion(bwRegion, m.bw, bwRects, "tap bw");
++    submitRegion(greyRegion, m.grey, greyRects, "tap grey");
++}
++
++void EinkEngine::startMotion(const Rect& rect, nsecs_t now, const char* why) {
++    const Modes m = modes();
++    mMotion = true;
++    mLastFrame = now;
++    mLastMotionChange = now;
++    mGesture = rect;
++    mGestureValid = true;
++    mGestureFrames = 1;
++    submit(mGesture, m.motion, why, false);
++    mMotionNext = now + mConfig.motionInterval;
++    mLastMotionSubmit = now;
++    mSettlePending = m.settle != 0;
++}
++
++void EinkEngine::processMotion(const Region& changed, nsecs_t now) {
++    if (changed.isEmpty()) return;
++    mLastMotionChange = now;
++    const Rect bounds = changed.getBounds();
++    mGesture = mGestureValid ? unite(mGesture, bounds) : bounds;
++    mGestureValid = true;
++    mGestureFrames++;
++    const Modes m = modes();
++    // The same rectangle every time: an update the kernel has not started yet is replaced by
++    // the newer one instead of being played after it.
++    submit(mGesture, m.motion, "motion", false);
++    mMotionNext = now + mConfig.motionInterval;
++    mLastMotionSubmit = now;
++    mSettlePending = m.settle != 0;
++    if (++mMotionCount == 100) {
++        ALOGI("motion: 100 updates");
++        mMotionCount = 0;
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Policy 1 (as flashed on 2026-11-13)
++
++void EinkEngine::onFrameV1(const sp<GraphicBuffer>& buffer, const sp<Fence>& acquireFence,
++                           const Region& damage) {
++    const Rect screen(static_cast<int32_t>(mWidth), static_cast<int32_t>(mHeight));
++    Region region = damage.intersect(screen);
++    uint32_t mode;
++    const bool forced = takeForcedMode(&mode);
++    if (forced || region.isEmpty() || !mHadFrame) region = Region(screen);
++    if (!forced) mode = frameMode();
++
++    if (acquireFence && acquireFence->wait(500) != NO_ERROR) {
++        ALOGW("client target fence timeout, skipping frame");
++        return;
++    }
++    const Region changed = convert(buffer, region, nullptr);
++    const Region update = (forced || !mHadFrame) ? region : changed;
++    mHadFrame = true;
++    if (update.isEmpty()) return;
++
++    const nsecs_t now = systemTime();
++    const Rect bounds = update.getBounds();
++    const bool big = area(bounds) * kMotionAreaDiv >= int64_t{mWidth} * mHeight;
++    mStreak = now - mLastChange < kMotionGapV1 ? mStreak + 1 : 1;
++    mLastChange = now;
++    if (!forced && (mStreak >= kMotionFramesV1 || (big && mStreak >= 2))) {
++        submit(bounds, kModeDU, "v1 motion");
++        mLastMotion = now;
++    } else {
++        submitRegion(update, mode, kMaxRectsV1, "v1");
++    }
++
++    if (mConfig.cleanDelay <= 0) return;
++    if (!mAutoCleanProp) mAutoCleanProp = __system_property_find("vendor.xrz.auto_clean_enabled");
++    if (readUint(mAutoCleanProp, 1) == 0) return;
++    if (forced && update.getBounds() == screen) {
++        std::fill(mTileChanged.begin(), mTileChanged.end(), 0);
++        mPendingClean = 0;
++    } else {
++        markChanged(update, now);
++    }
++}
++
++nsecs_t EinkEngine::cleanTiles(nsecs_t now) {
++    // Each tile gets a cleanup pass once it alone has been quiet for the clean delay, so a
++    // blinking cursor or a clock doesn't hold back the rest of the screen. When one tile is due,
++    // every tile quiet for at least half the delay joins it. Returns when to look again.
++    if (mPendingClean == 0 || mConfig.cleanDelay <= 0) return 0;
++    nsecs_t oldest = INT64_MAX;
++    for (const nsecs_t t : mTileChanged) {
++        if (t != 0) oldest = std::min(oldest, t);
++    }
++    if (now - oldest < mConfig.cleanDelay) return oldest + mConfig.cleanDelay;
++    // Never clean in the middle of an animation.
++    const nsecs_t lastMotion = mConfig.policy < 2 ? mLastMotion : mLastMotionSubmit;
++    if (mMotion) return now + mConfig.cleanDelay;
++    if (lastMotion != 0 && now - lastMotion < mConfig.cleanDelay) {
++        return lastMotion + mConfig.cleanDelay;
++    }
++    std::vector<uint8_t> due(mTileChanged.size(), 0);
++    size_t dueTiles = 0;
++    for (size_t i = 0; i < mTileChanged.size(); i++) {
++        const nsecs_t t = mTileChanged[i];
++        if (t != 0 && now - t >= mConfig.cleanDelay / 2) {
++            due[i] = 1;
++            mTileChanged[i] = 0;
++            mPendingClean--;
++            dueTiles++;
++        }
++    }
++    const Region region = tileRegion(due);
++    if (mConfig.policy < 2) {
++        // GC16 when the pass covers more than half the panel (removes GL16's faint ghost).
++        const uint32_t mode = dueTiles * 2 > mTileChanged.size() ? kModeGC16 : kModeGL16;
++        if (mLastMotion != 0) {
++            submit(region.getBounds(), mode, "v1 clean");
++            mLastMotion = 0;
++        } else {
++            submitRegion(region, mode, kMaxRectsV1, "v1 clean");
++        }
++    } else {
++        submitRegion(region, kModeGL16, mConfig.maxRects, "clean");
++    }
++    return 0;
++}
++
++// ---------------------------------------------------------------------------------------------
++
++void EinkEngine::workLoop() {
++    std::unique_lock lock(mMutex);
++    for (;;) {
++        reloadConfigIfChanged();
++        nsecs_t now = systemTime();
++        nsecs_t wake = 0; // 0 = nothing scheduled
++        const auto earliest = [&wake](nsecs_t t) {
++            if (t != 0 && (wake == 0 || t < wake)) wake = t;
++        };
++
++        if (mConfig.policy >= 2) {
++            if (mDeferred) {
++                // In motion, the newest frame is converted once the panel slot is free; otherwise
++                // at once. Wait for the GPU without the lock: SurfaceFlinger's main thread takes
++                // it for every frame.
++                if (!mMotion || mForcedPending || now >= mMotionNext) {
++                    convertNewest(lock);
++                    continue;
++                }
++                earliest(mMotionNext);
++            }
++            if (mMotion) {
++                // Motion ends when no frame came for a while, or when frames keep coming but
++                // no longer change anything (a screen that stays awake drawing the same).
++                const bool noFrames = !mDeferred && now - mLastFrame >= mConfig.motionEnd;
++                const bool noChange = now - mLastMotionChange >= mConfig.motionEnd;
++                if (noFrames || noChange) {
++                    mMotion = false;
++                    mStreak = 0;
++                    mLastChange = 0;
++                    if (mDeferred) continue; // converted as a tap
++                } else {
++                    earliest(std::min(mDeferred ? INT64_MAX : mLastFrame + mConfig.motionEnd,
++                                      mLastMotionChange + mConfig.motionEnd));
++                }
++            }
++            if (mSettlePending && !mMotion) {
++                const nsecs_t due = mLastMotionSubmit + mConfig.settleDelay;
++                if (now >= due) {
++                    const Modes m = modes();
++                    const bool deep =
++                            (mConfig.deepFrames > 0 && mGestureFrames >= mConfig.deepFrames) ||
++                            (mConfig.policy >= 3 && mConfig.fullAfter > 0 &&
++                             mGhost >= mConfig.fullAfter * 1000);
++                    if (mGestureValid && m.settle != 0) {
++                        // A gesture's fast frames count once, at twice its area, whatever their
++                        // number; the settle itself counts as usual.
++                        if (mConfig.policy >= 3 && !deep) {
++                            const int64_t panel = int64_t{mWidth} * mHeight;
++                            mGhost += static_cast<uint32_t>(2 * ghostWeight(m.motion) *
++                                                            area(mGesture) / panel);
++                        }
++                        submit(mGesture, deep ? kModeGC16 : m.settle, deep ? "deep" : "settle");
++                        if (deep) scheduleFlush(now);
++                    }
++                    mSettlePending = false;
++                    mGestureValid = false;
++                    mGestureFrames = 0;
++                } else {
++                    earliest(due);
++                }
++            }
++            if (mScreenPending) {
++                if (now >= mScreenDue) {
++                    mScreenPending = false;
++                    if (now - mLastChange < mConfig.screenWait) {
++                        // The cap was reached while it kept changing: an animation.
++                        startMotion(mScreen, now, "motion (from screen)");
++                    } else {
++                        submitScreen(mScreen, now, "screen");
++                    }
++                } else {
++                    earliest(mScreenDue);
++                }
++            }
++            if (mFlushLeft > 0) {
++                if (now >= mFlushNext) {
++                    // An invisible 2x2 update (nothing changed there) in the panel corner.
++                    const int32_t x = static_cast<int32_t>(mWidth) - 4 -
++                            static_cast<int32_t>(mFlushLeft) * 4;
++                    const int32_t y = static_cast<int32_t>(mHeight) - 4;
++                    mFlushLeft--;
++                    submit(Rect(x, y, x + 2, y + 2), kModeDU, "flush");
++                    mFlushNext = now + kFlushSpacing;
++                }
++                if (mFlushLeft > 0) earliest(mFlushNext);
++            }
++        }
++        earliest(cleanTiles(now));
++
++        if (wake == 0) {
++            mCondition.wait(lock);
++        } else if (wake > now) {
++            mCondition.wait_for(lock, std::chrono::nanoseconds(wake - now));
++        }
++    }
++}
++
++} // namespace android
+diff --git a/services/surfaceflinger/DisplayHardware/EinkEngine.h b/services/surfaceflinger/DisplayHardware/EinkEngine.h
+new file mode 100644
+index 0000000..b1d506f
+--- /dev/null
++++ b/services/surfaceflinger/DisplayHardware/EinkEngine.h
+@@ -0,0 +1,257 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#pragma once
++
++#include <condition_variable>
++#include <cstdint>
++#include <mutex>
++#include <vector>
++
++#include <ui/Fence.h>
++#include <ui/GraphicBuffer.h>
++#include <ui/Region.h>
++#include <utils/Timers.h>
++
++struct prop_info;
++
++namespace android {
++
++/**
++ * Drives an e-ink panel directly from the composed client target (debug.sf.eink_engine=1).
++ *
++ * The vendor composer on the Bigme HiBreak Pro (MT6877, XRZ e-ink kernel driver) refreshes the
++ * whole panel for every frame, so a key press waits for a full-panel waveform. This engine
++ * converts the damaged part of each composed frame to 8-bit grey in a persistent ION buffer,
++ * finds the 32x32 tiles that really changed and submits DRM_IOCTL_EINK_UPDATE for them itself.
++ * Kernel behaviour this relies on is in docs/eink-interface.md ("Update pipeline").
++ *
++ * The frame is converted on the engine's own thread (policies 2 and 3), never on SurfaceFlinger's
++ * main thread: reading a full client target takes ~50 ms, and doing it there held composition to
++ * about ten frames a second. FramebufferSurface waits (waitUntilReleased) only before it gives
++ * back the one buffer that is being read.
++ *
++ * Policy 3 (default) is policy 2 with the update shapes and the ghost handling of e-readers
++ * (Kindle, Kobo and KOReader refresh a widget's or the page's rectangle, never a grid of cells;
++ * docs/eink-vendor-research.md):
++ *  - Regions, not tiles: the 32x32 tile diff only says what changed. Changed tiles closer than
++ *    debug.sf.eink.merge_px form one rectangle (a button, a list row, the status bar), at most
++ *    debug.sf.eink.max_regions of them, and each goes out as ONE update in ONE mode: grey when
++ *    grey_share percent of its changed tiles have greys, otherwise the fast mode. Policy 2 split
++ *    one button into A2 and GL16 tiles that arrived at different times; with the "Clear" app
++ *    mode every tile flashed GC16 on its own.
++ *  - Ghost budget: the fast modes leave ghosts only GC16 removes (rule 8). The engine counts
++ *    them (panels drawn in a fast mode; GL16 counts half; a gesture counts once, at twice its
++ *    area) and, once debug.sf.eink.full_after panels have built up, the next new screen goes
++ *    out as one GC16 of the whole panel, or the next settle as GC16 over its gesture: the
++ *    "full refresh every N pages" of e-readers. GL16 screen changes leave visible ghosts of
++ *    the previous screen with or without the kernel's auto-clean (camera, 2026-11-14).
++ *  - Every large GC16 is followed by the invisible flush, so A2 keeps working after it; the
++ *    "Clear" app mode therefore scrolls in A2 instead of DU.
++ *
++ * Policy 2 (debug.sf.eink.policy=2) sorts every change into one of three classes:
++ *  - Tap: a change with no motion (key press, toggle, new screen). Tiles that are pure black and
++ *    white go out in the fast mode (A2, ~145 ms), tiles with greys in GL16 (~400 ms), as at
++ *    most debug.sf.eink.max_rects rectangles. A change over half the panel (a new screen) is
++ *    one GL16 update, even for apps set to "fast": A2 would leave ghosts of the old screen. A
++ *    second change within the motion gap already uses the fast mode everywhere. No cleanup pass
++ *    follows: the kernel cleans A2 ghosting itself (eink_debug/clean_a2).
++ *  - Motion: changes keep arriving less than the motion gap apart (scrolling, page swipes, the
++ *    shade). One update per panel slot (debug.sf.eink.motion_ms) over one rectangle that only
++ *    grows during the gesture, so the kernel can drop frames it has not started yet; frames
++ *    arriving in between are not even converted, the newest one is converted when the slot is
++ *    free. The panel shows the newest picture about ten times a second instead of replaying a
++ *    backlog.
++ *  - Settle: once, debug.sf.eink.settle_ms after the last motion update, over the gesture
++ *    rectangle in GL16, which restores the greys the 1-bit motion frames dropped.
++ * GC16 is never used automatically: while a GC16 of an area is among the kernel's last ten
++ * updates, A2 there falls back to a dithered GU16 (~365 ms). After a GC16 (the "refresh screen"
++ * tile, or a deep clean) the engine sends ten invisible 2x2 updates to push it out.
++ *
++ * Policy 1 is the earlier behaviour: every change in the app's mode, DU for detected motion,
++ * and a GL16/GC16 cleanup pass per tile debug.sf.eink.clean_ms after it changed.
++ *
++ * The vendor composer commits the first few frames after boot (the kernel driver sets up its
++ * pipeline on those); then the engine sets vendor.xrz.disable_commit and takes over.
++ *
++ * Properties, re-read whenever any property changes (so tuning needs no restart):
++ *   debug.sf.eink_engine          engine on (read at boot only)
++ *   debug.sf.eink.policy          3 (default), 2 or 1
++ *   debug.sf.eink.merge_px        policy 3: changes closer than this are one region (default 96)
++ *   debug.sf.eink.max_regions     policy 3: regions per change (default 2)
++ *   debug.sf.eink.grey_share      policy 3: percent of grey tiles that make a region grey (25)
++ *   debug.sf.eink.full_after      policy 3: ghost budget in panels before a GC16 (default 4
++ *                                 with auto-clean off, 8 with it on; 0 = never)
++ *   debug.sf.eink.tap_bw          tap mode for black/white tiles (default 16, A2)
++ *   debug.sf.eink.tap_grey        tap mode for tiles with greys (default 32, GL16)
++ *   debug.sf.eink.screen_mode     mode for a change over half the panel (default 32, GL16)
++ *   debug.sf.eink.screen_wait_ms  a new screen is sent once no change came for this long (at
++ *                                 most three times as long), so it goes out as one update
++ *                                 although apps draw it in two or three frames (default 120;
++ *                                 frames come about 100 ms apart while the panel is busy)
++ *   debug.sf.eink.grey_px         grey pixels that make a tile "grey" (default 48 of 1024)
++ *   debug.sf.eink.max_rects       rectangles per frame (default 4; the kernel queues 10)
++ *   debug.sf.eink.motion_mode     (default 16, A2)
++ *   debug.sf.eink.motion_ms       minimum time between motion updates (default 90)
++ *   debug.sf.eink.motion_gap_ms   changes closer than this are motion (default 100)
++ *   debug.sf.eink.motion_frames   changes in a row that start motion (default 3)
++ *   debug.sf.eink.motion_end_ms   motion ends this long after the last frame, or the last frame
++ *                                 that changed pixels (default 250; frames slow down to about
++ *                                 100 ms apart while the panel is busy)
++ *   debug.sf.eink.settle_mode     (default 32, GL16; 0 = no settle)
++ *   debug.sf.eink.settle_ms       (default 150)
++ *   debug.sf.eink.deep_frames     settle with GC16 after this many motion updates (0 = never)
++ *   debug.sf.eink.clean_ms        per-tile cleanup delay (policy 1: default 800; policy 2: 0)
++ *   debug.sf.eink.mode            policy 1 default mode (0xb2)
++ *   debug.sf.eink.black / .white  grey levels clamped to black / white (default 48 / 208)
++ *   debug.sf.eink.log             1 = log every decision (tag EinkEngine)
++ *   debug.sf.eink.convert_threads threads that read the client target together (default 4)
++ *   debug.sf.eink.no_hw_fb        1 = client target without GRALLOC_USAGE_HW_FB (read at boot)
++ *   vendor.xrz.global_refresh_mode   per-app mode from HiBreakParts (0 = default, 4 = clear,
++ *                                    32 = GL16, 16 = fast)
++ *   vendor.xrz.force_global_refresh_mode  each write requests one full refresh in that mode
++ *   vendor.xrz.auto_clean_enabled         policy 1 cleanup switch
++ */
++class EinkEngine {
++public:
++    static bool enabled();
++    static EinkEngine& get();
++
++    /** Called for every client target queued to the display, after it was handed to HWC. */
++    void onFrame(const sp<GraphicBuffer>& buffer, const sp<Fence>& acquireFence,
++                 const Region& damage);
++
++    /** Blocks while the engine reads `buffer`. FramebufferSurface calls it before it gives a
++     *  client target back to the queue, so nothing draws into a buffer being converted. */
++    void waitUntilReleased(const GraphicBuffer* buffer);
++
++    /** debug.sf.eink.no_hw_fb: allocate the client target without GRALLOC_USAGE_HW_FB. */
++    static bool clientTargetWithoutFb();
++
++private:
++    struct Config {
++        uint32_t policy = 3;
++        uint32_t defaultMode = 0xb2;
++        nsecs_t cleanDelay = 0;
++        uint32_t tapBw = 16;
++        uint32_t tapGrey = 32;
++        uint32_t screenMode = 32;
++        nsecs_t screenWait = 0;
++        uint32_t greyPixels = 48;
++        uint32_t maxRects = 4;
++        uint32_t motionMode = 16;
++        nsecs_t motionInterval = 0;
++        nsecs_t motionGap = 0;
++        nsecs_t motionEnd = 0;
++        uint32_t motionFrames = 3;
++        uint32_t settleMode = 32;
++        nsecs_t settleDelay = 0;
++        uint32_t deepFrames = 0;
++        int32_t mergeDist = 96;
++        uint32_t maxRegions = 2;
++        uint32_t greyShare = 25;
++        uint32_t fullAfter = 0;
++        bool log = false;
++        uint32_t convertThreads = 4;
++        int black = 48;
++        int white = 208;
++    };
++    struct Modes {
++        uint32_t bw, grey, screen, motion, settle;
++    };
++
++    EinkEngine();
++    void loadConfig();
++    void reloadConfigIfChanged();
++    bool init(uint32_t width, uint32_t height);
++    bool allocate(uint32_t size);
++    Region convert(const sp<GraphicBuffer>& buffer, const Region& region,
++                   std::vector<uint8_t>* greyTiles);
++    bool convertNewest(std::unique_lock<std::mutex>& lock);
++    Region tileRegion(const std::vector<uint8_t>& tiles) const;
++    void markChanged(const Region& region, nsecs_t when);
++    void submit(const Rect& rect, uint32_t mode, const char* why, bool countGhost = true);
++    void submitRegion(const Region& region, uint32_t mode, size_t maxRects, const char* why);
++    uint32_t frameMode();
++    Modes modes();
++    bool takeForcedMode(uint32_t* mode);
++    void scheduleFlush(nsecs_t now);
++    std::vector<Rect> regions(const Region& changed) const;
++    bool isGreyRect(const Rect& r, const std::vector<uint8_t>& grey) const;
++    void submitScreen(const Rect& rect, nsecs_t now, const char* why);
++    void onFrameV1(const sp<GraphicBuffer>& buffer, const sp<Fence>& acquireFence,
++                   const Region& damage);
++    void onFrameV2(const sp<GraphicBuffer>& buffer, const sp<Fence>& acquireFence,
++                   const Region& damage);
++    void processTap(const Region& changed, const std::vector<uint8_t>& grey, nsecs_t now);
++    void processMotion(const Region& changed, nsecs_t now);
++    void startMotion(const Rect& rect, nsecs_t now, const char* why);
++    nsecs_t cleanTiles(nsecs_t now);
++    void workLoop();
++
++    bool mInitDone = false;
++    bool mInitFailed = false;
++    bool mHadFrame = false;
++    uint32_t mFramesSeen = 0;
++    int mCard = -1;
++    int mBufferFd = -1;
++    uint8_t* mGrey = nullptr;
++    uint32_t mWidth = 0;
++    uint32_t mHeight = 0;
++    uint8_t mLut[256];
++    std::vector<uint8_t> mShadow; // cached copy of mGrey
++    std::vector<uint16_t> mGreyCount; // per tile, grey pixels in the last conversion
++    std::vector<uint8_t> mDirty;      // per tile, changed in the last conversion
++    uint32_t mConvertCount = 0;
++    nsecs_t mConvertTotal = 0;
++    nsecs_t mConvertMax = 0;
++
++    Config mConfig;
++    uint32_t mPropSerial = 0;
++    const prop_info* mModeProp = nullptr;
++    const prop_info* mForceProp = nullptr;
++    const prop_info* mAutoCleanProp = nullptr;
++    uint32_t mForceSerial = 0;
++
++    std::mutex mMutex; // guards everything below and the ioctl
++    std::condition_variable mCondition;
++    size_t mTilesX = 0;
++    size_t mTilesY = 0;
++    std::vector<nsecs_t> mTileChanged; // last change per tile, 0 = clean (cleanup pass)
++    size_t mPendingClean = 0;          // tiles with a non-zero entry
++    nsecs_t mLastChange = 0;           // last frame that changed the panel
++    uint32_t mStreak = 0;              // consecutive changes less than the motion gap apart
++    nsecs_t mLastMotion = 0;           // policy 1: last frame sent as motion
++    uint32_t mMotionCount = 0;         // stats: motion updates since the last log line
++
++    // Policy 2.
++    sp<GraphicBuffer> mDeferred; // newest client target not converted yet
++    sp<Fence> mDeferredFence;
++    Region mPendingDamage;       // damage of all frames since the last conversion
++    nsecs_t mDeferredTime = 0;   // when mDeferred arrived
++    bool mForcedPending = false; // the next conversion is a forced (or the first) full refresh
++    uint32_t mForcedMode = 0;
++    const GraphicBuffer* mReading = nullptr; // being converted by the work thread
++    std::condition_variable mReadDone;
++    bool mMotion = false;
++    nsecs_t mLastFrame = 0;      // last frame while in motion
++    nsecs_t mLastMotionChange = 0; // last motion conversion that changed pixels
++    nsecs_t mMotionNext = 0;     // the next motion update may go out from here
++    nsecs_t mLastMotionSubmit = 0;
++    Rect mGesture;               // grows during a gesture, reset by the settle update
++    bool mGestureValid = false;
++    uint32_t mGestureFrames = 0;
++    bool mSettlePending = false;
++    bool mScreenPending = false; // a new screen is being collected
++    Rect mScreen;
++    nsecs_t mScreenStart = 0;
++    nsecs_t mScreenDue = 0;
++    uint32_t mScreenFrames = 0;
++    uint32_t mGhost = 0;         // policy 3: ghosting built up, thousandths of a panel
++    uint32_t mFlushLeft = 0;     // invisible updates still to send after a GC16
++    nsecs_t mFlushNext = 0;
++};
++
++} // namespace android
+diff --git a/services/surfaceflinger/DisplayHardware/FramebufferSurface.cpp b/services/surfaceflinger/DisplayHardware/FramebufferSurface.cpp
+index 41e79d8..9504d72 100644
+--- a/services/surfaceflinger/DisplayHardware/FramebufferSurface.cpp
++++ b/services/surfaceflinger/DisplayHardware/FramebufferSurface.cpp
+@@ -40,6 +40,7 @@
+ #include <ui/Rect.h>
+ 
+ #include "FramebufferSurface.h"
++#include "EinkEngine.h"
+ #include "HWComposer.h"
+ #include "../SurfaceFlinger.h"
+ 
+@@ -70,9 +71,12 @@ FramebufferSurface::FramebufferSurface(HWComposer& hwc, PhysicalDisplayId displa
+ void FramebufferSurface::initializeConsumer() {
+     mName = "FramebufferSurface";
+     mConsumer->setConsumerName(mName);
++    // The e-ink engine reads the composed frame on the CPU. This also keeps the buffer linear
++    // (no AFBC), which the engine needs.
+-    mConsumer->setConsumerUsageBits(GRALLOC_USAGE_HW_FB |
+-                                       GRALLOC_USAGE_HW_RENDER |
+-                                       GRALLOC_USAGE_HW_COMPOSER);
++    mConsumer->setConsumerUsageBits(
++            (EinkEngine::clientTargetWithoutFb() ? 0 : GRALLOC_USAGE_HW_FB) |
++            GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER |
++            (EinkEngine::enabled() ? GRALLOC_USAGE_SW_READ_OFTEN : 0));
+     mConsumer->setDefaultBufferSize(mLimitedSize.width, mLimitedSize.height);
+     mConsumer->setMaxAcquiredBufferCount(
+             SurfaceFlinger::maxFrameBufferAcquiredBuffers - 1);
+@@ -142,6 +146,10 @@ status_t FramebufferSurface::advanceFrame(float hdrSdrRatio) {
+         return result;
+     }
+ 
++    if (EinkEngine::enabled()) {
++        EinkEngine::get().onFrame(mCurrentBuffer, mCurrentFence, item.mSurfaceDamage);
++    }
++
+     return NO_ERROR;
+ }
+ 
+@@ -152,6 +160,11 @@ status_t FramebufferSurface::nextBuffer(uint32_t& outSlot,
+ 
+ void FramebufferSurface::onFrameCommitted() {
+     if (mHasPendingRelease) {
++        // The e-ink engine may still be reading this client target on its own thread; the
++        // next frame must not be drawn into it before it is done.
++        if (EinkEngine::enabled()) {
++            EinkEngine::get().waitUntilReleased(mPreviousBuffer.get());
++        }
+         sp<Fence> fence = mHwc.getPresentFence(mDisplayId);
+         if (fence->isValid()) {
+             status_t result = addReleaseFence(mPreviousBufferSlot,
+-- 
+2.43.0
+

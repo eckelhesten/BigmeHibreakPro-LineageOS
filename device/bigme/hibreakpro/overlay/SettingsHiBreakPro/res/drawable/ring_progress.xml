@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-License-Identifier: Apache-2.0
+     E-ink: the fingerprint enrollment ring. A hairline track and a thick progress arc in the
+     same ink colour, sharing the inner edge, so progress shows as the arc growing over the
+     hairline (the stock track is a grey tint, which the black-and-white panel shows as ink of
+     the same width as the arc: progress was invisible).
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@android:id/background">
+        <shape
+            android:innerRadiusRatio="2.2"
+            android:shape="ring"
+            android:thickness="1dp"
+            android:useLevel="false"
+            android:tint="?android:attr/colorControlActivated">
+            <solid android:color="@android:color/white" />
+        </shape>
+    </item>
+    <item android:id="@android:id/progress">
+        <rotate
+            android:fromDegrees="270"
+            android:pivotX="50%"
+            android:pivotY="50%"
+            android:toDegrees="270">
+            <shape
+                android:innerRadiusRatio="2.2"
+                android:shape="ring"
+                android:thickness="5dp"
+                android:tint="?android:attr/colorControlActivated">
+                <solid android:color="@android:color/white" />
+            </shape>
+        </rotate>
+    </item>
+</layer-list>

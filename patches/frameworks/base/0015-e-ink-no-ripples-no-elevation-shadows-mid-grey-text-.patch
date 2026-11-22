@@ -1,0 +1,123 @@
+From f3444dc04b7dc77de8c36a03b6b3be00fd7f545f Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 17 Nov 2026 02:53:07 +0000
+Subject: [PATCH 15/16] e-ink: no ripples, no elevation shadows, mid-grey text
+ left alone
+
+For panels that show only black and white:
+- debug.eink.no_ripple=1: RippleDrawable draws its content only. A ripple
+  is a dither pattern that flickers through several refreshes per touch.
+- debug.hwui.eink_no_shadow=1: no elevation shadows, which are bands of
+  dither noise around cards, buttons and dialogs.
+- debug.hwui.eink_text: mid-grey text (L 55-85) keeps its colour instead of
+  snapping to white, which made grey hints invisible on white. Whether it
+  should be black or white depends on the background, which SurfaceFlinger's
+  e-ink pass decides from the composed picture.
+
+Change-Id: I470d098806f92a804fe0b65aa3001edde252ef4e
+---
+ .../java/android/graphics/drawable/RippleDrawable.java   | 9 +++++++++
+ libs/hwui/Properties.cpp                                 | 2 ++
+ libs/hwui/Properties.h                                   | 3 +++
+ libs/hwui/hwui/DrawTextFunctor.h                         | 4 ++++
+ libs/hwui/pipeline/skia/ReorderBarrierDrawables.cpp      | 2 ++
+ 5 files changed, 20 insertions(+)
+
+diff --git a/graphics/java/android/graphics/drawable/RippleDrawable.java b/graphics/java/android/graphics/drawable/RippleDrawable.java
+index 641a2ae7b..370a7448c 100644
+--- a/graphics/java/android/graphics/drawable/RippleDrawable.java
++++ b/graphics/java/android/graphics/drawable/RippleDrawable.java
+@@ -337,12 +337,21 @@ public class RippleDrawable extends LayerDrawable {
+                 windowFocused = true;
+             }
+         }
++        // E-ink: no ripple and no hover or focus wash, the content is drawn as it is.
++        if (EINK_NO_RIPPLE) return changed;
+         setRippleActive(enabled && pressed);
+         setBackgroundActive(hovered, focused, pressed, windowFocused);
+ 
+         return changed;
+     }
+ 
++    /**
++     * E-ink panels (debug.eink.no_ripple=1): on a panel that shows black and white only, a
++     * ripple is a dither pattern that flickers through several refreshes for each touch.
++     */
++    private static final boolean EINK_NO_RIPPLE =
++            android.os.SystemProperties.getBoolean("debug.eink.no_ripple", false);
++
+     private void setRippleActive(boolean active) {
+         if (mRippleActive != active) {
+             mRippleActive = active;
+diff --git a/libs/hwui/Properties.cpp b/libs/hwui/Properties.cpp
+index ef4ebd35d..60d916d31 100644
+--- a/libs/hwui/Properties.cpp
++++ b/libs/hwui/Properties.cpp
+@@ -81,6 +81,7 @@ bool Properties::sDisableProfileBars = false;
+ RenderPipelineType Properties::sRenderPipelineType = RenderPipelineType::NotInitialized;
+ bool Properties::enableHighContrastText = false;
+ bool Properties::einkText = false;
++bool Properties::einkNoShadow = false;
+ 
+ bool Properties::waitForGpuCompletion = false;
+ 
+@@ -147,6 +148,7 @@ bool Properties::load() {
+ 
+     debugLayersUpdates = base::GetBoolProperty(PROPERTY_DEBUG_LAYERS_UPDATES, false);
+     einkText = base::GetBoolProperty("debug.hwui.eink_text", false);
++    einkNoShadow = base::GetBoolProperty("debug.hwui.eink_no_shadow", false);
+     INIT_LOGD("  Layers updates debug enabled: %d", debugLayersUpdates);
+ 
+     showDirtyRegions = base::GetBoolProperty(PROPERTY_DEBUG_SHOW_DIRTY_REGIONS, false);
+diff --git a/libs/hwui/Properties.h b/libs/hwui/Properties.h
+index 7964bcf9f..bc51ebee7 100644
+--- a/libs/hwui/Properties.h
++++ b/libs/hwui/Properties.h
+@@ -312,6 +312,9 @@ public:
+     // E-ink panels: text is drawn in pure black or white (by its lightness), with no outline or
+     // backdrop. Set once per process from debug.hwui.eink_text.
+     static bool einkText;
++    // E-ink panels: no elevation shadows. A soft grey shadow is a band of dither noise around
++    // every card, button and dialog. Set once per process from debug.hwui.eink_no_shadow.
++    static bool einkNoShadow;
+ 
+     // Should be used only by test apps
+     static bool waitForGpuCompletion;
+diff --git a/libs/hwui/hwui/DrawTextFunctor.h b/libs/hwui/hwui/DrawTextFunctor.h
+index e05c2766b..2d0d6b314 100644
+--- a/libs/hwui/hwui/DrawTextFunctor.h
++++ b/libs/hwui/hwui/DrawTextFunctor.h
+@@ -118,6 +118,10 @@ static bool snapTextColorForEink(const Paint& paint, Paint* out) {
+     SkColor4f c = paint.getColor4f();
+     if (c.fA == 0.f) return false;
+     uirenderer::Lab lab = uirenderer::sRGBToLab(c);
++    // Mid greys stay as they are: whether they should be black or white depends on what is
++    // behind them (grey hint text on white, grey captions on black), which SurfaceFlinger's
++    // e-ink enhancement decides from the composed picture.
++    if (lab.L > 55 && lab.L < 85) return false;
+     SkColor4f snapped = lab.L <= 55 ? SkColors::kBlack : SkColors::kWhite;
+     snapped.fA = c.fA >= 0.5f ? 1.f : c.fA;
+     if (snapped == c) return false;
+diff --git a/libs/hwui/pipeline/skia/ReorderBarrierDrawables.cpp b/libs/hwui/pipeline/skia/ReorderBarrierDrawables.cpp
+index 136740c79..8d1feb270 100644
+--- a/libs/hwui/pipeline/skia/ReorderBarrierDrawables.cpp
++++ b/libs/hwui/pipeline/skia/ReorderBarrierDrawables.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "ReorderBarrierDrawables.h"
++#include "Properties.h"
+ #include "RenderNode.h"
+ #include "SkiaDisplayList.h"
+ #include "LightingInfo.h"
+@@ -130,6 +131,7 @@ static SkColor multiplyAlpha(SkColor color, float alpha) {
+ 
+ // copied from FrameBuilder::deferShadow
+ void EndReorderBarrierDrawable::drawShadow(SkCanvas* canvas, RenderNodeDrawable* caster) {
++    if (CC_UNLIKELY(Properties::einkNoShadow)) return;
+     const RenderProperties& casterProperties = caster->getNodeProperties();
+ 
+     if (casterProperties.getAlpha() <= 0.0f || casterProperties.getOutline().getAlpha() <= 0.0f ||
+-- 
+2.43.0
+

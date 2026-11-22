@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- MindTheGapps for the gapps flavour (device.mk HIBREAK_FLAVOR=gapps). Copied into
+     .repo/local_manifests by scripts/buildserver-pipeline.sh only when that flavour is built.
+     baklava = Android 16; pinned for reproducible builds. To update: the newest commit of
+     https://gitlab.com/MindTheGapps/vendor_gapps/-/commits/baklava -->
+<manifest>
+  <remote name="mindthegapps" fetch="https://gitlab.com/MindTheGapps/" />
+  <project path="vendor/gapps" name="vendor_gapps" remote="mindthegapps"
+           revision="f8cdcffc2fb9181b8cc5a9b02d4b5908b64e5cdd" upstream="baklava" clone-depth="1" />
+</manifest>

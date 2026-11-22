@@ -1,0 +1,40 @@
+LineageOS 23.2 for the Bigme HiBreak Pro: first install
+========================================================
+
+THIS ERASES EVERYTHING ON THE PHONE.
+
+Before you start:
+  1. Unlock the bootloader. On the phone, turn on Settings > Developer options > OEM unlocking.
+     Then run:   adb reboot bootloader
+                 fastboot flashing unlock
+     and confirm with Volume Up. This wipes the phone too.
+  2. Set Android up again (skip everything), turn on USB debugging, and connect the phone.
+  3. The phone must run stock firmware Bigme_HiBreak_EEA_V1.0_20260312 on slot A. Check with:
+                 adb shell getprop ro.boot.slot_suffix      (must print _a)
+  4. Install the Android platform tools (adb, fastboot).
+
+Install, on macOS or Linux:
+  bash flash.sh
+
+  The script checks the images and the phone, asks you to type YES, flashes, wipes and reboots.
+  If a step fails, it stops and leaves the phone in fastboot. Run it again, or do the steps by
+  hand.
+
+Install by hand (Windows or anywhere), from this folder:
+  adb reboot fastboot
+  fastboot flash system system.img
+  fastboot flash system_ext system_ext.img
+  fastboot flash product product.img
+  fastboot reboot bootloader
+  fastboot flash boot_a boot.img
+  fastboot flash dtbo_a dtbo.img
+  fastboot flash vbmeta_a vbmeta.img
+  fastboot flash vbmeta_system_a vbmeta_system.img
+  fastboot -w
+  fastboot format:ext4 metadata
+  fastboot reboot
+
+The first boot takes a few minutes.
+
+More, including the e-ink modes FAQ:
+  https://github.com/eckelhesten/BigmeHibreakPro-LineageOS

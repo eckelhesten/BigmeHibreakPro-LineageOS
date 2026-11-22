@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sleep screen weather conditions; the rest of HiBreakParts is English only. -->
+<resources>
+    <string name="weather_clear">Klart</string>
+    <string name="weather_partly_cloudy">Delvis skyet</string>
+    <string name="weather_cloudy">Overskyet</string>
+    <string name="weather_fog">Tåge</string>
+    <string name="weather_drizzle">Støvregn</string>
+    <string name="weather_rain">Regn</string>
+    <string name="weather_showers">Byger</string>
+    <string name="weather_snow">Sne</string>
+    <string name="weather_thunderstorm">Torden</string>
+    <string name="sleep_calendar_no_title">(Ingen titel)</string>
+</resources>

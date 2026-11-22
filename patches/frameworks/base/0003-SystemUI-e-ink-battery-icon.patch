@@ -1,0 +1,225 @@
+From 2621b3ce0e18172284d923e3bb8a21ed40ed8eef Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Fri, 13 Nov 2026 16:07:00 +0000
+Subject: [PATCH 3/4] SystemUI: e-ink battery icon
+
+With debug.sysui.eink_palette=1 the unified battery icon is drawn as a
+solid outline with a solid level fill in the icon colour. The green,
+red and yellow fills and the translucent frame background become
+dithered greys on e-ink and make the level hard to read.
+
+Change-Id: I1fca320f8aa73feae047e3fc358752bcd8d49c02
+---
+ .../battery/shared/ui/BatteryColors.kt        | 40 ++++++++++++-------
+ .../battery/ui/composable/UnifiedBattery.kt   | 22 +++++++++-
+ 2 files changed, 46 insertions(+), 16 deletions(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/battery/shared/ui/BatteryColors.kt b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/battery/shared/ui/BatteryColors.kt
+index a1675766b..ad19b93e5 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/battery/shared/ui/BatteryColors.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/battery/shared/ui/BatteryColors.kt
+@@ -21,6 +21,17 @@ import com.android.systemui.statusbar.pipeline.battery.shared.ui.BatteryColors.L
+ import com.android.systemui.statusbar.pipeline.battery.shared.ui.BatteryColors.LightTheme.Error
+ import com.android.systemui.statusbar.pipeline.battery.shared.ui.BatteryColors.LightTheme.PowerSave
+ 
++/**
++ * E-ink panels (debug.sysui.eink_palette=1): the battery is drawn as a solid outline with a solid
++ * level fill in the icon colour. Colour fills (green, red, yellow) and translucent backgrounds turn
++ * into dithered greys on e-ink and make the icon hard to read.
++ */
++object EinkBattery {
++    @JvmField
++    val enabled: Boolean =
++        android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)
++}
++
+ sealed interface BatteryColors {
+     /** Foreground color for battery glyphs (e.g. percentage or charging bolt) */
+     val glyph: Color
+@@ -51,28 +62,29 @@ sealed interface BatteryColors {
+      */
+     sealed class LightTheme : BatteryColors {
+         override val attribution = Color.Black
+-        override val glyph = Color.Black.copy(alpha = 0.75f)
+-        override val backgroundOnly = lowAlphaBg
+-        override val backgroundWithGlyph = lowAlphaBg
++        override val glyph = if (EinkBattery.enabled) Color.White else Color.Black.copy(alpha = 0.75f)
++        override val backgroundOnly = if (EinkBattery.enabled) Color.Transparent else lowAlphaBg
++        override val backgroundWithGlyph = if (EinkBattery.enabled) Color.Transparent else lowAlphaBg
+ 
+         data object Default : LightTheme() {
+-            override val glyph = Color.White.copy(alpha = 0.9f)
++            override val glyph = if (EinkBattery.enabled) Color.White else Color.White.copy(alpha = 0.9f)
+             override val fill = Color.Black
+ 
+             /** Use a higher opacity here because the foreground is white */
+-            override val backgroundWithGlyph = highAlphaBg
++            override val backgroundWithGlyph =
++                if (EinkBattery.enabled) Color.Transparent else highAlphaBg
+         }
+ 
+         data object Charging : LightTheme() {
+-            override val fill = Color(0xFF18CC47)
++            override val fill = if (EinkBattery.enabled) Color.Black else Color(0xFF18CC47)
+         }
+ 
+         data object Error : LightTheme() {
+-            override val fill = Color(0xFFFF0E01)
++            override val fill = if (EinkBattery.enabled) Color.Black else Color(0xFFFF0E01)
+         }
+ 
+         data object PowerSave : LightTheme() {
+-            override val fill = Color(0xFFFFC917)
++            override val fill = if (EinkBattery.enabled) Color.Black else Color(0xFFFFC917)
+         }
+ 
+         companion object {
+@@ -91,24 +103,24 @@ sealed interface BatteryColors {
+      */
+     sealed class DarkTheme : BatteryColors {
+         override val attribution = Color.White
+-        override val backgroundOnly = lowAlphaBg
+-        override val backgroundWithGlyph = highAlphaBg
+-        override val glyph = Color.Black.copy(alpha = 0.75f)
++        override val backgroundOnly = if (EinkBattery.enabled) Color.Transparent else lowAlphaBg
++        override val backgroundWithGlyph = if (EinkBattery.enabled) Color.Transparent else highAlphaBg
++        override val glyph = if (EinkBattery.enabled) Color.Black else Color.Black.copy(alpha = 0.75f)
+ 
+         data object Default : DarkTheme() {
+             override val fill = Color.White
+         }
+ 
+         data object Charging : DarkTheme() {
+-            override val fill = Color(0xFF18CC47)
++            override val fill = if (EinkBattery.enabled) Color.White else Color(0xFF18CC47)
+         }
+ 
+         data object Error : DarkTheme() {
+-            override val fill = Color(0xFFFF0E01)
++            override val fill = if (EinkBattery.enabled) Color.White else Color(0xFFFF0E01)
+         }
+ 
+         data object PowerSave : DarkTheme() {
+-            override val fill = Color(0xFFFFC917)
++            override val fill = if (EinkBattery.enabled) Color.White else Color(0xFFFFC917)
+         }
+ 
+         companion object {
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/battery/ui/composable/UnifiedBattery.kt b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/battery/ui/composable/UnifiedBattery.kt
+index a050bca95..0d967e7f2 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/battery/ui/composable/UnifiedBattery.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/pipeline/battery/ui/composable/UnifiedBattery.kt
+@@ -63,6 +63,7 @@ import com.android.systemui.compose.modifiers.sysuiResTag
+ import com.android.systemui.statusbar.phone.domain.interactor.IsAreaDark
+ import com.android.systemui.statusbar.pipeline.battery.data.repository.BatteryRepository
+ import com.android.systemui.statusbar.pipeline.battery.shared.ui.BatteryColors
++import com.android.systemui.statusbar.pipeline.battery.shared.ui.EinkBattery
+ import com.android.systemui.statusbar.pipeline.battery.shared.ui.BatteryFrame
+ import com.android.systemui.statusbar.pipeline.battery.shared.ui.BatteryGlyph
+ import com.android.systemui.statusbar.pipeline.battery.shared.ui.PathSpec
+@@ -444,10 +445,17 @@ fun CircleBatteryBody(
+         // Draw thin gray ring first
+-        drawCircle(colors.backgroundOnly, radius, center, style = Stroke(strokeWidth))
++        if (EinkBattery.enabled) {
++            // backgroundOnly is transparent on e-ink; draw a thin solid track instead.
++            drawCircle(colors.attribution, radius, center, style = Stroke(strokeWidth / 3f))
++        } else {
++            drawCircle(colors.backgroundOnly, radius, center, style = Stroke(strokeWidth))
++        }
+ 
+         // Draw colored arc representing charge level
+         if (level != null && level > 0) {
+             drawArc(
+-                if (attr is BatteryGlyph.Bolt || attr is BatteryGlyph.Defend) {
++                if (EinkBattery.enabled) {
++                    colors.attribution
++                } else if (attr is BatteryGlyph.Bolt || attr is BatteryGlyph.Defend) {
+                     BatteryColors.DarkTheme.Charging.fill
+                 } else if (attr is BatteryGlyph.Plus) {
+                     BatteryColors.DarkTheme.PowerSave.fill
+@@ -588,19 +596,56 @@ fun BatteryBody(
+                 }
+             }
+ 
++            if (EinkBattery.enabled && !isFull) {
++                // The stroke is centred on the path and the outer half is clipped by the offscreen
++                // layer, so a quarter of the height leaves an eighth visible inside.
++                drawPath(
++                    pathSpec.path,
++                    colors.attribution,
++                    style = Stroke(width = BatteryFrame.innerHeight / 4f),
++                )
++            }
++
+             // Next: draw the glyphs
+-            var horizontalOffset = (BatteryFrame.innerWidth - totalGlyphWidth) / 2f
+-            for (glyph in glyphs) {
+-                // Move the glyph to the right spot
+-                val verticalOffset = (BatteryFrame.innerHeight - glyph.height) / 2
+-                inset(
+-                    // Never try and inset more than half of the available size - see b/400246091.
+-                    minOf(horizontalOffset, size.width / 2),
+-                    minOf(verticalOffset, size.height / 2),
+-                ) {
+-                    glyph.draw(this, colors)
+-                }
+-                horizontalOffset += glyph.width + INTER_GLYPH_PADDING_PX
++            fun drawAllGlyphs(glyphColors: BatteryColors) {
++                var horizontalOffset = (BatteryFrame.innerWidth - totalGlyphWidth) / 2f
++                for (glyph in glyphs) {
++                    // Move the glyph to the right spot
++                    val verticalOffset = (BatteryFrame.innerHeight - glyph.height) / 2
++                    inset(
++                        // Never try and inset more than half of the available size - see b/400246091.
++                        minOf(horizontalOffset, size.width / 2),
++                        minOf(verticalOffset, size.height / 2),
++                    ) {
++                        glyph.draw(this, glyphColors)
++                    }
++                    horizontalOffset += glyph.width + INTER_GLYPH_PADDING_PX
++                }
++            }
++            if (EinkBattery.enabled && !isFull && glyphs.isNotEmpty()) {
++                // Over transparent backgroundWithGlyph, invert glyph colour across the fill edge
++                // so digits/bolt stay readable on both the filled and unfilled halves.
++                val fillEdge = if (level != null && level > 0) level.scaledLevel() else 0f
++                val fillLeft = if (!rtl) 0f else BatteryFrame.innerWidth - fillEdge
++                val fillRight = if (!rtl) fillEdge else BatteryFrame.innerWidth
++                val unfilledLeft = if (!rtl) fillEdge else 0f
++                val unfilledRight =
++                    if (!rtl) BatteryFrame.innerWidth else BatteryFrame.innerWidth - fillEdge
++                val unfilledColors =
++                    if (colors is BatteryColors.LightTheme) BatteryColors.DarkTheme.Default
++                    else BatteryColors.LightTheme.Default
++                if (fillRight > fillLeft) {
++                    clipRect(fillLeft, 0f, fillRight, BatteryFrame.innerHeight) {
++                        drawAllGlyphs(colors)
++                    }
++                }
++                if (unfilledRight > unfilledLeft) {
++                    clipRect(unfilledLeft, 0f, unfilledRight, BatteryFrame.innerHeight) {
++                        drawAllGlyphs(unfilledColors)
++                    }
++                }
++            } else {
++                drawAllGlyphs(colors)
+             }
+         }
+     }
+@@ -620,7 +665,12 @@ fun BatteryCap(
+         val colors = colorsProvider()
+         val isFull = isFullProvider()
+         val hasGlyphs = glyphsProvider().isNotEmpty()
+-        val color = getBatteryFrameColor(isFull = isFull, hasGlyphs = hasGlyphs, colors = colors)
++        val color =
++            if (EinkBattery.enabled) {
++                colors.attribution
++            } else {
++                getBatteryFrameColor(isFull = isFull, hasGlyphs = hasGlyphs, colors = colors)
++            }
+ 
+         val s = pathSpec.scaleTo(size.width, size.height)
+         scale(s, pivot = Offset.Zero) { drawPath(pathSpec.path, color = color) }
+-- 
+2.43.0
+

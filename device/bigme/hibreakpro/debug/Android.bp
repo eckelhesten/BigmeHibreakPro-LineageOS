@@ -1,0 +1,8 @@
+// Bring-up log collector. Only installed on userdebug/eng (device.mk), with its SELinux domain in
+// sepolicy/debug (BoardConfig.mk adds that directory for debug variants only).
+sh_binary {
+    name: "hbdebug.sh",
+    src: "hbdebug.sh",
+    system_ext_specific: true,
+    init_rc: ["hbdebug.rc"],
+}

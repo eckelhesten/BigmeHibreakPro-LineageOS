@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 21 Nov 2026 10:39:14 +0100
+Subject: [PATCH] e-ink sleep screen: listen again when the shade window is
+ re-attached
+
+onDetachedFromWindow drops the state listener and the static instance
+(the time tick's target), but nothing took them back when the view was
+attached again, so after the notification shade window was removed and
+re-added the sleep screen stayed hidden until SystemUI restarted. The
+first attach keeps the listener from attach(); a later one registers it
+again and catches up with the doze state.
+---
+ .../android/systemui/shade/EinkSleepScreen.java | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+index 0af8345c..443a1756 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+@@ -138,10 +138,11 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+             NotificationStackScrollLayoutController notifications) {
+         if (!ENABLED || sInstance != null) return;
+         EinkSleepScreen view = new EinkSleepScreen(root.getContext(), stateController, notifications);
++        // Before addView: on an attached root it calls onAttachedToWindow at once.
++        sInstance = view;
++        stateController.addCallback(view);
+         root.addView(view, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                 ViewGroup.LayoutParams.MATCH_PARENT));
+-        stateController.addCallback(view);
+-        sInstance = view;
+         if (stateController.isDozing()) view.onDozingChanged(true);
+     }
+ 
+@@ -161,6 +162,18 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         setTranslationZ(10000f);
+     }
+ 
++    @Override
++    protected void onAttachedToWindow() {
++        super.onAttachedToWindow();
++        // Attached again after onDetachedFromWindow (the shade window was re-added): listen and
++        // take the time tick again, or the sleep screen would never show until SystemUI restarts.
++        if (sInstance == null) {
++            sInstance = this;
++            mStateController.addCallback(this);
++            onDozingChanged(mStateController.isDozing());
++        }
++    }
++
+     @Override
+     protected void onDetachedFromWindow() {
+         mStateController.removeCallback(this);
+-- 
+2.50.1 (Apple Git-155)
+

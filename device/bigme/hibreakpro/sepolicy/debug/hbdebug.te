@@ -1,0 +1,25 @@
+# Bring-up log collector (debug/hbdebug.sh). Debug builds only: this directory is added to
+# SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS for userdebug/eng in BoardConfig.mk, never for user builds.
+type hbdebug, domain, coredomain;
+type hbdebug_exec, system_file_type, exec_type, file_type;
+init_daemon_domain(hbdebug)
+# Reads logs, dmesg, all properties and /proc of every process, writes /metadata/hbdebug and may
+# request a reboot. A permissive domain keeps it out of the way of the real policy under test,
+# while targeted dontaudits keep bring-up logs from flooding with ~2,700 benign audit lines.
+permissive hbdebug;
+
+dontaudit hbdebug self:{ capability capability2 } *;
+dontaudit hbdebug domain:dir { getattr open read search };
+dontaudit hbdebug domain:{ file lnk_file } { getattr open read };
+dontaudit hbdebug property_type:file { getattr open read map };
+dontaudit hbdebug property_socket:sock_file write;
+dontaudit hbdebug init:unix_stream_socket connectto;
+dontaudit hbdebug metadata_file:dir { create open read write search getattr add_name remove_name rmdir rename setattr };
+dontaudit hbdebug metadata_file:file { create open read write getattr setattr unlink rename append };
+dontaudit hbdebug data_file_type:dir { getattr open read search write add_name };
+dontaudit hbdebug data_file_type:file { create open read write getattr setattr append };
+dontaudit hbdebug kmsg_device:chr_file { open read getattr };
+dontaudit hbdebug kernel:system { syslog_read syslog_mod };
+dontaudit hbdebug logd:unix_stream_socket connectto;
+dontaudit hbdebug logdr_socket:sock_file write;
+dontaudit hbdebug { proc proc_type }:file { getattr open read };

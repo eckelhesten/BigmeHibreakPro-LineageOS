@@ -1,0 +1,349 @@
+From 1442ccd514668fe525f723819f2de8ebd79c8ac2 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 14 Nov 2026 14:51:59 +0100
+Subject: [PATCH] Launcher3: plain surfaces and solid outlines on e-ink
+
+With debug.sysui.eink_palette=1 (the property SystemUI uses for its
+two-tone palette):
+- the scrims behind recents and the app list are plain paper (white, or
+  black in dark mode) instead of a translucent grey. On the Bigme
+  HiBreak Pro the recents screen was 70% mid-grey, which an e-ink panel
+  shows as dithered noise;
+- recents cards, the popup menu's items and the app list's search box
+  get a 2dp outline in the text colour, because their fill is as white
+  as what is behind them and their shadows are too faint to see.
+
+Change-Id: I2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e
+---
+ .../task/thumbnail/TaskContentView.kt         |  17 +++
+ .../task/thumbnail/TaskThumbnailView.kt       |  21 ++++
+ .../views/TaskThumbnailViewDeprecated.java    |  10 ++
+ .../allapps/ActivityAllAppsContainerView.java |   5 +
+ .../search/AppsSearchContainerLayout.java     |   6 +
+ .../android/launcher3/popup/ArrowPopup.java   |   5 +
+ src/com/android/launcher3/util/EinkUi.kt      | 110 ++++++++++++++++++
+ src/com/android/launcher3/util/Themes.java    |  12 ++
+ 8 files changed, 186 insertions(+)
+ create mode 100644 src/com/android/launcher3/util/EinkUi.kt
+
+diff --git a/quickstep/src/com/android/quickstep/task/thumbnail/TaskContentView.kt b/quickstep/src/com/android/quickstep/task/thumbnail/TaskContentView.kt
+index dabb20b..53520c3 100644
+--- a/quickstep/src/com/android/quickstep/task/thumbnail/TaskContentView.kt
++++ b/quickstep/src/com/android/quickstep/task/thumbnail/TaskContentView.kt
+@@ -45,6 +45,7 @@ import androidx.core.view.isInvisible
+ import androidx.core.view.isVisible
+ import com.android.launcher3.Flags.enableRefactorDigitalWellbeingToast
+ import com.android.launcher3.R
++import com.android.launcher3.util.EinkUi
+ import com.android.launcher3.util.KFloatProperty
+ import com.android.launcher3.util.MultiPropertyDelegate
+ import com.android.launcher3.util.MultiPropertyFactory
+@@ -256,6 +257,22 @@ class TaskContentView @JvmOverloads constructor(context: Context, attrs: Attribu
+ 
+     override fun draw(canvas: Canvas) {
+         super.draw(canvas)
++        if (EinkUi.ENABLED) {
++            // E-ink: the page behind the cards is as white as most apps, so outline the card.
++            val rect = outlineBounds ?: bounds
++            val expansion = outlineExpansion.toInt()
++            EinkUi.drawOutline(
++                this,
++                canvas,
++                rect.left.toFloat() - expansion,
++                rect.top.toFloat() - expansion,
++                rect.right.toFloat() + expansion,
++                rect.bottom.toFloat() + expansion,
++                if (scaleX > 0f) (cornerRadius + expansion) / scaleX else cornerRadius + expansion,
++                if (scaleY > 0f) (cornerRadius + expansion) / scaleY else cornerRadius + expansion,
++                scaleX,
++            )
++        }
+         if (isFocusable()) {
+             focusBorderAnimator.drawBorder(canvas)
+         }
+diff --git a/quickstep/src/com/android/quickstep/task/thumbnail/TaskThumbnailView.kt b/quickstep/src/com/android/quickstep/task/thumbnail/TaskThumbnailView.kt
+index b6928ae..513f1fc 100644
+--- a/quickstep/src/com/android/quickstep/task/thumbnail/TaskThumbnailView.kt
++++ b/quickstep/src/com/android/quickstep/task/thumbnail/TaskThumbnailView.kt
+@@ -17,6 +17,7 @@
+ package com.android.quickstep.task.thumbnail
+ 
+ import android.content.Context
++import android.graphics.Canvas
+ import android.graphics.Color
+ import android.graphics.Matrix
+ import android.graphics.Outline
+@@ -33,6 +34,7 @@ import androidx.core.view.isInvisible
+ import com.android.launcher3.Flags.enableRefactorTaskContentView
+ import com.android.launcher3.LauncherAnimUtils.VIEW_ALPHA
+ import com.android.launcher3.R
++import com.android.launcher3.util.EinkUi
+ import com.android.launcher3.util.MultiPropertyFactory
+ import com.android.launcher3.util.ViewPool
+ import com.android.quickstep.task.thumbnail.TaskThumbnailUiState.BackgroundOnly
+@@ -110,6 +112,25 @@ class TaskThumbnailView : FrameLayout, ViewPool.Reusable {
+             }
+     }
+ 
++    override fun dispatchDraw(canvas: Canvas) {
++        super.dispatchDraw(canvas)
++        if (EinkUi.ENABLED && !enableRefactorTaskContentView()) {
++            // E-ink: the page behind the cards is as white as most apps, so outline the card.
++            val rect = outlineBounds ?: bounds
++            EinkUi.drawOutline(
++                this,
++                canvas,
++                rect.left.toFloat(),
++                rect.top.toFloat(),
++                rect.right.toFloat(),
++                rect.bottom.toFloat(),
++                if (scaleX > 0f) cornerRadius / scaleX else cornerRadius,
++                if (scaleY > 0f) cornerRadius / scaleY else cornerRadius,
++                scaleX,
++            )
++        }
++    }
++
+     override fun onRecycle() {
+         uiState = Uninitialized
+         if (!enableRefactorTaskContentView()) {
+diff --git a/quickstep/src/com/android/quickstep/views/TaskThumbnailViewDeprecated.java b/quickstep/src/com/android/quickstep/views/TaskThumbnailViewDeprecated.java
+index a39100e..05e8680 100644
+--- a/quickstep/src/com/android/quickstep/views/TaskThumbnailViewDeprecated.java
++++ b/quickstep/src/com/android/quickstep/views/TaskThumbnailViewDeprecated.java
+@@ -46,6 +46,7 @@ import androidx.core.graphics.ColorUtils;
+ 
+ import com.android.launcher3.DeviceProfile;
+ import com.android.launcher3.Utilities;
++import com.android.launcher3.util.EinkUi;
+ import com.android.launcher3.util.SystemUiController;
+ import com.android.launcher3.util.SystemUiController.SystemUiControllerFlags;
+ import com.android.launcher3.util.ViewPool;
+@@ -291,6 +292,15 @@ public class TaskThumbnailViewDeprecated extends View implements ViewPool.Reusab
+ 
+     public void drawOnCanvas(Canvas canvas, float x, float y, float width, float height,
+             float cornerRadius) {
++        drawContentOnCanvas(canvas, x, y, width, height, cornerRadius);
++        if (EinkUi.ENABLED) {
++            // E-ink: the page behind the cards is as white as most apps, so outline the card.
++            EinkUi.drawOutline(this, canvas, x, y, width, height, cornerRadius, cornerRadius, 1f);
++        }
++    }
++
++    private void drawContentOnCanvas(Canvas canvas, float x, float y, float width, float height,
++            float cornerRadius) {
+         if (mTask != null && mTaskView.isRunningTask()
+                 && !mTaskView.getShouldShowScreenshot()) {
+             canvas.drawRoundRect(x, y, width, height, cornerRadius, cornerRadius, mClearPaint);
+diff --git a/src/com/android/launcher3/allapps/ActivityAllAppsContainerView.java b/src/com/android/launcher3/allapps/ActivityAllAppsContainerView.java
+index 9cdbf45..c80201d 100644
+--- a/src/com/android/launcher3/allapps/ActivityAllAppsContainerView.java
++++ b/src/com/android/launcher3/allapps/ActivityAllAppsContainerView.java
+@@ -87,6 +87,7 @@ import com.android.launcher3.model.StringCache;
+ import com.android.launcher3.model.data.ItemInfo;
+ import com.android.launcher3.pm.UserCache;
+ import com.android.launcher3.recyclerview.AllAppsRecyclerViewPool;
++import com.android.launcher3.util.EinkUi;
+ import com.android.launcher3.util.ItemInfoMatcher;
+ import com.android.launcher3.util.Preconditions;
+ import com.android.launcher3.util.Themes;
+@@ -817,6 +818,10 @@ public class ActivityAllAppsContainerView<T extends Context & ActivityContext>
+             invalidateHeader();
+         }
+         getSearchView().setBackgroundResource(R.drawable.bg_all_apps_searchbox);
++        if (EinkUi.ENABLED) {
++            // E-ink: the search box is as white as the app list around it.
++            EinkUi.outline(getSearchView());
++        }
+         if (mSearchUiManager.getEditText() == null) {
+             return;
+         }
+diff --git a/src/com/android/launcher3/allapps/search/AppsSearchContainerLayout.java b/src/com/android/launcher3/allapps/search/AppsSearchContainerLayout.java
+index 9018dc6..b7f9f0e 100644
+--- a/src/com/android/launcher3/allapps/search/AppsSearchContainerLayout.java
++++ b/src/com/android/launcher3/allapps/search/AppsSearchContainerLayout.java
+@@ -44,6 +44,7 @@ import com.android.launcher3.allapps.PrivateProfileManager;
+ import com.android.launcher3.allapps.SearchUiManager;
+ import com.android.launcher3.search.SearchCallback;
+ import com.android.launcher3.util.ApiWrapper;
++import com.android.launcher3.util.EinkUi;
+ import com.android.launcher3.views.ActivityContext;
+ 
+ import java.util.ArrayList;
+@@ -83,6 +84,11 @@ public class AppsSearchContainerLayout extends ExtendedEditText
+ 
+         mContentOverlap =
+                 getResources().getDimensionPixelSize(R.dimen.all_apps_search_bar_content_overlap);
++
++        if (EinkUi.ENABLED) {
++            // E-ink: the search box is as white as the app list around it.
++            EinkUi.outline(this);
++        }
+     }
+ 
+     @Override
+diff --git a/src/com/android/launcher3/popup/ArrowPopup.java b/src/com/android/launcher3/popup/ArrowPopup.java
+index 56c4fb1..ebf7210 100644
+--- a/src/com/android/launcher3/popup/ArrowPopup.java
++++ b/src/com/android/launcher3/popup/ArrowPopup.java
+@@ -51,6 +51,7 @@ import com.android.launcher3.R;
+ import com.android.launcher3.Utilities;
+ import com.android.launcher3.dragndrop.DragLayer;
+ import com.android.launcher3.shortcuts.DeepShortcutView;
++import com.android.launcher3.util.EinkUi;
+ import com.android.launcher3.util.RunnableList;
+ import com.android.launcher3.util.Themes;
+ import com.android.launcher3.views.ActivityContext;
+@@ -275,6 +276,10 @@ public abstract class ArrowPopup<T extends Context & ActivityContext>
+                         }
+                         numVisibleShortcut++;
+                     }
++                    if (EinkUi.ENABLED) {
++                        // E-ink: the popup's shadow is too faint to show its edge.
++                        EinkUi.outline(view);
++                    }
+                 }
+ 
+                 setChildColor(view, backgroundColor, colorAnimator);
+diff --git a/src/com/android/launcher3/util/EinkUi.kt b/src/com/android/launcher3/util/EinkUi.kt
+new file mode 100644
+index 0000000..a707e20
+--- /dev/null
++++ b/src/com/android/launcher3/util/EinkUi.kt
+@@ -0,0 +1,110 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.launcher3.util
++
++import android.content.Context
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.drawable.GradientDrawable
++import android.util.Log
++import android.util.TypedValue
++import android.view.View
++
++/**
++ * The launcher's look on e-ink panels (debug.sysui.eink_palette=1, the property SystemUI uses for
++ * its two-tone palette). Such a panel shows greys and translucent scrims as dithered noise, so
++ * surfaces are plain paper (white, or black in dark mode) and their edges are solid ink lines.
++ */
++object EinkUi {
++
++    private const val OUTLINE_DP = 2f
++
++    @JvmField
++    val ENABLED: Boolean =
++        try {
++            // SystemProperties is not in the SDK that the non-quickstep launcher builds against.
++            Class.forName("android.os.SystemProperties")
++                .getMethod("getBoolean", String::class.java, Boolean::class.javaPrimitiveType)
++                .invoke(null, "debug.sysui.eink_palette", false) as Boolean
++        } catch (e: Exception) {
++            Log.w("EinkUi", "Unable to read the e-ink property", e)
++            false
++        }
++
++    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
++
++    private fun isNight(context: Context) = context.resources.configuration.isNightModeActive
++
++    /** The colour of plain surfaces. */
++    @JvmStatic fun paperColor(context: Context) = if (isNight(context)) Color.BLACK else Color.WHITE
++
++    /** The colour of text and outlines. */
++    @JvmStatic fun inkColor(context: Context) = if (isNight(context)) Color.WHITE else Color.BLACK
++
++    /** The outline width in pixels. */
++    @JvmStatic
++    fun outlineWidth(context: Context) =
++        TypedValue.applyDimension(
++            TypedValue.COMPLEX_UNIT_DIP,
++            OUTLINE_DP,
++            context.resources.displayMetrics,
++        )
++
++    /** Gives a shape drawable a solid outline. Other drawables are left as they are. */
++    @JvmStatic
++    fun outline(view: View) {
++        val background = view.background
++        if (background is GradientDrawable) {
++            (background.mutate() as GradientDrawable).setStroke(
++                Math.round(outlineWidth(view.context)),
++                inkColor(view.context),
++            )
++        }
++    }
++
++    /**
++     * Draws a solid outline just inside the given rounded rectangle. [scale] is the scale of the
++     * view the canvas belongs to, so the line keeps its width on screen. Main thread only.
++     */
++    @JvmStatic
++    fun drawOutline(
++        view: View,
++        canvas: Canvas,
++        left: Float,
++        top: Float,
++        right: Float,
++        bottom: Float,
++        radiusX: Float,
++        radiusY: Float,
++        scale: Float,
++    ) {
++        val width = outlineWidth(view.context) / (if (scale > 0f) scale else 1f)
++        val half = width / 2f
++        paint.strokeWidth = width
++        paint.color = inkColor(view.context)
++        canvas.drawRoundRect(
++            left + half,
++            top + half,
++            right - half,
++            bottom - half,
++            Math.max(radiusX - half, 0f),
++            Math.max(radiusY - half, 0f),
++            paint,
++        )
++    }
++}
+diff --git a/src/com/android/launcher3/util/Themes.java b/src/com/android/launcher3/util/Themes.java
+index 927a2a4..b45fb18 100644
+--- a/src/com/android/launcher3/util/Themes.java
++++ b/src/com/android/launcher3/util/Themes.java
+@@ -94,6 +94,18 @@ public class Themes {
+     }
+ 
+     public static int getAttrColor(Context context, int attr) {
++        if (EinkUi.ENABLED) {
++            // E-ink: the scrims behind recents and the app list are plain paper, not a
++            // translucent grey.
++            if (attr == R.attr.overviewScrimColor || attr == R.attr.allAppsScrimColor
++                    || attr == R.attr.allappsHeaderProtectionColor) {
++                return EinkUi.paperColor(context);
++            }
++            if (attr == R.attr.overviewScrimForegroundPrimary
++                    || attr == R.attr.overviewScrimForegroundSecondary) {
++                return Color.TRANSPARENT;
++            }
++        }
+         return GraphicsUtils.getAttrColor(context, attr);
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

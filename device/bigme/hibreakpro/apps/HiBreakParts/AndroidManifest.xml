@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.lineageos.hibreak.parts"
+    android:sharedUserId="android.uid.system">
+
+    <!-- Sleep screen: weather from Open-Meteo, the next event from the calendar provider -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.EXPAND_STATUS_BAR" />
+
+    <!-- Protected broadcasts MediaTek's stock ImsService registers for without an explicit
+         RECEIVER_EXPORTED/NOT_EXPORTED flag (targetSdk 34). Stock declared these in
+         system_ext/app/mediatek-res/mediatek-res.apk; without them BroadcastController throws
+         SecurityException on startup (docs/volte.md). -->
+    <protected-broadcast android:name="com.mediatek.common.carrierexpress.operator_config_changed" />
+    <protected-broadcast android:name="com.mediatek.ims.ACTION_VODATA_PDN_STATUS" />
+    <protected-broadcast android:name="com.mediatek.ims.MTK_RCS_REG_STATE" />
+
+    <application
+        android:name=".PartsApp"
+        android:label="@string/app_name"
+        android:persistent="true"
+        android:directBootAware="true"
+        android:defaultToDeviceProtectedStorage="true"
+        android:theme="@style/Theme.SubSettingsBase">
+
+        <!-- Settings > Display > E-ink & front light; also long-press on the tiles -->
+        <activity
+            android:name=".SettingsActivity"
+            android:label="@string/settings_title"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.android.settings.action.IA_SETTINGS" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+            </intent-filter>
+            <meta-data android:name="com.android.settings.category"
+                android:value="com.android.settings.category.ia.display" />
+            <meta-data android:name="com.android.settings.summary"
+                android:resource="@string/settings_summary" />
+            <meta-data android:name="com.android.settings.order" android:value="-100" />
+        </activity>
+
+        <service
+            android:name=".WeatherJobService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <service
+            android:name=".EinkRefreshTile"
+            android:label="@string/tile_refresh"
+            android:icon="@drawable/ic_eink"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="false" />
+        </service>
+
+        <service
+            android:name=".EinkModeTile"
+            android:label="@string/tile_mode"
+            android:icon="@drawable/ic_eink_mode"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".FrontLightWarmthTile"
+            android:label="@string/tile_warmth"
+            android:icon="@drawable/ic_frontlight"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

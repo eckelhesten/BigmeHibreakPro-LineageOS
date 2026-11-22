@@ -1,0 +1,360 @@
+From cd2e461edc3f730b6dd12744ceb0888df4abe8b3 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 21 Nov 2026 12:13:14 +0100
+Subject: [PATCH] e-ink: sleep screen, doze wakelock, and slider fixes
+
+---
+ .../brightness/ui/compose/BrightnessSlider.kt |  2 +-
+ .../systemui/doze/EinkDozeScreenOff.java      | 19 +++--
+ .../systemui/shade/EinkSleepScreen.java       | 85 ++++++++++++++-----
+ .../systemui/shade/EinkWeatherIcon.java       | 46 ++++++++--
+ 4 files changed, 112 insertions(+), 40 deletions(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt b/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt
+index fa3f774..78bee33 100644
+--- a/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt
++++ b/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt
+@@ -628,11 +628,11 @@ private suspend fun Animatable<Float, AnimationVector1D>.disappear() =
+     animateTo(targetValue = 0f, animationSpec = IconDisappearSpec)
+ 
+-@VisibleForTesting
+ /** E-ink panels (debug.sysui.eink_palette=1): outline the slider track. */
+ private val EINK_SLIDER_OUTLINE: Boolean =
+     android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)
+ private val EinkSliderOutlineWidth = 2.dp
+ 
++@VisibleForTesting
+ object BrightnessSliderMotionTestKeys {
+     val AnimatingIcon = MotionTestValueKey<Boolean>("animatingIcon")
+     val ActiveIconAlpha = MotionTestValueKey<Float>("activeIconAlpha")
+diff --git a/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java b/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
+index b55954d..72274e7 100644
+--- a/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
++++ b/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
+@@ -38,11 +38,14 @@ final class EinkDozeScreenOff {
+ 
+     private final DozeMachine.Service mService;
+     private final Handler mHandler;
++    private final WakeLock mRawWakeLock;
+     private final SettableWakeLock mWakeLock;
+     private final Runnable mTurnOff = this::turnOff;
+ 
+     /** The always-on state the doze machine asked for, or STATE_UNKNOWN when it wants another. */
+     private int mAlwaysOnState = Display.STATE_UNKNOWN;
++    /** Generation counter isolating posted time-tick updates from prior doze sessions. */
++    private volatile int mSessionGen;
+     /** The display is off on our account while the doze machine wants it always on. */
+     private boolean mOff;
+     private int mSleepDelay = 3000;
+@@ -51,6 +54,7 @@ final class EinkDozeScreenOff {
+     EinkDozeScreenOff(DozeMachine.Service service, Handler handler, WakeLock wakeLock) {
+         mService = service;
+         mHandler = handler;
++        mRawWakeLock = wakeLock;
+         mWakeLock = new SettableWakeLock(wakeLock, TAG);
+         sInstance = this;
+     }
+@@ -59,6 +63,7 @@ final class EinkDozeScreenOff {
+     void setDozeScreenState(int state) {
+         if (state == Display.STATE_DOZE || state == Display.STATE_DOZE_SUSPEND) {
+             if (mAlwaysOnState == Display.STATE_UNKNOWN) {
++                mSessionGen++;
+                 mSleepDelay = SystemProperties.getInt("debug.sysui.eink_sleep.off_ms", 3000);
+                 mTickDelay = SystemProperties.getInt("debug.sysui.eink_sleep.tick_ms", 1500);
+             } else if (mOff) {
+@@ -73,6 +78,7 @@ final class EinkDozeScreenOff {
+             mAlwaysOnState = state;
+             scheduleOff(mSleepDelay);
+         } else {
++            mSessionGen++;
+             mHandler.removeCallbacks(mTurnOff);
+             mOff = false;
+             mService.setDozeScreenState(state);
+@@ -83,6 +89,7 @@ final class EinkDozeScreenOff {
+ 
+     /** Dozing ends; main thread. */
+     void cancel() {
++        mSessionGen++;
+         mHandler.removeCallbacks(mTurnOff);
+         mAlwaysOnState = Display.STATE_UNKNOWN;
+         mOff = false;
+@@ -101,16 +108,14 @@ final class EinkDozeScreenOff {
+     static void onTimeTick() {
+         EinkDozeScreenOff instance = sInstance;
+         if (instance != null) {
+-            // Hold the wakelock until showUpdate() runs and either schedules turnOff() or
+-            // releases it, so the CPU cannot suspend before the display comes back on.
+-            instance.mWakeLock.setAcquired(true);
+-            instance.mHandler.post(instance::showUpdate);
++            final int gen = instance.mSessionGen;
++            // Hold a refcounted WakeLock wrapper across post() so mWakeLock stays main-thread only.
++            instance.mHandler.post(instance.mRawWakeLock.wrap(() -> instance.showUpdate(gen)));
+         }
+     }
+ 
+-    private void showUpdate() {
+-        if (mAlwaysOnState == Display.STATE_UNKNOWN) {
+-            mWakeLock.setAcquired(false);
++    private void showUpdate(int gen) {
++        if (gen != mSessionGen || mAlwaysOnState == Display.STATE_UNKNOWN) {
+             return;
+         }
+         mHandler.removeCallbacks(mTurnOff);
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+index 443a175..a00ea7a 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+@@ -39,6 +39,7 @@ import com.android.systemui.statusbar.notification.row.ExpandableNotificationRow
+ import com.android.systemui.statusbar.notification.shared.NotificationBundleUi;
+ import com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayoutController;
+ 
++import java.io.File;
+ import java.time.Instant;
+ import java.time.LocalDate;
+ import java.time.ZoneId;
+@@ -93,6 +94,7 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+             SystemProperties.getBoolean("debug.sysui.eink_palette", false)
+                     && SystemProperties.getBoolean("debug.sysui.eink_sleep", true);
+     private static final String FONT = "google-sans-flex";
++    private static final File CLOCK_FONT_FILE = new File("/product/fonts/GoogleSansFlex-Regular.ttf");
+     private static final int MAX_ICONS = 6;
+     private static final String WEATHER_DATA = "hibreak_sleep_weather_data";
+     private static final String CALENDAR_DATA = "hibreak_sleep_calendar_data";
+@@ -108,9 +110,11 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+     private final Rect mBounds = new Rect();
+     private final List<Drawable> mIcons = new ArrayList<>();
+     private Typeface mTimeTypeface;
++    private boolean mTimeTypefaceIsFlex;
+     private int mTimeTypefaceWeight = -1;
+     private final Typeface mTextTypeface = typeface(500);
+     private final Typeface mFooterTypeface = typeface(400);
++    private String mBatteryText;
+     private int mWeight = 500;
+     private float mSize = 0.52f;
+     private boolean mShowIcons = true;
+@@ -213,6 +217,7 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         if (getVisibility() != VISIBLE) return;
+         loadIcons();
+         loadCorners();
++        loadBattery();
+         invalidate();
+     }
+ 
+@@ -268,8 +273,10 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+             if (f != null && f.length == 7 && "1".equals(f[0])) {
+                 f = new String[] {f[0], f[1], f[2], f[3], f[4], f[5], "", "", f[6]};
+             }
++            final long age = f != null && f.length == 9 ? now - Long.parseLong(f[5]) : Long.MAX_VALUE;
+             if (f != null && f.length == 9 && ("1".equals(f[0]) || "2".equals(f[0]))
+-                    && now - Long.parseLong(f[5]) < WEATHER_MAX_AGE && !f[8].isEmpty()) {
++                    && age >= -DateUtils.HOUR_IN_MILLIS && age < WEATHER_MAX_AGE
++                    && !f[8].isEmpty()) {
+                 final boolean fahrenheit = "f".equals(f[4]);
+                 final double celsius = Double.parseDouble(f[3]);
+                 if (!Double.isFinite(celsius)) throw new NumberFormatException("non-finite temp");
+@@ -304,6 +311,37 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         return Typeface.create(Typeface.create(FONT, Typeface.NORMAL), weight, false);
+     }
+ 
++    private Typeface clockTypeface(int weight) {
++        if (CLOCK_FONT_FILE.isFile()) {
++            try {
++                Typeface tf = new Typeface.Builder(CLOCK_FONT_FILE)
++                        .setFontVariationSettings("'wght' " + weight + ", 'opsz' 144")
++                        .build();
++                mTimeTypefaceIsFlex = true;
++                return tf;
++            } catch (RuntimeException e) {
++                Log.w(TAG, "clock typeface fallback", e);
++            }
++        }
++        mTimeTypefaceIsFlex = false;
++        return typeface(weight);
++    }
++
++    private void loadBattery() {
++        mBatteryText = null;
++        if (!mShowBattery) return;
++        Intent battery = mContext.registerReceiver(null,
++                new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
++        if (battery != null) {
++            int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
++            int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
++            boolean charging = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
++            if (level >= 0 && scale > 0) {
++                mBatteryText = (charging ? "⚡︎ " : "") + (level * 100 / scale) + " %";
++            }
++        }
++    }
++
+     @Override
+     protected void onDraw(Canvas canvas) {
+         final int w = getWidth();
+@@ -325,12 +363,13 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+ 
+         // The numerals: two lines, centred, their block starting at 17 % of the height.
+         if (mTimeTypeface == null || mTimeTypefaceWeight != mWeight) {
+-            mTimeTypeface = typeface(mWeight);
++            mTimeTypeface = clockTypeface(mWeight);
+             mTimeTypefaceWeight = mWeight;
+         }
+         mTimePaint.setColor(fg);
+         mTimePaint.setTypeface(mTimeTypeface);
+-        mTimePaint.setFontVariationSettings("'wght' " + mWeight + ", 'opsz' 144");
++        mTimePaint.setFontVariationSettings(
++                mTimeTypefaceIsFlex ? "'wght' " + mWeight + ", 'opsz' 144" : "'wght' " + mWeight);
+         mTimePaint.setFontFeatureSettings("tnum");
+         mTimePaint.setTextSize(ref * mSize);
+         mTimePaint.setTextAlign(Paint.Align.CENTER);
+@@ -371,20 +410,10 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         if (footer) drawFooter(canvas, w, h, fg, bg);
+ 
+         // Battery, small, at the bottom (at the top while the footer is shown).
+-        if (mShowBattery) {
+-            Intent battery = mContext.registerReceiver(null,
+-                    new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+-            if (battery != null) {
+-                int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+-                int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+-                boolean charging = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
+-                if (level >= 0 && scale > 0) {
+-                    mTextPaint.setTextSize(ref * 0.042f);
+-                    String text = (charging ? "⚡︎ " : "") + (level * 100 / scale) + " %";
+-                    canvas.drawText(text, w / 2f, footer ? ref * 0.10f : h - ref * 0.12f,
+-                            mTextPaint);
+-                }
+-            }
++        if (mShowBattery && mBatteryText != null) {
++            mTextPaint.setTextSize(ref * 0.042f);
++            canvas.drawText(mBatteryText, w / 2f, footer ? ref * 0.10f : h - ref * 0.12f,
++                    mTextPaint);
+         }
+     }
+ 
+@@ -452,12 +481,21 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+     /** "Today 14:00", "Tomorrow 09:30", "Thu 10:00"; "Today 14:00–15:00" while it runs. */
+     private String describeWhen(long now) {
+         final boolean running = mEventBegin <= now;
+-        final String day = dayLabel(running ? now : mEventBegin, now);
+-        if (mEventAllDay) return day;
++        if (mEventAllDay) return dayLabel(running ? now : mEventBegin, now);
+         final java.text.DateFormat time = DateFormat.getTimeFormat(mContext);
+         final String start = time.format(new Date(mEventBegin));
+-        return running ? day + " " + start + "\u2013" + time.format(new Date(mEventEnd))
+-                : day + " " + start;
++        if (!running) {
++            return dayLabel(mEventBegin, now) + " " + start;
++        }
++        final ZoneId zone = ZoneId.systemDefault();
++        final LocalDate startDay = LocalDate.ofInstant(Instant.ofEpochMilli(mEventBegin), zone);
++        final LocalDate endDay = LocalDate.ofInstant(Instant.ofEpochMilli(mEventEnd), zone);
++        final String end = time.format(new Date(mEventEnd));
++        if (startDay.equals(endDay)) {
++            return dayLabel(now, now) + " " + start + "\u2013" + end;
++        }
++        return dayLabel(mEventBegin, now) + " " + start + "\u2013"
++                + dayLabel(mEventEnd, now) + " " + end;
+     }
+ 
+     private String dayLabel(long when, long now) {
+@@ -465,12 +503,13 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         final long days = ChronoUnit.DAYS.between(
+                 LocalDate.ofInstant(Instant.ofEpochMilli(now), zone),
+                 LocalDate.ofInstant(Instant.ofEpochMilli(when), zone));
+-        if (days <= 1) {
++        if (days >= 0 && days <= 1) {
+             // "Today", "Tomorrow" in the phone's language.
+             return DateUtils.getRelativeTimeSpanString(when, now, DateUtils.DAY_IN_MILLIS)
+                     .toString();
+         }
++        final String skeleton = (days > 1 && days < 7) ? "EEE" : "EEEdMMM";
+         return DateFormat.format(
+-                DateFormat.getBestDateTimePattern(Locale.getDefault(), "EEE"), when).toString();
++                DateFormat.getBestDateTimePattern(Locale.getDefault(), skeleton), when).toString();
+     }
+ }
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java b/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java
+index 4ddd209..12e9854 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java
+@@ -12,7 +12,9 @@ import android.graphics.Path;
+ import android.graphics.RectF;
+ 
+ import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * Weather icons for the e-ink sleep screen: plain line drawings in one colour, with solid
+@@ -30,18 +32,44 @@ final class EinkWeatherIcon {
+     /** Filled with the background: hides what is behind (the sun behind a cloud). */
+     private static final int KNOCKOUT = 2;
+ 
++    private static final class CachedIcon {
++        final List<Path> paths;
++        final List<Integer> modes;
++        final RectF bare;
++
++        CachedIcon(List<Path> paths, List<Integer> modes, RectF bare) {
++            this.paths = paths;
++            this.modes = modes;
++            this.bare = bare;
++        }
++    }
++
++    private static final Map<String, CachedIcon> CACHE = new HashMap<>();
++
+     private EinkWeatherIcon() {}
+ 
++    private static CachedIcon getIcon(String kind, boolean day) {
++        final String key = kind + "|" + (day ? "1" : "0");
++        synchronized (CACHE) {
++            CachedIcon cached = CACHE.get(key);
++            if (cached != null) return cached;
++            List<Path> paths = new ArrayList<>();
++            List<Integer> modes = new ArrayList<>();
++            build(kind, day, paths, modes);
++            cached = new CachedIcon(paths, modes, inkBounds(paths, modes, 0f));
++            CACHE.put(key, cached);
++            return cached;
++        }
++    }
++
+     /** The width {@link #draw} takes for this icon at this height. */
+     static float width(String kind, boolean day, float height) {
+-        List<Path> paths = new ArrayList<>();
+-        List<Integer> modes = new ArrayList<>();
+-        build(kind, day, paths, modes);
+-        RectF bare = inkBounds(paths, modes, 0f);
++        CachedIcon icon = getIcon(kind, day);
++        RectF bare = icon.bare;
+         if (bare == null || bare.isEmpty()) return 0;
+         final float strokeUnits = height * STROKE_OF_HEIGHT
+                 / Math.min(height / bare.height(), height * 1.3f / bare.width());
+-        RectF ink = inkBounds(paths, modes, strokeUnits);
++        RectF ink = inkBounds(icon.paths, icon.modes, strokeUnits);
+         return ink.width() * Math.min(height / ink.height(), height * 1.3f / ink.width());
+     }
+ 
+@@ -51,13 +79,13 @@ final class EinkWeatherIcon {
+      */
+     static float draw(Canvas canvas, String kind, boolean day, float left, float centerY,
+             float height, int fg, int bg) {
+-        List<Path> paths = new ArrayList<>();
+-        List<Integer> modes = new ArrayList<>();
+-        build(kind, day, paths, modes);
++        CachedIcon icon = getIcon(kind, day);
++        List<Path> paths = icon.paths;
++        List<Integer> modes = icon.modes;
+ 
+         // Ink bounds in unit coordinates; strokes reach half their width beyond the path. The
+         // stroke is set in pixels, so size once without it and once with it.
+-        RectF bare = inkBounds(paths, modes, 0f);
++        RectF bare = icon.bare;
+         if (bare == null || bare.isEmpty()) return 0;
+         final float strokeUnits = height * STROKE_OF_HEIGHT
+                 / Math.min(height / bare.height(), height * 1.3f / bare.width());
+-- 
+2.50.1 (Apple Git-155)
+

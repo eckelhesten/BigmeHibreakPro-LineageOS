@@ -1,0 +1,30 @@
+From 10b204de7c15350ae0a22761c11189db1ea5639a Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Sun, 22 Nov 2026 00:30:28 +0000
+Subject: [PATCH] config: let devices turn mobile data on by default
+
+ro.com.android.mobiledata=false is a plain assignment, so a device that
+sets ro.com.android.mobiledata=true fails the build with a duplicate
+sysprop. Make it an optional default (?=) a device can override.
+
+Change-Id: I0b9e0b9958ae609d6abddc3d5e8fd9dfd650c85f
+---
+ config/telephony.mk | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/config/telephony.mk b/config/telephony.mk
+index 6881846..f9e3cd9 100644
+--- a/config/telephony.mk
++++ b/config/telephony.mk
+@@ -25,6 +25,6 @@ PRODUCT_PRODUCT_PROPERTIES += \
+ PRODUCT_PRODUCT_PROPERTIES += \
+     net.tethering.noprovisioning=true
+ 
+-# Disable mobile data by default
++# Disable mobile data by default (a device may turn it on with ro.com.android.mobiledata=true)
+ PRODUCT_PRODUCT_PROPERTIES += \
+-    ro.com.android.mobiledata=false
++    ro.com.android.mobiledata?=false
+-- 
+2.43.0
+

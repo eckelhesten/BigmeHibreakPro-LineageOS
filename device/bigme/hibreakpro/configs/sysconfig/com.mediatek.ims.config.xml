@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- As on stock: the IMS service may read the location for emergency calls (and reports it to
+     the network) even when the user has location off. -->
+<config>
+    <allow-ignore-location-settings package="com.mediatek.ims" attributionTag="*" />
+</config>

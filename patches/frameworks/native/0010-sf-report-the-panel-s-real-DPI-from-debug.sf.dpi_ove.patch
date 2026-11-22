@@ -1,0 +1,54 @@
+From 02407d45a1ff0ad2d1bd2a2ececfc51a519b522b Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 17 Nov 2026 19:35:04 +0100
+Subject: [PATCH 10/10] sf: report the panel's real DPI from debug.sf.dpi_override
+
+The HiBreak Pro's composer reports 667.61 x 188.55 dpi for its 300 ppi
+panel (bogus panel dimensions), so Display.getRealMetrics() has xdpi
+188.55 and ydpi 667.61. Everything measured in physical inches goes
+wrong with that. SystemUI's falsing check, for one, then wants a swipe
+of 1318 px (80 % of the screen height) before it lets the bouncer stay
+open: swiping up on the lock screen bounced back to it.
+
+debug.sf.dpi_override, when set, replaces both values for internal
+displays.
+---
+ services/surfaceflinger/SurfaceFlinger.cpp | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 7c7fe7d..8cd543f 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -4006,6 +4006,15 @@ std::pair<DisplayModes, DisplayModePtr> SurfaceFlinger::loadDisplayModes(
+                                                });
+     ++nextModeId;
+ 
++    // debug.sf.dpi_override (HiBreak Pro): the panel's real density for both axes. Its composer
++    // reports 667.61 x 188.55 dpi for a 300 ppi panel, and everything measured in inches goes
++    // wrong with that, e.g. SystemUI's falsing check wants a swipe of 80 % of the screen height
++    // before the bouncer may stay open. Internal displays only.
++    const int dpiOverride = getHwComposer().getDisplayConnectionType(displayId) ==
++                    ui::DisplayConnectionType::Internal
++            ? base::GetIntProperty("debug.sf.dpi_override"s, 0)
++            : 0;
++
+     DisplayModes newModes;
+     for (const auto& hwcMode : hwcModes) {
+         const auto id = nextModeId++;
+@@ -4016,8 +4025,10 @@ std::pair<DisplayModes, DisplayModePtr> SurfaceFlinger::loadDisplayModes(
+                                      .setResolution({hwcMode.width, hwcMode.height})
+                                      .setVsyncPeriod(hwcMode.vsyncPeriod)
+                                      .setVrrConfig(hwcMode.vrrConfig)
+-                                     .setDpiX(hwcMode.dpiX)
+-                                     .setDpiY(hwcMode.dpiY)
++                                     .setDpiX(dpiOverride > 0 ? static_cast<float>(dpiOverride)
++                                                              : hwcMode.dpiX)
++                                     .setDpiY(dpiOverride > 0 ? static_cast<float>(dpiOverride)
++                                                              : hwcMode.dpiY)
+                                      .setGroup(hwcMode.configGroup)
+                                      .setHdrOutputType(hwcMode.hdrOutputType)
+                                      .build());
+-- 
+2.50.1 (Apple Git-155)
+

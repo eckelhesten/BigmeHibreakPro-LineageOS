@@ -1,0 +1,42 @@
+From 60ead4375df68c1360fae619a74775896e349e73 Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Fri, 13 Nov 2026 13:43:52 +0000
+Subject: [PATCH] sf: allow forcing GPU composition from a property
+
+debug.sf.force_client_composition=1 starts SurfaceFlinger with forced
+client (GPU) composition, the same state as the developer-option
+transaction 1008, so the composer only ever gets one full-screen
+client target.
+
+On the Bigme HiBreak Pro (MT6877, landscape-native e-ink panel with
+primary_display_orientation=270), the vendor composer rotates every app
+layer through the MDP blit engine. That path waits on a fence that
+never signals (MDP: "DpPath: RootAndLeaf[1] waitFence failed -26", 1 s
+per frame), so nothing reaches the panel after the boot animation.
+GPU composition hands it an already rotated buffer and the panel
+updates. On e-ink the extra GPU pass costs little.
+
+Change-Id: Icdf15d697c72113e90a32809422aaa61912eee24
+---
+ services/surfaceflinger/SurfaceFlinger.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 0ab1a9b..d1dcc3d 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -556,6 +556,11 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
+     mIgnoreHwcPhysicalDisplayOrientation =
+             base::GetBoolProperty("debug.sf.ignore_hwc_physical_display_orientation"s, false);
+ 
++    // Start with forced client (GPU) composition, like developer-option transaction 1008. For
++    // composers that can't handle device composition of rotated layers (MT6877 e-ink: the MDP
++    // rotation path never completes its fences).
++    mDebugDisableHWC = base::GetBoolProperty("debug.sf.force_client_composition"s, false);
++
+     // We should be reading 'persist.sys.sf.color_saturation' here
+     // but since /data may be encrypted, we need to wait until after vold
+     // comes online to attempt to read the property. The property is
+-- 
+2.43.0
+

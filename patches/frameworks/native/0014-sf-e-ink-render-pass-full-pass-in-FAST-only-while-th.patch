@@ -1,0 +1,89 @@
+From 9f182b5c1fdeecbbb4cc838a93bc0b5af121de82 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Fri, 20 Nov 2026 21:10:13 +0000
+Subject: [PATCH] sf: e-ink render pass: full pass in FAST only while the
+ keyboard is up
+
+FAST (A2) is both the scrolling mode and the typing mode. The render
+pass's full analysis made scrolling worse: on a Wikipedia article, two
+runs each on the same build (scripts/eink-bench/dynamic.py), 24-27 % of
+the panel frames of a drag got no new content with the full pass in
+FAST, against 0-2 % with the cheap pass (tone curve and dither only) and
+10 % with the old enhancement pass; drag cadence CV 0.72 / 0.28 / 0.53,
+touch to first panel update 88 / 78 / 85 ms.
+
+While typing, though, the full pass keeps the keyboard's key outlines and
+solid text. EinkMotion now publishes whether the keyboard is visible
+(vendor.xrz.hibreak_ime_visible, a property SurfaceFlinger may set, written
+only when it changes), and
+debug.sf.eink.fast_full chooses: 2 (default) = full pass while the
+keyboard is up, cheap otherwise; 1 = always full; 0 = always cheap.
+
+Change-Id: I88a75648cb1698fe95cf56454b88a90af3c752f4
+---
+ .../CompositionEngine/src/Output.cpp            | 17 ++++++++++++-----
+ .../DisplayHardware/EinkMotion.cpp              |  6 ++++++
+ .../surfaceflinger/DisplayHardware/EinkMotion.h |  1 +
+ 3 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index 6e6f4aa..d1368b0 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -1606,12 +1606,19 @@ EinkEnhance getEinkEnhance() {
+             // (HD, CLEAN, GL16) 16 levels.
+             switch (mode) {
+                 case 0xb3: case 0x10: case 0x11: case 0xb7:
+-                    // FAST is also the typing mode (the whole time the keyboard is up), so by
+-                    // default it gets the full pass too: key outlines and solid text stay, and
+-                    // nothing changes look when a scroll ends. debug.sf.eink.fast_full=0: the
+-                    // cheap version (tone and dither only) for a shorter composition.
+-                    c.mode = base::GetBoolProperty("debug.sf.eink.fast_full", true) ? 0 : 1;
++                {
++                    // FAST is the scrolling mode and the typing mode (the whole time the keyboard
++                    // is up). Scrolling gets the cheap version (tone and dither only): with the
++                    // full pass a quarter of the panel frames of a drag got no new content.
++                    // Typing gets the full pass, so key outlines and solid text stay.
++                    // debug.sf.eink.fast_full: 2 = by the keyboard (EinkMotion publishes
++                    // vendor.xrz.hibreak_ime_visible), 1 = always full, 0 = always cheap.
++                    const uint32_t full =
++                            base::GetUintProperty<uint32_t>("debug.sf.eink.fast_full", 2u);
++                    const bool ime = base::GetBoolProperty("vendor.xrz.hibreak_ime_visible", false);
++                    c.mode = (full == 1 || (full == 2 && ime)) ? 0 : 1;
+                     break;
++                }
+                 case 0xb1: case 0x21: case 0xb0: case 0x04: case 0x20: case 0x84: case 0x40:
+                 case 0xb4:
+                     c.mode = 2;
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index 77f2609..5762346 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -173,6 +173,12 @@ void EinkMotion::onComposite(bool imeVisible) {
+     mStreak = (mLastFrame != 0 && now - mLastFrame <= mConfig.gap) ? mStreak + 1 : 1;
+     mLastFrame = now;
+     mImeVisible = imeVisible;
++    if (imeVisible != mImePublished) {
++        // SurfaceFlinger's e-ink render pass gives FAST frames the full pass while the keyboard
++        // is up (typing) and the cheap one otherwise (scrolling): debug.sf.eink.fast_full.
++        mImePublished = imeVisible;
++        base::SetProperty("vendor.xrz.hibreak_ime_visible", imeVisible ? "1" : "0");
++    }
+     if (mFrozen) {
+         // The thread lets the panel go once the frames stop.
+         mCondition.notify_one();
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index f80a657..78473df 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -102,6 +102,7 @@ private:
+     nsecs_t mLastFrame = 0;
+     uint32_t mStreak = 0;
+     bool mImeVisible = false;
++    bool mImePublished = false;
+     bool mFast = false;    // the property holds our fast mode
+     uint32_t mBase = 0;    // the mode to put back
+     uint32_t mWritten = 0; // what we wrote, to notice when someone else changes the mode
+-- 
+2.43.0
+

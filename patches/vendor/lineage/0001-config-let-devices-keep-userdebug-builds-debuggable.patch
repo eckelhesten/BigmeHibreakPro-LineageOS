@@ -1,0 +1,38 @@
+From 4e52dd1313417f70ac4afac0367c1bb53097fdd8 Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Fri, 13 Nov 2026 10:38:57 +0100
+Subject: [PATCH] config: let devices keep userdebug builds debuggable
+
+PRODUCT_NOT_DEBUGGABLE_IN_USERDEBUG makes userdebug builds ro.debuggable=0.
+adbd then defers to the framework and refuses every service (shell,
+sync, reboot all fail with 'error: closed') whenever system_server or
+the display stack is not up, which is exactly the bring-up case.
+
+The flag is passed to Soong with add_json_bool, so any non-empty value
+means true and a device cannot reset it to false from its own product
+makefile. Add an opt-out variable instead.
+---
+ config/common.mk | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/config/common.mk b/config/common.mk
+index 903fcd0..10cb854 100644
+--- a/config/common.mk
++++ b/config/common.mk
+@@ -39,9 +39,12 @@ else
+ # Enable ADB authentication
+ PRODUCT_SYSTEM_EXT_PROPERTIES += ro.adb.secure=1
+ 
+-# Set ro.debuggable=0 for userdebug
++# Set ro.debuggable=0 for userdebug, unless the device opts out for bring-up
++# (LINEAGE_DEBUGGABLE_USERDEBUG := true in its product makefile, set before inheriting this one).
++ifneq ($(LINEAGE_DEBUGGABLE_USERDEBUG),true)
+ PRODUCT_NOT_DEBUGGABLE_IN_USERDEBUG := true
+ endif
++endif
+ 
+ # Disable extra StrictMode features on all non-engineering builds
+ PRODUCT_PRODUCT_PROPERTIES += persist.sys.strictmode.disable=true
+-- 
+2.50.1 (Apple Git-155)
+

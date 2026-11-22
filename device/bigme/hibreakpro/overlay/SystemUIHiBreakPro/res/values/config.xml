@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- E-ink tiles from HiBreakParts first: full refresh, refresh mode, front light warmth. -->
+<resources>
+    <!-- Both lists: QSHost takes _new_default only while QS is drawn in Compose
+         (QsInCompose), the plain default otherwise. -->
+    <string name="quick_settings_tiles_default" translatable="false">custom(org.lineageos.hibreak.parts/.EinkRefreshTile),custom(org.lineageos.hibreak.parts/.EinkModeTile),custom(org.lineageos.hibreak.parts/.FrontLightWarmthTile),internet,bt,dnd,airplane,rotation,battery,flashlight,alarm,cast,screenrecord,controls,wallet,mictoggle,cameratoggle</string>
+    <string name="quick_settings_tiles_new_default" translatable="false">custom(org.lineageos.hibreak.parts/.EinkRefreshTile),custom(org.lineageos.hibreak.parts/.EinkModeTile),custom(org.lineageos.hibreak.parts/.FrontLightWarmthTile),internet,bt,dnd,airplane,rotation,battery,flashlight,alarm,cast,screenrecord</string>
+
+    <!-- Lets SystemUI ask for the doze display states (without it DOZE becomes ON). This alone
+         does not let the CPU sleep: the composer has no doze mode, so SurfaceFlinger runs DOZE
+         and DOZE_SUSPEND with the display fully on, and the display driver holds
+         cmdq_wake_lock (measured 2026-11-17: 42 mAh/h, never suspended). The CPU sleeps
+         because SystemUI turns the display off between minute updates (frameworks/base 0017,
+         EinkDozeScreenOff); the panel keeps the picture. -->
+    <bool name="doze_display_state_supported">true</bool>
+</resources>

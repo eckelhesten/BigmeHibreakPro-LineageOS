@@ -1,0 +1,215 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 21 Nov 2026 10:49:11 +0100
+Subject: [PATCH] renderengine: e-ink pass reads an offscreen frame, no
+ full-frame copy
+
+The e-ink pass took makeImageSnapshot() of the client target and drew
+back into it. A snapshot of a surface that is drawn into again makes
+Skia copy it (copy-on-write; for the wrapped client-target buffer the
+copy happens at the snapshot), so every frame, FAST scroll frames
+included, paid a 1648 x 824 RGBA copy on top of the composition.
+
+With an e-ink pass on, the layers are now composed into an offscreen
+surface (a pooled scratch texture, the way upstream's blur path does
+it) and the pass reads it with makeTemporaryImage() and writes the
+client target: no copy. If the pass draws nothing (its effect failed
+to compile) the frame is blitted, so the screen never goes blank. With
+a blur composition layer, which ends the frame on the client target,
+the snapshot stays. debug.sf.eink.offscreen=0 brings the old path back
+for comparison (runtime, read with the other e-ink settings).
+---
+ .../include/renderengine/DisplaySettings.h    |  6 +-
+ libs/renderengine/skia/SkiaRenderEngine.cpp   | 55 ++++++++++++++-----
+ libs/renderengine/skia/SkiaRenderEngine.h     |  6 +-
+ .../CompositionEngine/src/Output.cpp          |  4 ++
+ 4 files changed, 54 insertions(+), 17 deletions(-)
+
+diff --git a/libs/renderengine/include/renderengine/DisplaySettings.h b/libs/renderengine/include/renderengine/DisplaySettings.h
+index b0ae706..16a2657 100644
+--- a/libs/renderengine/include/renderengine/DisplaySettings.h
++++ b/libs/renderengine/include/renderengine/DisplaySettings.h
+@@ -129,6 +129,9 @@ struct DisplaySettings {
+     float einkMinTone = 1.f;
+     bool einkKnock = true;
+     bool einkInvert = false;
++    // E-ink: compose into an offscreen surface that the pass reads directly, instead of
++    // snapshotting the client target (a full-frame copy per frame). debug.sf.eink.offscreen.
++    bool einkOffscreen = true;
+ 
+     bool einkPass() const {
+         return einkRender >= 3 || einkEnhanceStrength > 0.f || einkBlack > 0.f || einkWhite < 1.f;
+@@ -197,7 +200,8 @@ static inline bool operator==(const DisplaySettings& lhs, const DisplaySettings&
+             lhs.einkContourSolid == rhs.einkContourSolid && lhs.einkBleach == rhs.einkBleach &&
+             lhs.einkCrush == rhs.einkCrush && lhs.einkGamma == rhs.einkGamma &&
+             lhs.einkGamma16 == rhs.einkGamma16 && lhs.einkMinTone == rhs.einkMinTone &&
+-            lhs.einkKnock == rhs.einkKnock && lhs.einkInvert == rhs.einkInvert;
++            lhs.einkKnock == rhs.einkKnock && lhs.einkInvert == rhs.einkInvert &&
++            lhs.einkOffscreen == rhs.einkOffscreen;
+ }
+ 
+ static const char* orientation_to_string(uint32_t orientation) {
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+index 6d84282..3f1e18d 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -835,17 +835,15 @@ static const char* const kEinkEnhanceSkSL = R"(
+     }
+ )";
+ 
+-void SkiaRenderEngine::drawEinkEnhance(const DisplaySettings& display,
+-                                       const sk_sp<SkSurface>& surface, SkCanvas* canvas) {
++bool SkiaRenderEngine::drawEinkEnhance(const DisplaySettings& display,
++                                       const sk_sp<SkImage>& frame, SkCanvas* canvas) {
+     SFTRACE_CALL();
+     static const sk_sp<SkRuntimeEffect> sEffect = [] {
+         auto [effect, error] = SkRuntimeEffect::MakeForShader(SkString(kEinkEnhanceSkSL));
+         if (!effect) ALOGE("e-ink enhance shader: %s", error.c_str());
+         return effect;
+     }();
+-    if (!sEffect) return;
+-    sk_sp<SkImage> frame = surface->makeImageSnapshot();
+-    if (!frame) return;
++    if (!sEffect || !frame) return false;
+     SkRuntimeShaderBuilder builder(sEffect);
+     builder.child("img") = frame->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
+                                              SkSamplingOptions(SkFilterMode::kNearest));
+@@ -867,6 +865,7 @@ void SkiaRenderEngine::drawEinkEnhance(const DisplaySettings& display,
+     SkAutoCanvasRestore restore(canvas, true);
+     canvas->resetMatrix();
+     canvas->drawPaint(paint);
++    return true;
+ }
+ 
+ // E-ink render pass, see DisplaySettings::einkRender. One pass over the composed frame; its
+@@ -1040,8 +1039,8 @@ static const char* const kEinkRenderHdSkSL = R"(
+     }
+ )";
+ 
+-void SkiaRenderEngine::drawEinkRender(const DisplaySettings& display,
+-                                      const sk_sp<SkSurface>& surface, SkCanvas* canvas) {
++bool SkiaRenderEngine::drawEinkRender(const DisplaySettings& display,
++                                      const sk_sp<SkImage>& frame, SkCanvas* canvas) {
+     SFTRACE_CALL();
+     static const sk_sp<SkRuntimeEffect> sEffectFull = [] {
+         auto [effect, error] = SkRuntimeEffect::MakeForShader(SkString(kEinkRenderSkSL));
+@@ -1067,9 +1066,7 @@ void SkiaRenderEngine::drawEinkRender(const DisplaySettings& display,
+     const sk_sp<SkRuntimeEffect>& effect = display.einkMode >= 2 ? sEffectHd
+             : display.einkMode == 1                              ? sEffectFast
+                                                                  : sEffectFull;
+-    if (!effect || !sNoise) return;
+-    sk_sp<SkImage> frame = surface->makeImageSnapshot();
+-    if (!frame) return;
++    if (!effect || !sNoise || !frame) return false;
+     SkRuntimeShaderBuilder builder(effect);
+     builder.child("img") = frame->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
+                                              SkSamplingOptions(SkFilterMode::kNearest));
+@@ -1111,6 +1108,7 @@ void SkiaRenderEngine::drawEinkRender(const DisplaySettings& display,
+     SkAutoCanvasRestore restore(canvas, true);
+     canvas->resetMatrix();
+     canvas->drawPaint(paint);
++    return true;
+ }
+ 
+ void SkiaRenderEngine::drawLayersInternal(
+@@ -1200,6 +1198,21 @@ void SkiaRenderEngine::drawLayersInternal(
+         }
+     }
+ 
++    // E-ink: the e-ink pass reads the composed frame and writes the client target. Composed into
++    // an offscreen surface (the scratch texture comes from Skia's pool, as for blur), the pass
++    // reads it as it is; a snapshot of the client target itself costs a full-frame copy every
++    // frame, since Skia copies a surface before drawing into it while an image of it is alive.
++    // With a blur composition layer the frame ends on the client target: snapshot there.
++    if (display.einkPass() && display.einkOffscreen && blurCompositionLayer == nullptr) {
++        sk_sp<SkSurface> offscreen = dstSurface->makeSurface(dstSurface->imageInfo());
++        if (offscreen) {
++            activeSurface = std::move(offscreen);
++            canvas = mCapture->tryOffscreenCapture(activeSurface.get(), &offscreenCaptureState);
++        } else {
++            ALOGW("e-ink: no offscreen surface, composing into the client target");
++        }
++    }
++
+     AutoSaveRestore surfaceAutoSaveRestore(canvas);
+ 
+     if (mRenderDocCaptureNextFrame) {
+@@ -1686,10 +1699,24 @@ void SkiaRenderEngine::drawLayersInternal(
+ 
+     surfaceAutoSaveRestore.restore();
+ 
+-    if (display.einkRender >= 3) {
+-        drawEinkRender(display, dstSurface, dstCanvas);
+-    } else if (display.einkPass()) {
+-        drawEinkEnhance(display, dstSurface, dstCanvas);
++    if (display.einkPass()) {
++        const bool offscreen = activeSurface != dstSurface;
++        if (offscreen && CC_UNLIKELY(mCapture->isCaptureRunning())) {
++            uint64_t id = mCapture->endOffscreenCapture(&offscreenCaptureState);
++            dstCanvas->drawAnnotation(SkRect::Make(dstCanvas->imageInfo().dimensions()),
++                                      String8::format("SurfaceID|%" PRId64, id).c_str(), nullptr);
++        }
++        sk_sp<SkImage> frame = offscreen ? activeSurface->makeTemporaryImage()
++                                         : dstSurface->makeImageSnapshot();
++        const bool drawn = display.einkRender >= 3 ? drawEinkRender(display, frame, dstCanvas)
++                                                   : drawEinkEnhance(display, frame, dstCanvas);
++        if (!drawn && offscreen && frame) {
++            // No pass: the composed frame must still reach the client target.
++            SkPaint paint;
++            paint.setBlendMode(SkBlendMode::kSrc);
++            dstCanvas->drawImage(frame, 0, 0, SkSamplingOptions(), &paint);
++        }
++        activeSurface = dstSurface;
+     }
+ 
+     mCapture->endCapture();
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.h b/libs/renderengine/skia/SkiaRenderEngine.h
+index 9d778e1..b88b5e7 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.h
++++ b/libs/renderengine/skia/SkiaRenderEngine.h
+@@ -156,9 +156,11 @@ private:
+     void initCanvas(SkCanvas* canvas, const DisplaySettings& display);
+     void drawShadow(SkCanvas* canvas, const SkRRect& casterRRect,
+                     const ShadowSettings& shadowSettings);
+-    void drawEinkEnhance(const DisplaySettings& display, const sk_sp<SkSurface>& surface,
++    // Both draw the pass over the whole canvas from `frame`, the composed picture; false when
++    // nothing was drawn (the effect failed to compile).
++    bool drawEinkEnhance(const DisplaySettings& display, const sk_sp<SkImage>& frame,
+                          SkCanvas* canvas);
+-    void drawEinkRender(const DisplaySettings& display, const sk_sp<SkSurface>& surface,
++    bool drawEinkRender(const DisplaySettings& display, const sk_sp<SkImage>& frame,
+                         SkCanvas* canvas);
+     void drawLayersInternal(const std::shared_ptr<std::promise<FenceResult>>&& resultPromise,
+                             const DisplaySettings& display,
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index e1b2107..d332f8d 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -1572,6 +1572,8 @@ struct EinkEnhance {
+     bool invert = false;
+     // Client-target damage padded by the pass's reach (debug.sf.eink.damage_pad, default on).
+     bool damagePad = true;
++    // RenderEngine composes into an offscreen surface for the pass (debug.sf.eink.offscreen).
++    bool offscreen = true;
+ };
+ 
+ float einkProp(const char* name, uint32_t def, float scale) {
+@@ -1609,6 +1611,7 @@ EinkEnhance getEinkEnhance() {
+         c.render = static_cast<int32_t>(
+                 base::GetUintProperty<uint32_t>("debug.sf.eink_render", 3u));
+         c.damagePad = base::GetBoolProperty("debug.sf.eink.damage_pad", true);
++        c.offscreen = base::GetBoolProperty("debug.sf.eink.offscreen", true);
+         const uint32_t effectiveMode = (forceMode != 0) ? forceMode : mode;
+         if (c.render >= 3 && enhancePct > 0) {
+             // The panel's mode decides what the frame must become: NORMAL (DU, dithered by the
+@@ -1794,6 +1797,7 @@ void Output::applyEinkEnhance(renderengine::DisplaySettings& settings) {
+     settings.einkMinTone = eink.minTone;
+     settings.einkKnock = eink.knock;
+     settings.einkInvert = eink.invert;
++    settings.einkOffscreen = eink.offscreen;
+ }
+ 
+ std::vector<LayerFE::LayerSettings> Output::generateClientCompositionRequests(
+-- 
+2.50.1 (Apple Git-155)
+

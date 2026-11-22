@@ -1,0 +1,239 @@
+From 9d35945ae00d34e3596f7d0949d6a3ec1db4e2c0 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 17 Nov 2026 15:37:25 +0100
+Subject: [PATCH 17/17] e-ink: display off between the sleep screen's minute updates
+
+The composer of the HiBreak Pro has no doze mode, so SurfaceFlinger runs
+the always-on display (DOZE and DOZE_SUSPEND) with the display fully on.
+The display driver then holds cmdq_wake_lock and the SoC never suspends:
+measured 42 mAh an hour asleep, 99.9 % of the time awake.
+
+An e-ink panel keeps its picture with the display off. With the e-ink
+sleep screen, DozeScreenState now turns the display off once the sleep
+screen is on the panel (debug.sysui.eink_sleep.off_ms, 3000); the doze
+time tick turns it on for the new minute and off again after the update
+(tick_ms, 1500). debug.sysui.eink_sleep.screen_off=0 keeps the display on.
+---
+ .../systemui/doze/DozeScreenState.java        |  12 +-
+ .../src/com/android/systemui/doze/DozeUi.java |   3 +
+ .../systemui/doze/EinkDozeScreenOff.java      | 127 ++++++++++++++++++
+ 3 files changed, 141 insertions(+), 1 deletion(-)
+ create mode 100644 packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
+
+diff --git a/packages/SystemUI/src/com/android/systemui/doze/DozeScreenState.java b/packages/SystemUI/src/com/android/systemui/doze/DozeScreenState.java
+index 6ee0dec0..5414f640 100644
+--- a/packages/SystemUI/src/com/android/systemui/doze/DozeScreenState.java
++++ b/packages/SystemUI/src/com/android/systemui/doze/DozeScreenState.java
+@@ -88,6 +88,8 @@ public class DozeScreenState implements DozeMachine.Part {
+ 
+     private int mPendingScreenState = Display.STATE_UNKNOWN;
+     private SettableWakeLock mWakeLock;
++    /** E-ink: the display is off between the sleep screen's updates; null elsewhere. */
++    @Nullable private final EinkDozeScreenOff mEinkScreenOff;
+ 
+     @Inject
+     public DozeScreenState(
+@@ -107,6 +109,8 @@ public class DozeScreenState implements DozeMachine.Part {
+         mParameters = parameters;
+         mDozeHost = host;
+         mWakeLock = new SettableWakeLock(wakeLock, TAG);
++        mEinkScreenOff = EinkDozeScreenOff.ENABLED
++                ? new EinkDozeScreenOff(service, handler, wakeLock) : null;
+         mAuthController = authController;
+         mUdfpsControllerProvider = udfpsControllerProvider;
+         mDozeLog = dozeLog;
+@@ -131,6 +135,7 @@ public class DozeScreenState implements DozeMachine.Part {
+     @Override
+     public void destroy() {
+         mAuthController.removeCallback(mAuthControllerCallback);
++        if (mEinkScreenOff != null) mEinkScreenOff.destroy();
+     }
+ 
+     @Override
+@@ -142,6 +147,7 @@ public class DozeScreenState implements DozeMachine.Part {
+             // Make sure not to apply the screen state after DozeService was destroyed.
+             mPendingScreenState = Display.STATE_UNKNOWN;
+             mHandler.removeCallbacks(mApplyPendingScreenState);
++            if (mEinkScreenOff != null) mEinkScreenOff.cancel();
+ 
+             applyScreenState(screenState);
+             mWakeLock.setAcquired(false);
+@@ -233,7 +239,11 @@ public class DozeScreenState implements DozeMachine.Part {
+     private void applyScreenState(int screenState) {
+         if (screenState != Display.STATE_UNKNOWN) {
+             if (DEBUG) Log.d(TAG, "setDozeScreenState(" + screenState + ")");
+-            mDozeService.setDozeScreenState(screenState);
++            if (mEinkScreenOff != null) {
++                mEinkScreenOff.setDozeScreenState(screenState);
++            } else {
++                mDozeService.setDozeScreenState(screenState);
++            }
+             mDozeInteractor.setDozeScreenState(screenState);
+             if (screenState == Display.STATE_DOZE) {
+                 // If we're entering doze, update the doze screen brightness. We might have been
+diff --git a/packages/SystemUI/src/com/android/systemui/doze/DozeUi.java b/packages/SystemUI/src/com/android/systemui/doze/DozeUi.java
+index 91c6df3a..d9e4be60 100644
+--- a/packages/SystemUI/src/com/android/systemui/doze/DozeUi.java
++++ b/packages/SystemUI/src/com/android/systemui/doze/DozeUi.java
+@@ -231,6 +231,9 @@ public class DozeUi implements DozeMachine.Part {
+     private void onTimeTick() {
+         verifyLastTimeTick();
+ 
++        // E-ink: the display is off between minute updates; on again for this one.
++        EinkDozeScreenOff.onTimeTick();
++
+         // Keep wakelock until a frame has been pushed.
+         mHandler.post(mWakeLock.wrap(mHost::dozeTimeTick));
+ 
+diff --git a/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java b/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
+new file mode 100644
+index 00000000..26f53b07
+--- /dev/null
++++ b/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
+@@ -0,0 +1,143 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package com.android.systemui.doze;
++
++import android.os.Handler;
++import android.os.SystemProperties;
++import android.util.Log;
++import android.view.Display;
++
++import com.android.systemui.shade.EinkSleepScreen;
++import com.android.systemui.util.wakelock.SettableWakeLock;
++import com.android.systemui.util.wakelock.WakeLock;
++
++/**
++ * E-ink sleep screen (HiBreak Pro): the display is off between the minute updates.
++ *
++ * The composer of this phone has no doze mode, so SurfaceFlinger runs the always-on display
++ * (DOZE and DOZE_SUSPEND) with the display fully on. The display driver then holds a wakelock
++ * (cmdq_wake_lock) and the SoC never suspends: about 40 mAh an hour with nothing to do. An e-ink
++ * panel keeps its picture with the display off, so the always-on display does not need it on:
++ * once the sleep screen is on the panel the display goes off, the minute tick turns it on for
++ * the new minute and off again after that update.
++ *
++ * Tuning without a build (read when dozing starts), debug.sysui.eink_sleep.*:
++ * screen_off (0 keeps the display on, as before), off_ms (on after going to sleep, 3000: the
++ * SurfaceFlinger hold of up to 1.5 s and the GC16), tick_ms (on for a minute update, 1500).
++ * The kernel waits for a running panel update before it turns the display off.
++ */
++final class EinkDozeScreenOff {
++    private static final String TAG = "EinkDozeScreenOff";
++    static final boolean ENABLED = EinkSleepScreen.ENABLED
++            && SystemProperties.getBoolean("debug.sysui.eink_sleep.screen_off", true);
++
++    private static volatile EinkDozeScreenOff sInstance;
++
++    private final DozeMachine.Service mService;
++    private final Handler mHandler;
++    private final SettableWakeLock mWakeLock;
++    private final Runnable mTurnOff = this::turnOff;
++
++    /** The always-on state the doze machine asked for, or STATE_UNKNOWN when it wants another. */
++    private int mAlwaysOnState = Display.STATE_UNKNOWN;
++    /** The display is off on our account while the doze machine wants it always on. */
++    private boolean mOff;
++    private int mSleepDelay = 3000;
++    private int mTickDelay = 1500;
++
++    EinkDozeScreenOff(DozeMachine.Service service, Handler handler, WakeLock wakeLock) {
++        mService = service;
++        mHandler = handler;
++        mWakeLock = new SettableWakeLock(wakeLock, TAG);
++        sInstance = this;
++    }
++
++    /** Instead of {@code service.setDozeScreenState(state)}; main thread. */
++    void setDozeScreenState(int state) {
++        if (state == Display.STATE_DOZE || state == Display.STATE_DOZE_SUSPEND) {
++            if (mAlwaysOnState == Display.STATE_UNKNOWN) {
++                mSleepDelay = SystemProperties.getInt("debug.sysui.eink_sleep.off_ms", 3000);
++                mTickDelay = SystemProperties.getInt("debug.sysui.eink_sleep.tick_ms", 1500);
++            } else if (mOff) {
++                // Already sleeping with the display off: remember the new doze sub-state
++                // (DOZE <-> DOZE_SUSPEND) without waking the display up unnecessarily.
++                mAlwaysOnState = state;
++                return;
++            }
++            mHandler.removeCallbacks(mTurnOff);
++            mOff = false;
++            mService.setDozeScreenState(state);
++            mAlwaysOnState = state;
++            scheduleOff(mSleepDelay);
++        } else {
++            mHandler.removeCallbacks(mTurnOff);
++            mOff = false;
++            mService.setDozeScreenState(state);
++            mAlwaysOnState = Display.STATE_UNKNOWN;
++            mWakeLock.setAcquired(false);
++        }
++    }
++
++    /** Dozing ends; main thread. */
++    void cancel() {
++        mHandler.removeCallbacks(mTurnOff);
++        mAlwaysOnState = Display.STATE_UNKNOWN;
++        mOff = false;
++        mWakeLock.setAcquired(false);
++    }
++
++    void destroy() {
++        cancel();
++        if (sInstance == this) sInstance = null;
++    }
++
++    /**
++     * The doze time tick, before the sleep screen redraws; any thread. The display comes on for
++     * the new minute (the window redraws when it does) and goes off again after the update.
++     */
++    static void onTimeTick() {
++        EinkDozeScreenOff instance = sInstance;
++        if (instance != null) {
++            // Hold the wakelock until showUpdate() runs and either schedules turnOff() or
++            // releases it, so the CPU cannot suspend before the display comes back on.
++            instance.mWakeLock.setAcquired(true);
++            instance.mHandler.post(instance::showUpdate);
++        }
++    }
++
++    private void showUpdate() {
++        if (mAlwaysOnState == Display.STATE_UNKNOWN) {
++            mWakeLock.setAcquired(false);
++            return;
++        }
++        mHandler.removeCallbacks(mTurnOff);
++        if (mOff) {
++            mOff = false;
++            mService.setDozeScreenState(mAlwaysOnState);
++        }
++        scheduleOff(mTickDelay);
++    }
++
++    private void scheduleOff(int delay) {
++        if (delay < 0) {
++            // Negative: the display stays on (the behaviour before this class).
++            mWakeLock.setAcquired(false);
++            return;
++        }
++        // Awake until the display is off: the handler's clock stops while the CPU sleeps.
++        mWakeLock.setAcquired(true);
++        mHandler.postDelayed(mTurnOff, delay);
++    }
++
++    private void turnOff() {
++        if (mAlwaysOnState != Display.STATE_UNKNOWN && !mOff) {
++            if (DozeService.DEBUG) Log.d(TAG, "display off until the next update");
++            mOff = true;
++            mService.setDozeScreenState(Display.STATE_OFF);
++        }
++        mWakeLock.setAcquired(false);
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

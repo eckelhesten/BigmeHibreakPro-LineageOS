@@ -1,0 +1,71 @@
+From 8745a1ec745018f6395dd74f6019c062ebc522d1 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Thu, 19 Nov 2026 19:32:52 +0000
+Subject: [PATCH] sf: e-ink pass no longer pushes text and backgrounds to pure
+ black
+
+The min/max enhancement (0011) pushed both sides of any strong local
+contrast to pure black and white. For grey text on white that made the
+text solid, but for light text on a grey or coloured shape (filled
+buttons, avatar circles, toolbars, a dimmed page) the shape's pixels next
+to the letters went black: white labels came out as smeared outlines with
+echoes of the letters a few pixels away. From pixels alone the two cases
+look the same locally, so no rule here can get both right.
+
+Text is now made black-and-white where it is drawn (hwui's e-ink glyphs,
+frameworks/base), so the pass only snaps anti-aliased edges to the
+darkest or lightest value around them and never invents black: solid1
+and solid2 default to 0.95 and 1.0. debug.sf.eink_enhance.solid1_x1000 /
+solid2_x1000 bring the push back for tests.
+
+Change-Id: I7cdc547b8500ed2ef8178967ca8816048f83fc98
+---
+ libs/renderengine/include/renderengine/DisplaySettings.h | 4 ++--
+ services/surfaceflinger/CompositionEngine/src/Output.cpp | 8 ++++----
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/libs/renderengine/include/renderengine/DisplaySettings.h b/libs/renderengine/include/renderengine/DisplaySettings.h
+index 2fb5e0d..45ee3bb 100644
+--- a/libs/renderengine/include/renderengine/DisplaySettings.h
++++ b/libs/renderengine/include/renderengine/DisplaySettings.h
+@@ -86,8 +86,8 @@ struct DisplaySettings {
+     float einkEnhanceRadius = 3.5f;
+     float einkEnhanceT1 = 0.04f;
+     float einkEnhanceT2 = 0.12f;
+-    float einkSolid1 = 0.12f;
+-    float einkSolid2 = 0.40f;
++    float einkSolid1 = 0.95f;
++    float einkSolid2 = 1.0f;
+     float einkGate0 = 0.55f;
+     float einkGate1 = 0.80f;
+     float einkBlack = 0.f;
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index df7f1a1..e35229b 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -1527,8 +1527,8 @@ struct EinkEnhance {
+     float radius = 3.5f;
+     float t1 = 0.04f;
+     float t2 = 0.12f;
+-    float solid1 = 0.12f;
+-    float solid2 = 0.40f;
++    float solid1 = 0.95f;
++    float solid2 = 1.0f;
+     float gate0 = 0.55f;
+     float gate1 = 0.80f;
+     // Text contrast, set by the HiBreakParts app: grey levels (0-255) that become black and
+@@ -1563,9 +1563,9 @@ EinkEnhance getEinkEnhance() {
+         c.t1 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t1_x1000", 40u) / 1000.f;
+         c.t2 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t2_x1000", 120u) / 1000.f;
+         c.solid1 =
+-                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid1_x1000", 120u) / 1000.f;
++                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid1_x1000", 950u) / 1000.f;
+         c.solid2 =
+-                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid2_x1000", 400u) / 1000.f;
++                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid2_x1000", 1000u) / 1000.f;
+         c.gate0 =
+                 base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.gate0_x1000", 550u) / 1000.f;
+         c.gate1 =
+-- 
+2.43.0
+

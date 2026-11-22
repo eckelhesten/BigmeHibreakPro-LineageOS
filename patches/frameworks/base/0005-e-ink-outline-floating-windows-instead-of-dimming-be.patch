@@ -1,0 +1,218 @@
+From f92faa7bbbceb76f8667b33d3442b66540a2e1e4 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 14 Nov 2026 14:47:23 +0100
+Subject: [PATCH 1/4] e-ink: outline floating windows instead of dimming behind
+ them
+
+With debug.eink.windows=1 the window manager shows no dim layer behind
+windows, and dialogs and popup windows draw a 2dp outline along the
+outline of their background drawable (black in light mode, white in
+dark mode).
+
+An e-ink panel shows the dim layer as dithered grey over the whole
+screen, which looks noisy and leaves ghosts when it goes away. On the
+Bigme HiBreak Pro the power menu screen was 77% mid-grey. Shadows are
+too faint to show a window's edge on such a panel, hence the outline.
+It is drawn by DecorView for floating windows and by PopupWindow's
+background view, so it covers every app that gives its window a
+background drawable. Windows that draw their own surface inside a
+transparent window (Compose dialogs) get no outline.
+
+Change-Id: I0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f60718293
+---
+ core/java/android/widget/PopupWindow.java     |  9 ++
+ .../android/internal/policy/DecorView.java    |  5 ++
+ .../internal/policy/EinkWindowOutline.java    | 86 +++++++++++++++++++
+ .../com/android/server/wm/WindowState.java    | 13 ++-
+ 4 files changed, 111 insertions(+), 2 deletions(-)
+ create mode 100644 core/java/com/android/internal/policy/EinkWindowOutline.java
+
+diff --git a/core/java/android/widget/PopupWindow.java b/core/java/android/widget/PopupWindow.java
+index d54addbb..af7908c1 100644
+--- a/core/java/android/widget/PopupWindow.java
++++ b/core/java/android/widget/PopupWindow.java
+@@ -25,6 +25,7 @@ import android.annotation.Nullable;
+ import android.compat.annotation.UnsupportedAppUsage;
+ import android.content.Context;
+ import android.content.res.TypedArray;
++import android.graphics.Canvas;
+ import android.graphics.PixelFormat;
+ import android.graphics.Rect;
+ import android.graphics.drawable.Drawable;
+@@ -60,6 +61,7 @@ import android.window.OnBackInvokedDispatcher;
+ import android.window.WindowOnBackInvokedDispatcher;
+ 
+ import com.android.internal.R;
++import com.android.internal.policy.EinkWindowOutline;
+ 
+ import java.lang.ref.WeakReference;
+ import java.util.List;
+@@ -2780,5 +2782,12 @@ public class PopupWindow {
+                 return super.onCreateDrawableState(extraSpace);
+             }
+         }
++
++        @Override
++        public void draw(Canvas canvas) {
++            super.draw(canvas);
++            // E-ink: a solid outline instead of relying on the popup's shadow.
++            EinkWindowOutline.draw(this, canvas);
++        }
+     }
+ }
+diff --git a/core/java/com/android/internal/policy/DecorView.java b/core/java/com/android/internal/policy/DecorView.java
+index fdc5631f..b1b8dc79 100644
+--- a/core/java/com/android/internal/policy/DecorView.java
++++ b/core/java/com/android/internal/policy/DecorView.java
+@@ -819,6 +819,11 @@ public class DecorView extends FrameLayout implements RootViewSurfaceTaker, Wind
+         if (mMenuBackground != null) {
+             mMenuBackground.draw(canvas);
+         }
++
++        if (EinkWindowOutline.ENABLED && mWindow.isFloating()) {
++            // E-ink: a dialog has no dim layer behind it, so it gets a solid outline.
++            EinkWindowOutline.draw(this, canvas);
++        }
+     }
+ 
+     @Override
+diff --git a/core/java/com/android/internal/policy/EinkWindowOutline.java b/core/java/com/android/internal/policy/EinkWindowOutline.java
+new file mode 100644
+index 00000000..ef0952bb
+--- /dev/null
++++ b/core/java/com/android/internal/policy/EinkWindowOutline.java
+@@ -0,0 +1,86 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.internal.policy;
++
++import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.Outline;
++import android.graphics.Paint;
++import android.graphics.Rect;
++import android.graphics.drawable.Drawable;
++import android.os.SystemProperties;
++import android.util.TypedValue;
++import android.view.View;
++
++/**
++ * Outlines for floating windows on e-ink panels (debug.eink.windows=1).
++ *
++ * A dialog or popup normally stands out through the dim layer behind it and its shadow. An e-ink
++ * panel shows both as dithered grey, so the window manager leaves the dim out there, and the
++ * window draws a solid line around its background instead: black in light mode, white in dark
++ * mode. The line follows the outline of the view's background drawable; a view without a visible
++ * background gets none.
++ *
++ * @hide
++ */
++public final class EinkWindowOutline {
++
++    /** Read once per process. */
++    public static final boolean ENABLED = SystemProperties.getBoolean("debug.eink.windows", false);
++
++    private static final float WIDTH_DP = 2f;
++
++    private static final ThreadLocal<Outline> sOutline = ThreadLocal.withInitial(Outline::new);
++    private static final ThreadLocal<Paint> sPaint = ThreadLocal.withInitial(() -> {
++        final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
++        paint.setStyle(Paint.Style.STROKE);
++        return paint;
++    });
++
++    private EinkWindowOutline() {}
++
++    /** Draws the outline of {@code view}'s background on top of what the view has drawn. */
++    public static void draw(View view, Canvas canvas) {
++        if (!ENABLED) return;
++        final Drawable background = view.getBackground();
++        if (background == null) return;
++
++        final Outline outline = sOutline.get();
++        outline.setEmpty();
++        outline.setAlpha(1f);
++        background.getOutline(outline);
++        if (outline.isEmpty() || outline.getAlpha() <= 0f) return;
++
++        final float width = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, WIDTH_DP,
++                view.getResources().getDisplayMetrics());
++        final Paint paint = sPaint.get();
++        paint.setStrokeWidth(width);
++        paint.setColor(view.getResources().getConfiguration().isNightModeActive()
++                ? Color.WHITE : Color.BLACK);
++
++        if (outline.mMode == Outline.MODE_ROUND_RECT) {
++            // Keep the whole line inside the background's edge.
++            final float half = width / 2f;
++            final Rect rect = outline.mRect;
++            final float radius = Math.max(outline.mRadius - half, 0f);
++            canvas.drawRoundRect(rect.left + half, rect.top + half, rect.right - half,
++                    rect.bottom - half, radius, radius, paint);
++        } else if (outline.mMode == Outline.MODE_PATH && outline.mPath != null) {
++            canvas.drawPath(outline.mPath, paint);
++        }
++    }
++}
+diff --git a/services/core/java/com/android/server/wm/WindowState.java b/services/core/java/com/android/server/wm/WindowState.java
+index e2541113..e56d75c2 100644
+--- a/services/core/java/com/android/server/wm/WindowState.java
++++ b/services/core/java/com/android/server/wm/WindowState.java
+@@ -211,6 +211,7 @@ import android.os.PowerManager;
+ import android.os.RemoteCallbackList;
+ import android.os.RemoteException;
+ import android.os.SystemClock;
++import android.os.SystemProperties;
+ import android.os.Trace;
+ import android.os.WorkSource;
+ import android.provider.Settings;
+@@ -278,6 +279,10 @@ class WindowState extends WindowContainer<WindowState> implements WindowManagerP
+         InsetsControlTarget, InputTarget {
+     static final String TAG = TAG_WITH_CLASS_NAME ? "WindowState" : TAG_WM;
+ 
++    /** E-ink panels (debug.eink.windows=1): no dim layer behind windows. */
++    private static final boolean EINK_NO_DIM =
++            SystemProperties.getBoolean("debug.eink.windows", false);
++
+     // The minimal size of a window within the usable area of the freeform root task.
+     // TODO(multi-window): fix the min sizes when we have minimum width/height support,
+     //                     use hard-coded min sizes for now.
+@@ -5158,7 +5163,11 @@ class WindowState extends WindowContainer<WindowState> implements WindowManagerP
+ 
+     private void applyDims() {
+         Task task = getTask();
+-        if (((mAttrs.flags & FLAG_DIM_BEHIND) != 0 || shouldDrawBlurBehind())
++        // E-ink panels show a dim layer as dithered grey; floating windows get an outline instead
++        // (EinkWindowOutline). The window then doesn't count as dimming either, so the system
++        // bars keep the colours of the window behind it.
++        final boolean dimBehind = (mAttrs.flags & FLAG_DIM_BEHIND) != 0 && !EINK_NO_DIM;
++        if ((dimBehind || shouldDrawBlurBehind())
+                 && mWinAnimator.getShown()
+                 && !mHidden && mTransitionController.canApplyDim(task)) {
+             // Only show the Dimmer when the following is satisfied:
+@@ -5168,7 +5177,7 @@ class WindowState extends WindowContainer<WindowState> implements WindowManagerP
+             // 4. The WS is not hidden.
+             // 5. The window is not in a transition or is in a transition that allows to dim.
+             mIsDimming = true;
+-            final float dimAmount = (mAttrs.flags & FLAG_DIM_BEHIND) != 0 ? mAttrs.dimAmount : 0;
++            final float dimAmount = dimBehind ? mAttrs.dimAmount : 0;
+             final int blurRadius = shouldDrawBlurBehind() ? mAttrs.getBlurBehindRadius() : 0;
+             // If the window is visible from surface flinger perspective (mWinAnimator.getShown())
+             // but not window manager visible (!isVisibleNow()), it can still be the parent of the
+-- 
+2.50.1 (Apple Git-155)
+

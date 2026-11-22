@@ -1,0 +1,362 @@
+From 2b036cbe8d0df496b486a2445fe6becc5cbe1170 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 21 Nov 2026 12:12:41 +0100
+Subject: [PATCH] sf: e-ink fixes (damage-pad race, force-mode reset,
+ EinkEngine bounds)
+
+---
+ libs/renderengine/skia/SkiaRenderEngine.cpp   |  2 +-
+ .../include/compositionengine/impl/Output.h   |  4 +-
+ .../CompositionEngine/src/Output.cpp          | 66 +++++++++++--------
+ .../DisplayHardware/EinkEngine.cpp            | 28 ++++----
+ .../DisplayHardware/EinkEngine.h              |  3 +-
+ .../DisplayHardware/EinkMotion.cpp            | 10 ++-
+ .../DisplayHardware/EinkMotion.h              |  1 +
+ 7 files changed, 64 insertions(+), 50 deletions(-)
+
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+index 4cef2b2..adfcafe 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -1704,7 +1704,7 @@ void SkiaRenderEngine::drawLayersInternal(
+         if (offscreen && CC_UNLIKELY(mCapture->isCaptureRunning())) {
+             uint64_t id = mCapture->endOffscreenCapture(&offscreenCaptureState);
+             dstCanvas->drawAnnotation(SkRect::Make(dstCanvas->imageInfo().dimensions()),
+-                                      String8::format("SurfaceID|%" PRId64, id).c_str(), nullptr);
++                                      String8::format("SurfaceID|%" PRIu64, id).c_str(), nullptr);
+         }
+         sk_sp<SkImage> frame = offscreen ? activeSurface->makeTemporaryImage()
+                                          : dstSurface->makeImageSnapshot();
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+index 8c361a0..7ca34cc 100644
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+@@ -146,7 +146,9 @@
+     compositionengine::Output::FrameFences presentFrame() override;
+     void executeCommands() override {}
+     // E-ink (Bigme HiBreak Pro): fills in the enhancement settings from the properties.
+-    static void applyEinkEnhance(renderengine::DisplaySettings&);
++    static void applyEinkEnhance(renderengine::DisplaySettings&, bool trackKernelDither = false,
++                               int32_t* outDamagePad = nullptr);
++    mutable int32_t mLastEinkDamagePad = 0;
+     virtual renderengine::DisplaySettings generateClientCompositionDisplaySettings(
+             const std::shared_ptr<renderengine::ExternalTexture>& buffer) const;
+     std::vector<LayerFE::LayerSettings> generateClientCompositionRequests(
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index 785f069..010d5d8 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -104,10 +104,6 @@
+             .y = static_cast<float>(to.height()) / from.height()};
+ }
+ 
+-// E-ink (defined with the e-ink settings below): how far around a changed pixel the e-ink pass
+-// changes the output.
+-int32_t einkDamagePadding();
+-
+ } // namespace
+ 
+ std::shared_ptr<Output> createOutput(
+@@ -1357,10 +1353,15 @@ std::shared_ptr<Output> createOutput(
+         // change too. Without them in the damage a partial panel update leaves their old values
+         // as a fringe around the changed area.
+         const int32_t pad =
+-                getDisplayIdVariant().and_then(asPhysicalDisplayId) ? einkDamagePadding() : 0;
++                getDisplayIdVariant().and_then(asPhysicalDisplayId) ? mLastEinkDamagePad : 0;
+         if (pad > 0) {
+             Region padded;
+             for (const Rect& r : dirty) {
++                if (!r.isValid()) {
++                    padded = Region(outputState.framebufferSpace.getBoundsAsRect());
++                    break;
++                }
++                if (r.isEmpty()) continue;
+                 padded.orSelf(Rect(r.left - pad, r.top - pad, r.right + pad, r.bottom + pad));
+             }
+             dirty = padded;
+@@ -1574,13 +1575,16 @@ struct EinkEnhance {
+     bool damagePad = true;
+     // RenderEngine composes into an offscreen surface for the pass (debug.sf.eink.offscreen).
+     bool offscreen = true;
++    uint32_t effectiveMode = 0;
++    bool commitDisabled = false;
++    bool kernelDither = true;
+ };
+ 
+ float einkProp(const char* name, uint32_t def, float scale) {
+     return base::GetUintProperty<uint32_t>(name, def) / scale;
+ }
+ 
+-EinkEnhance getEinkEnhance() {
++EinkEnhance getEinkEnhance(bool trackKernelDither) {
+     static std::mutex sMutex;
+     static uint32_t sSerial = 0xffffffffu;
+     static EinkEnhance sConfig;
+@@ -1613,12 +1617,14 @@ EinkEnhance getEinkEnhance() {
+         c.damagePad = base::GetBoolProperty("debug.sf.eink.damage_pad", true);
+         c.offscreen = base::GetBoolProperty("debug.sf.eink.offscreen", true);
+         const uint32_t effectiveMode = (forceMode != 0) ? forceMode : mode;
++        c.effectiveMode = effectiveMode;
++        c.commitDisabled = commitDisabled;
++        c.kernelDither = base::GetBoolProperty("debug.sf.eink_kernel_dither", true);
+         if (c.render >= 3 && enhancePct > 0) {
+             // The panel's mode decides what the frame must become: NORMAL (DU, dithered by the
+             // kernel) gets the full pass; FAST and HYPER (A2, never dithered by the kernel: greys
+             // would become partial drives and grey residue) the cheap one; the grey modes
+-            // (HD, GL16) 16 levels. CLEAN/GC16 (0xb0/0x04) inherits g_last_dither_type in the
+-            // kernel when kernel dither is on, so match 1-bit (0/255) vs 16-level (16*q+4).
++            // (HD, GL16) 16 levels. CLEAN/GC16 (0xb0/0x04) inherits g_last_dither_type below.
+             switch (effectiveMode) {
+                 case 0xb3: case 0x10: case 0x11: case 0xb7:
+                 {
+@@ -1637,12 +1643,6 @@ EinkEnhance getEinkEnhance() {
+                 case 0xb1: case 0x21: case 0x20: case 0x84: case 0x40: case 0xb4:
+                     c.mode = 2;
+                     break;
+-                case 0xb0: case 0x04:
+-                    c.mode = (!base::GetBoolProperty("debug.sf.eink_kernel_dither", true) ||
+-                              sLastKernelDither == 4u)
+-                            ? 2
+-                            : 0;
+-                    break;
+                 default:
+                     c.mode = 0;
+             }
+@@ -1698,23 +1698,28 @@ EinkEnhance getEinkEnhance() {
+                                                             "vendor.xrz.hibreak_contrast_white",
+                                                             255u))) / 255.f;
+         }
+-        if (!commitDisabled) {
+-            if (effectiveMode == 0xb1 || effectiveMode == 0x21 || effectiveMode == 0x20 ||
+-                effectiveMode == 0x84 || effectiveMode == 0x40 || effectiveMode == 0xb4) {
+-                sLastKernelDither = 4u;
+-            } else if (effectiveMode != 0xb0 && effectiveMode != 0x04) {
+-                sLastKernelDither = 3u;
+-            }
+-        }
+         sConfig = c;
+     }
+-    return sConfig;
++    EinkEnhance out = sConfig;
++    if (out.render >= 3 && out.strength > 0.f &&
++        (out.effectiveMode == 0xb0 || out.effectiveMode == 0x04)) {
++        out.mode = (!out.kernelDither || sLastKernelDither == 4u) ? 2 : 0;
++    }
++    if (trackKernelDither && !out.commitDisabled) {
++        if (out.effectiveMode == 0xb1 || out.effectiveMode == 0x21 ||
++            out.effectiveMode == 0x20 || out.effectiveMode == 0x84 ||
++            out.effectiveMode == 0x40 || out.effectiveMode == 0xb4) {
++            sLastKernelDither = 4u;
++        } else if (out.effectiveMode != 0xb0 && out.effectiveMode != 0x04) {
++            sLastKernelDither = 3u;
++        }
++    }
++    return out;
+ }
+ 
+ // The render pass's full version reads its outer ring 3 r away (r = radius), the enhancement
+ // pass 2 r; the FAST and 16-level versions work per pixel.
+-int32_t einkDamagePadding() {
+-    const EinkEnhance e = getEinkEnhance();
++int32_t einkDamagePadding(const EinkEnhance& e) {
+     if (!e.damagePad) return 0;
+     float reach = 0.f;
+     if (e.render >= 3) {
+@@ -1764,13 +1769,18 @@ renderengine::DisplaySettings Output::generateClientCompositionDisplaySettings(
+ 
+     // E-ink: only for the built-in panel, not for virtual displays (recordings, mirroring).
+     if (getDisplayIdVariant().and_then(asPhysicalDisplayId)) {
+-        applyEinkEnhance(clientCompositionDisplay);
++        applyEinkEnhance(clientCompositionDisplay, /*trackKernelDither=*/true,
++                         &mLastEinkDamagePad);
++    } else {
++        mLastEinkDamagePad = 0;
+     }
+     return clientCompositionDisplay;
+ }
+ 
+-void Output::applyEinkEnhance(renderengine::DisplaySettings& settings) {
+-    const EinkEnhance eink = getEinkEnhance();
++void Output::applyEinkEnhance(renderengine::DisplaySettings& settings, bool trackKernelDither,
++                              int32_t* outDamagePad) {
++    const EinkEnhance eink = getEinkEnhance(trackKernelDither);
++    if (outDamagePad) *outDamagePad = einkDamagePadding(eink);
+     settings.einkEnhanceStrength = eink.strength;
+     settings.einkEnhanceRadius = eink.radius;
+     settings.einkEnhanceT1 = eink.t1;
+diff --git a/services/surfaceflinger/DisplayHardware/EinkEngine.cpp b/services/surfaceflinger/DisplayHardware/EinkEngine.cpp
+index 330f461..01f4a7f 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkEngine.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkEngine.cpp
+@@ -211,10 +211,6 @@ void EinkEngine::loadConfig() {
+     c.convertThreads = std::clamp(prop("debug.sf.eink.convert_threads", 4), 1u, 8u);
+     c.black = base::GetIntProperty("debug.sf.eink.black", 48, 0, 254);
+     c.white = std::max(c.black + 1, base::GetIntProperty("debug.sf.eink.white", 208, 1, 255));
+-    for (int v = 0; v < 256; v++) {
+-        int out = v <= c.black ? 0 : v >= c.white ? 255 : (v - c.black) * 255 / (c.white - c.black);
+-        mLut[v] = static_cast<uint8_t>(out);
+-    }
+     if (c.policy != mConfig.policy) ALOGI("policy %u", c.policy);
+     mConfig = c;
+ }
+@@ -237,12 +233,13 @@ bool EinkEngine::allocate(uint32_t size) {
+     ion_heap_query query = {.cnt = 32, .heaps = reinterpret_cast<uintptr_t>(heaps)};
+     int heap = -1;
+     if (ioctl(ion, kIonHeapQuery, &query) == 0) {
+-        for (uint32_t i = 0; i < query.cnt && heap < 0; i++) {
++        const uint32_t cnt = std::min(query.cnt, 32u);
++        for (uint32_t i = 0; i < cnt && heap < 0; i++) {
+             if (heaps[i].type == kIonHeapTypeSystem) heap = static_cast<int>(heaps[i].heap_id);
+         }
+     }
+-    if (heap < 0) {
+-        ALOGE("no ION system heap");
++    if (heap < 0 || heap >= 32) {
++        ALOGE("no valid ION system heap (%d)", heap);
+         close(ion);
+         return false;
+     }
+@@ -318,7 +315,7 @@ bool EinkEngine::init(uint32_t width, uint32_t height) {
+ }
+ 
+ Region EinkEngine::convert(const sp<GraphicBuffer>& buffer, const Region& region,
+-                           std::vector<uint8_t>* greyTiles) {
++                           std::vector<uint8_t>* greyTiles, const Config& config) {
+     Region changed;
+     const PixelFormat format = buffer->getPixelFormat();
+     const bool bgra = format == PIXEL_FORMAT_BGRA_8888;
+@@ -340,9 +337,9 @@ Region EinkEngine::convert(const sp<GraphicBuffer>& buffer, const Region& region
+     const nsecs_t start = systemTime();
+     const std::vector<Rect> rects(region.begin(), region.end());
+     const bool countGrey = greyTiles != nullptr;
+-    const int32_t black = mConfig.black;
+-    // Fixed-point form of the black/white clamp (mLut), so the loop has no table lookup.
+-    const int32_t scale = (255 << 16) / std::max(16, mConfig.white - mConfig.black);
++    const int32_t black = config.black;
++    // Fixed-point form of the black/white clamp, so the loop has no table lookup.
++    const int32_t scale = (255 << 16) / std::max(16, config.white - config.black);
+     // Reading the uncached mapping is bound by memory latency, not by one core's speed, so
+     // several threads read faster together. Each thread takes whole tile rows (row / kTile %
+     // threads), so no two threads write the same tile counters, shadow rows or buffer rows.
+@@ -398,7 +395,7 @@ Region EinkEngine::convert(const sp<GraphicBuffer>& buffer, const Region& region
+         }
+     };
+     const int64_t pixels = area(bounds);
+-    const size_t parts = pixels >= 128 * 1024 ? mConfig.convertThreads : 1;
++    const size_t parts = pixels >= 128 * 1024 ? config.convertThreads : 1;
+     std::vector<std::thread> helpers;
+     for (size_t i = 1; i < parts; i++) helpers.emplace_back(work, i, parts);
+     work(0, parts);
+@@ -417,7 +414,7 @@ Region EinkEngine::convert(const sp<GraphicBuffer>& buffer, const Region& region
+     if (greyTiles) {
+         greyTiles->assign(mTilesX * mTilesY, 0);
+         for (size_t i = 0; i < greyTiles->size(); i++) {
+-            (*greyTiles)[i] = dirty[i] && mGreyCount[i] >= mConfig.greyPixels;
++            (*greyTiles)[i] = dirty[i] && mGreyCount[i] >= config.greyPixels;
+         }
+     }
+     changed = tileRegion(dirty);
+@@ -685,6 +682,7 @@ bool EinkEngine::convertNewest(std::unique_lock<std::mutex>& lock) {
+     const nsecs_t when = mDeferredTime;
+     const bool forced = mForcedPending;
+     const uint32_t forcedMode = mForcedMode;
++    const Config config = mConfig;
+     mDeferred.clear();
+     mDeferredFence.clear();
+     mPendingDamage.clear();
+@@ -698,7 +696,7 @@ bool EinkEngine::convertNewest(std::unique_lock<std::mutex>& lock) {
+     }
+     std::vector<uint8_t> grey;
+     Region changed;
+-    if (ok) changed = convert(buffer, region, forced ? nullptr : &grey);
++    if (ok) changed = convert(buffer, region, forced ? nullptr : &grey, config);
+     lock.lock();
+     mReading = nullptr;
+     mReadDone.notify_all();
+@@ -879,7 +877,7 @@ void EinkEngine::onFrameV1(const sp<GraphicBuffer>& buffer, const sp<Fence>& acq
+         ALOGW("client target fence timeout, skipping frame");
+         return;
+     }
+-    const Region changed = convert(buffer, region, nullptr);
++    const Region changed = convert(buffer, region, nullptr, mConfig);
+     const Region update = (forced || !mHadFrame) ? region : changed;
+     mHadFrame = true;
+     if (update.isEmpty()) return;
+diff --git a/services/surfaceflinger/DisplayHardware/EinkEngine.h b/services/surfaceflinger/DisplayHardware/EinkEngine.h
+index b1d506f..f8bf77c 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkEngine.h
++++ b/services/surfaceflinger/DisplayHardware/EinkEngine.h
+@@ -168,7 +168,7 @@ private:
+     bool init(uint32_t width, uint32_t height);
+     bool allocate(uint32_t size);
+     Region convert(const sp<GraphicBuffer>& buffer, const Region& region,
+-                   std::vector<uint8_t>* greyTiles);
++                   std::vector<uint8_t>* greyTiles, const Config& config);
+     bool convertNewest(std::unique_lock<std::mutex>& lock);
+     Region tileRegion(const std::vector<uint8_t>& tiles) const;
+     void markChanged(const Region& region, nsecs_t when);
+@@ -200,7 +200,6 @@ private:
+     uint8_t* mGrey = nullptr;
+     uint32_t mWidth = 0;
+     uint32_t mHeight = 0;
+-    uint8_t mLut[256];
+     std::vector<uint8_t> mShadow; // cached copy of mGrey
+     std::vector<uint16_t> mGreyCount; // per tile, grey pixels in the last conversion
+     std::vector<uint8_t> mDirty;      // per tile, changed in the last conversion
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index 9c3269a..3c870d0 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -159,15 +159,16 @@ void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now) {
+         if (mConfig.sleepMode != 0 && current != mConfig.sleepMode) {
+             mSleepWritten = mConfig.sleepMode;
+             writeMode(mSleepWritten);
++            mSleepWrittenSerial = mWrittenSerial;
+             mSleepModeSet = (mSleepBase != mConfig.sleepMode);
+         }
+     } else if (mSleepModeSet) {
+         // Unless someone else changed the mode meanwhile.
+-        if (current == mSleepWritten) writeMode(mSleepBase);
++        if (current == mSleepWritten && modeSerial() == mSleepWrittenSerial) writeMode(mSleepBase);
+         mSleepModeSet = false;
+     }
+     if (!asleep && mForceArmed && mConfig.wakeMode == 0) {
+-        base::SetProperty(kForceModeProperty, "0");
++        base::SetProperty(kForceModeProperty, "-1");
+     }
+     base::SetProperty(kDisableCommitProperty, "1");
+     mForceArmed = false;
+@@ -188,6 +189,7 @@ void EinkMotion::applySleepMode() {
+     mSleepBase = current;
+     mSleepWritten = mConfig.sleepMode;
+     writeMode(mSleepWritten);
++    mSleepWrittenSerial = mWrittenSerial;
+     mSleepModeSet = true;
+ }
+ 
+@@ -200,7 +202,9 @@ void EinkMotion::onComposite(bool imeVisible) {
+             base::SetProperty(kDisableCommitProperty, "0");
+             mFrozen = false;
+         }
+-        if (mSleepModeSet && readMode() == mSleepWritten) writeMode(mSleepBase);
++        if (mSleepModeSet && readMode() == mSleepWritten && modeSerial() == mSleepWrittenSerial) {
++            writeMode(mSleepBase);
++        }
+         mSleepModeSet = false;
+         mAsleep = false;
+     }
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index 33ae45d..add27c2 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -131,6 +131,7 @@ private:
+     bool mSleepModeSet = false;   // the property holds our sleep mode
+     uint32_t mSleepBase = 0;      // the mode to put back when waking up
+     uint32_t mSleepWritten = 0;
++    uint32_t mSleepWrittenSerial = 0;
+     bool mForceArmed = false;     // the one-shot for the first picture after the hold is set
+ };
+ 
+-- 
+2.50.1 (Apple Git-155)
+

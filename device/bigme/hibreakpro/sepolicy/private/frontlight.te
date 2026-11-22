@@ -1,0 +1,4 @@
+# Front light (LM3630A warm/cold channels), driven by the HiBreakParts app (system_app).
+type sysfs_hibreak_frontlight, fs_type, sysfs_type;
+allow system_app sysfs_hibreak_frontlight:file rw_file_perms;
+allow init sysfs_hibreak_frontlight:file setattr;

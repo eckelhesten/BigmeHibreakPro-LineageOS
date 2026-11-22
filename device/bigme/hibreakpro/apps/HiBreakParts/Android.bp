@@ -1,0 +1,25 @@
+// HiBreak Pro device parts, replacing the parts of Bigme's closed XRZ framework we need:
+// - front light (LM3630A warm/cold channels) driven from Android's display brightness
+//   (the vendor lights HAL only writes a dummy lcd-backlight LED)
+// - e-ink: global and per-app refresh modes, full refresh, auto-clean, anti-flicker
+// - side keys (F1/F2 on mtk-kpd): configurable actions or app launch, through LineageOS's
+//   device key handler hook (KeyHandler runs inside system_server)
+// - quick settings tiles and a settings page (Settings > Display > E-ink & front light)
+android_app {
+    name: "HiBreakParts",
+    defaults: ["SettingsLibDefaults"],
+    srcs: ["src/**/*.java"],
+    resource_dirs: ["res"],
+    platform_apis: true,
+    certificate: "platform",
+    privileged: true,
+    system_ext_specific: true,
+    static_libs: [
+        "androidx.preference_preference",
+        "androidx.core_core",
+    ],
+    // KeyHandler is loaded by class name from this APK by system_server: keep it unshrunk.
+    optimize: {
+        enabled: false,
+    },
+}

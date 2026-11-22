@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Carrier settings AOSP's CarrierConfig assets lack, merged on top of the carrier's own file
+     (DefaultCarrierConfigService reads res/xml/vendor.xml last). Keep entries per carrier:
+     a filterless entry would also override carriers that turn VoLTE off on purpose.
+
+     VoLTE needs carrier_volte_available_bool on top of the device's
+     config_device_volte_available (com.android.ims.ImsManager.isVolteEnabledByPlatform);
+     AOSP defaults it to false. docs/volte.md. -->
+<carrier_config_list>
+    <!-- 3 Sweden (Hi3G Access, carrier id 1691): no 2G, 3G switched off, so voice is VoLTE only.
+         AOSP has no config for it. Filter by cid rather than mcc/mnc: aapt2 compiles mnc="02"
+         as integer 2, which fails DefaultCarrierConfigService's string match against "02". -->
+    <carrier_config cid="1691" name="3_se">
+        <boolean name="carrier_volte_available_bool" value="true" />
+        <boolean name="editable_enhanced_4g_lte_bool" value="true" />
+        <boolean name="enhanced_4g_lte_on_by_default_bool" value="true" />
+        <boolean name="carrier_vt_available_bool" value="false" />
+        <boolean name="carrier_wfc_ims_available_bool" value="false" />
+    </carrier_config>
+</carrier_config_list>

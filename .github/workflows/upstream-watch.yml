@@ -1,0 +1,76 @@
+name: upstream-watch
+
+# Weekly: if LineageOS (or our own trees) moved since the last build, rebuild all flavours to
+# see that they still build. Never publishes: releases are versioned and tested by hand first
+# (build.yml with publish and a version, docs/building.md "Releases").
+on:
+  schedule: [{ cron: "0 3 * * 1" }]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      state: ${{ steps.diff.outputs.state }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: diff
+        env:
+          BRANCH: ${{ vars.LINEAGE_BRANCH || 'lineage-23.2' }}
+          LAST: ${{ vars.LAST_UPSTREAM_STATE }}
+        run: |
+          set -euo pipefail
+          state="self=$(git rev-parse --short=12 HEAD);"
+          for r in \
+            android_build \
+            android_external_roboto-fonts \
+            android_frameworks_base \
+            android_frameworks_libs_systemui \
+            android_frameworks_native \
+            android_packages_apps_Trebuchet \
+            android_packages_modules_Connectivity \
+            android_packages_overlays_Lineage \
+            android_system_core \
+            android_vendor_lineage; do
+            line=$(git ls-remote "https://github.com/LineageOS/$r" "refs/heads/$BRANCH")
+            sha=${line%%$'\t'*}
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::unexpected ls-remote output for $r ($BRANCH): $line"; exit 1; }
+            state+="$r=${sha:0:12};"
+          done
+          echo "state: $state"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [[ "$state" != "$LAST" ]]; then
+            echo changed=true >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      lineage_branch: ${{ vars.LINEAGE_BRANCH || 'lineage-23.2' }}
+      build_type: user
+      flavors: vanilla microg gapps
+      publish: false
+    secrets:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      VENDOR_DEPLOY_KEY: ${{ secrets.VENDOR_DEPLOY_KEY }}
+      RELEASE_KEYS_PASSPHRASE: ${{ secrets.RELEASE_KEYS_PASSPHRASE }}
+
+  record:
+    needs: [check, build]
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Persist upstream state after successful build
+        env:
+          GH_TOKEN: ${{ secrets.VARS_TOKEN }}   # PAT with variables:write to persist state
+          STATE: ${{ needs.check.outputs.state }}
+        run: gh variable set LAST_UPSTREAM_STATE -R "${{ github.repository }}" --body "$STATE"

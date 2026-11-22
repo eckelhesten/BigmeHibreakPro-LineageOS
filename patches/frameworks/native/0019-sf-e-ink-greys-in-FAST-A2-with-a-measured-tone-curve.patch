@@ -1,0 +1,214 @@
+From bcf64d2fa61194fd2829f89b711be1aae426c1b7 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sun, 22 Nov 2026 10:40:45 +0100
+Subject: [PATCH] sf: e-ink greys in FAST (A2) with a measured tone curve and
+ level map
+
+FAST runs whole-panel A2 (0x11), which the kernel does not dither: its
+auto-clean table drives every pixel in proportion to the change of its
+level, and the cleanup passes refine it. So A2 can draw greys in 35 ms
+passes, where HD (0x21) takes 443 ms. Measured with
+scripts/eink-bench/greys.py (perfetto timing, GR III photos): A2 with
+the app's greys reaches 12 distinct greys from white and 10 from black,
+4.7 L* apart, like HD (4.0); DU with greys is history-bound (22 L*).
+
+debug.sf.eink.fast_greys (default: HiBreakParts'
+vendor.xrz.hibreak_fast_greys): 1 = the 16-level version of the render
+pass in FAST except while the keyboard is up (the full pass then, as
+before), 2 = always, 0 = off (as before). Only for 0xb3/0x11: partial
+A2 (0x10) and HYPER get the kernel's 1-bit Atkinson.
+
+Its tone curve is debug.sf.eink.gamma_fast_x100 (default 200) and
+debug.sf.eink.fast_levels ("l0,...,l15") maps each of the 16 steps to
+a panel level, so levels that A2 doesn't reach reliably can be skipped.
+Without the debug properties both come from HiBreakParts
+(vendor.xrz.hibreak_fast_gamma_x100 / _fast_levels), which picks them
+per temperature band. DisplaySettings::einkLevelMap carries the map (identity for HD/CLEAN,
+whose output is unchanged; checked bit for bit with skia-python).
+---
+ .../include/renderengine/DisplaySettings.h    |  8 ++-
+ libs/renderengine/skia/SkiaRenderEngine.cpp   | 18 ++++++
+ .../CompositionEngine/src/Output.cpp          | 56 +++++++++++++++++++
+ 3 files changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/libs/renderengine/include/renderengine/DisplaySettings.h b/libs/renderengine/include/renderengine/DisplaySettings.h
+index 16a2657..522f7a0 100644
+--- a/libs/renderengine/include/renderengine/DisplaySettings.h
++++ b/libs/renderengine/include/renderengine/DisplaySettings.h
+@@ -126,6 +126,11 @@ struct DisplaySettings {
+     float einkCrush = 0.36f;
+     float einkGamma = 1.25f;
+     float einkGamma16 = 1.25f;
++    // Panel level for each of the 16 steps of einkMode 2, 4 bits per step (step k in bits
++    // 4k..4k+3).
++    // Identity for HD/CLEAN; for greys in FAST (A2) a map measured on the panel skips levels
++    // that A2's proportional drives don't reach reliably.
++    uint64_t einkLevelMap = 0xFEDCBA9876543210ull;
+     float einkMinTone = 1.f;
+     bool einkKnock = true;
+     bool einkInvert = false;
+@@ -199,7 +204,8 @@ static inline bool operator==(const DisplaySettings& lhs, const DisplaySettings&
+             lhs.einkContourLight == rhs.einkContourLight &&
+             lhs.einkContourSolid == rhs.einkContourSolid && lhs.einkBleach == rhs.einkBleach &&
+             lhs.einkCrush == rhs.einkCrush && lhs.einkGamma == rhs.einkGamma &&
+-            lhs.einkGamma16 == rhs.einkGamma16 && lhs.einkMinTone == rhs.einkMinTone &&
++            lhs.einkGamma16 == rhs.einkGamma16 && lhs.einkLevelMap == rhs.einkLevelMap &&
++            lhs.einkMinTone == rhs.einkMinTone &&
+             lhs.einkKnock == rhs.einkKnock && lhs.einkInvert == rhs.einkInvert &&
+             lhs.einkOffscreen == rhs.einkOffscreen;
+ }
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+index 6a1126e..0264d56 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -1026,6 +1026,11 @@ static const char* const kEinkRenderHdSkSL = R"(
+     uniform shader noise;
+     uniform float gamma16;
+     uniform float invert;
++    // panel level per step: lv0 = steps 0-3, ..., lv3 = steps 12-15 (DisplaySettings::einkLevelMap)
++    uniform half4 lv0;
++    uniform half4 lv1;
++    uniform half4 lv2;
++    uniform half4 lv3;
+     const half3 W = half3(0.299, 0.587, 0.114);
+     half4 main(float2 xy) {
+         half l = dot(img.eval(xy).rgb, W);
+@@ -1034,6 +1039,11 @@ static const char* const kEinkRenderHdSkSL = R"(
+         half t = saturate((l - 0.04) / 0.92);
+         t = t <= 0.0 ? 0.0 : pow(t, gamma16);
+         half q = clamp(floor(t * 15.0 + th), 0.0, 15.0);
++        const half4 steps = half4(0.0, 1.0, 2.0, 3.0);
++        const half4 near = half4(0.5);
++        q = dot(lv0, step(abs(steps - q), near)) + dot(lv1, step(abs(steps + 4.0 - q), near)) +
++            dot(lv2, step(abs(steps + 8.0 - q), near)) +
++            dot(lv3, step(abs(steps + 12.0 - q), near));
+         half v = (q * 16.0 + 4.0) / 255.0;  // passes the kernel's 16-level dither unchanged
+         return half4(v, v, v, 1.0);
+     }
+@@ -1076,6 +1086,14 @@ bool SkiaRenderEngine::drawEinkRender(const DisplaySettings& display,
+     builder.uniform("invert") = display.einkInvert ? 1.f : 0.f;
+     if (display.einkMode >= 2) {
+         builder.uniform("gamma16") = std::max(display.einkGamma16, 0.1f);
++        float lv[16];
++        for (int k = 0; k < 16; k++) {
++            lv[k] = static_cast<float>((display.einkLevelMap >> (4 * k)) & 0xFu);
++        }
++        builder.uniform("lv0") = SkV4{lv[0], lv[1], lv[2], lv[3]};
++        builder.uniform("lv1") = SkV4{lv[4], lv[5], lv[6], lv[7]};
++        builder.uniform("lv2") = SkV4{lv[8], lv[9], lv[10], lv[11]};
++        builder.uniform("lv3") = SkV4{lv[12], lv[13], lv[14], lv[15]};
+     } else if (display.einkMode == 1) {
+         builder.uniform("bleach") = display.einkBleach;
+         builder.uniform("crush") = display.einkCrush;
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index 8747b3e..85080d6 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -54,6 +54,7 @@
+ // TODO(b/129481165): remove the #pragma below and fix conversion issues
+ #pragma clang diagnostic pop // ignored "-Wconversion"
+ 
++#include <android-base/parseint.h>
+ #include <android-base/properties.h>
+ #include <sys/system_properties.h>
+ #include <cmath>
+@@ -1568,6 +1569,9 @@ struct EinkEnhance {
+     float crush = 0.36f;
+     float gamma = 1.25f;
+     float gamma16 = 1.25f;
++    // Panel level for each of the 16 steps of the 16-level version, 4 bits each (step k in
++    // bits 4k..4k+3); identity except for greys in FAST.
++    uint64_t levelMap = 0xFEDCBA9876543210ull;
+     float minTone = 1.f;
+     bool knock = true;
+     bool invert = false;
+@@ -1584,6 +1588,23 @@ float einkProp(const char* name, uint32_t def, float scale) {
+     return base::GetUintProperty<uint32_t>(name, def) / scale;
+ }
+ 
++// "l0,l1,...,l15": the panel level (0-15) for each of the 16 steps of the 16-level version, packed
++// 4 bits per step. Missing or invalid entries keep the identity.
++uint64_t einkLevelMap(const char* name) {
++    uint64_t map = 0xFEDCBA9876543210ull;
++    const std::string s = base::GetProperty(name, "");
++    size_t pos = 0;
++    for (uint64_t k = 0; k < 16 && pos < s.size(); k++) {
++        const size_t end = std::min(s.find(',', pos), s.size());
++        uint32_t level = 0;
++        if (base::ParseUint(s.substr(pos, end - pos), &level, 15u)) {
++            map = (map & ~(0xFull << (4 * k))) | (static_cast<uint64_t>(level) << (4 * k));
++        }
++        pos = end + 1;
++    }
++    return map;
++}
++
+ EinkEnhance getEinkEnhance(bool trackKernelDither) {
+     static std::mutex sMutex;
+     static uint32_t sSerial = 0xffffffffu;
+@@ -1621,6 +1642,7 @@ EinkEnhance getEinkEnhance(bool trackKernelDither) {
+         c.commitDisabled = commitDisabled;
+         c.kernelDither = base::GetBoolProperty("debug.sf.eink_kernel_dither", true);
+         if (c.render >= 3 && enhancePct > 0) {
++            bool fastGreys = false;
+             // The panel's mode decides what the frame must become: NORMAL (DU, dithered by the
+             // kernel) gets the full pass; FAST and HYPER (A2, never dithered by the kernel: greys
+             // would become partial drives and grey residue) the cheap one; the grey modes
+@@ -1638,6 +1660,24 @@ EinkEnhance getEinkEnhance(bool trackKernelDither) {
+                             base::GetUintProperty<uint32_t>("debug.sf.eink.fast_full", 2u);
+                     const bool ime = base::GetBoolProperty("vendor.xrz.hibreak_ime_visible", false);
+                     c.mode = (full == 1 || (full == 2 && ime)) ? 0 : 1;
++                    // Greys in FAST: the 16-level version. A2 (0x11) is not dithered by the
++                    // kernel, its auto-clean table drives each pixel in proportion to the change
++                    // of its level and its cleanup passes then refine it: greys in 35 ms passes,
++                    // where HD takes 443 ms (scripts/eink-bench/greys.py). Tone curve
++                    // (debug.sf.eink.gamma_fast_x100) and level map (debug.sf.eink.fast_levels)
++                    // are measured on the panel. debug.sf.eink.fast_greys (default: HiBreakParts'
++                    // vendor.xrz.hibreak_fast_greys): 1 = greys except while the keyboard is up
++                    // (the full pass then, as above), 2 = greys always, 0 = off.
++                    const uint32_t greys = base::GetUintProperty<uint32_t>(
++                            "debug.sf.eink.fast_greys",
++                            base::GetUintProperty<uint32_t>("vendor.xrz.hibreak_fast_greys", 0u));
++                    // Only the whole-panel A2 path is undithered: partial A2 (0x10) and HYPER
++                    // (0xb7) get the kernel's 1-bit Atkinson.
++                    const bool a2 = effectiveMode == 0xb3 || effectiveMode == 0x11;
++                    if (a2 && (greys == 2 || (greys == 1 && c.mode == 1))) {
++                        c.mode = 2;
++                        fastGreys = true;
++                    }
+                     break;
+                 }
+                 case 0xb1: case 0x21: case 0x20: case 0x84: case 0x40: case 0xb4:
+@@ -1660,6 +1700,21 @@ EinkEnhance getEinkEnhance(bool trackKernelDither) {
+             c.contourSolid = einkProp("debug.sf.eink.contoursolid_x1000", 100u, 1000.f);
+             c.gamma = einkProp("debug.sf.eink.gamma_x100", 125u, 100.f);
+             c.gamma16 = einkProp("debug.sf.eink.gamma16_x100", 125u, 100.f);
++            c.levelMap = 0xFEDCBA9876543210ull;
++            if (fastGreys) {
++                // Measured per temperature band: HiBreakParts publishes the band's curve and map
++                // (vendor.xrz.hibreak_fast_gamma_x100 / _fast_levels) from the battery
++                // temperature, one of the two the kernel picks its waveform by. The debug
++                // properties override them for the bench.
++                c.gamma16 = einkProp("debug.sf.eink.gamma_fast_x100",
++                                     base::GetUintProperty<uint32_t>(
++                                             "vendor.xrz.hibreak_fast_gamma_x100", 200u),
++                                     100.f);
++                c.levelMap = einkLevelMap(
++                        base::GetProperty("debug.sf.eink.fast_levels", "").empty()
++                                ? "vendor.xrz.hibreak_fast_levels"
++                                : "debug.sf.eink.fast_levels");
++            }
+             c.minTone = einkProp("debug.sf.eink.mintone_x1000", 1000u, 1000.f);
+             c.knock = base::GetBoolProperty("debug.sf.eink.knock", true);
+             // HiBreakParts' per-app "inverted" mode, set while such an app is in front
+@@ -1804,6 +1859,7 @@ void Output::applyEinkEnhance(renderengine::DisplaySettings& settings, bool trac
+     settings.einkCrush = eink.crush;
+     settings.einkGamma = eink.gamma;
+     settings.einkGamma16 = eink.gamma16;
++    settings.einkLevelMap = eink.levelMap;
+     settings.einkMinTone = eink.minTone;
+     settings.einkKnock = eink.knock;
+     settings.einkInvert = eink.invert;
+-- 
+2.50.1 (Apple Git-155)
+

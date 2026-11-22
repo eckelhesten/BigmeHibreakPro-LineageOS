@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- E-ink: dark UIs ghost badly and look muddy, so default to the light theme
+         (LineageOS sets 2 = dark in vendor/lineage/overlay/common). -->
+    <integer name="config_defaultNightMode">1</integer>
+
+    <!-- E-ink: a blinking text cursor costs a panel update twice a second, so it doesn't blink
+         by default. Users can still pick an interval in Accessibility. -->
+    <integer name="def_accessibility_text_cursor_blink_interval_ms">0</integer>
+
+    <!-- E-ink: a fling keeps producing frames until it stops, and the panel shows about ten of
+         them a second. More friction (AOSP 0.015) ends a fling in about half the time and
+         distance, so a list settles sooner. -->
+    <item name="config_scrollFriction" format="float" type="dimen">0.032</item>
+
+    <!-- No display cutout. MediaTek's vendor overlay declares a 40x26 dp notch at the top centre,
+         but the HiBreak Pro's camera sits in the bezel, so full-screen apps that don't handle
+         cutouts were moved down by a black bar. -->
+    <string name="config_mainBuiltInDisplayCutout" translatable="false"></string>
+    <string name="config_mainBuiltInDisplayCutoutRectApproximation" translatable="false"></string>
+
+    <!-- Auto brightness drives an e-ink front light, not a backlight. Android's curve is flat
+         here (backlight 22, the middle of the brightness slider), so in auto mode the slider is
+         the user's level, and HiBreakParts' FrontLightController scales it by the light sensor
+         (brighter in the dark, off in daylight). The bottom of the slider turns it off. -->
+    <integer-array name="config_autoBrightnessLevels">
+        <item>10</item>
+    </integer-array>
+    <integer-array name="config_autoBrightnessLcdBacklightValues">
+        <item>22</item>
+        <item>22</item>
+    </integer-array>
+
+    <!-- Sleep screen (always-on display): an e-ink panel keeps its image without power, so AOD
+         costs one panel update per change (the minute, a notification). The lock screen
+         wallpaper stays visible in AOD. -->
+    <!-- The vendor overlay names com.android.dreams.alwaysondisplay, which isn't installed. -->
+    <string name="config_dozeComponent" translatable="false">com.android.systemui/com.android.systemui.doze.DozeService</string>
+    <bool name="config_dozeAlwaysOnDisplayAvailable">true</bool>
+    <bool name="config_dozeAlwaysOnEnabled">true</bool>
+    <bool name="config_dozeSupportsAodWallpaper">true</bool>
+
+    <!-- E-ink: screensavers while charging waste refreshes; the sleep screen covers standby. -->
+    <bool name="config_dreamsSupported">false</bool>
+    <bool name="config_dreamsEnabledByDefault">false</bool>
+
+    <!-- VoLTE through MediaTek's IMS service (docs/volte.md). Carriers still have to allow it
+         (carrier_volte_available_bool; CarrierConfigHiBreakPro adds the ones AOSP lacks).
+         Video calling and Wi-Fi calling stay off: ViLTE needs MediaTek's vtservice and media
+         libraries on system, which we don't carry, and Wi-Fi calling is untested. -->
+    <bool name="config_device_volte_available">true</bool>
+    <bool name="config_device_vt_available">false</bool>
+    <bool name="config_device_wfc_ims_available">false</bool>
+</resources>

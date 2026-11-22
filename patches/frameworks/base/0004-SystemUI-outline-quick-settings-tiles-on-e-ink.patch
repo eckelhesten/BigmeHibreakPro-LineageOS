@@ -1,0 +1,62 @@
+From e97f46aa9c5491e148d280206324b890b996fc26 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Fri, 13 Nov 2026 16:07:00 +0000
+Subject: [PATCH 4/4] SystemUI: outline quick settings tiles on e-ink
+
+With debug.sysui.eink_palette=1 every quick settings tile gets a 2dp
+outline in the on-surface colour. With the two-tone palette the
+inactive tile surface is as white as the shade, so without an outline
+the tile edges are invisible.
+
+Change-Id: I85bcc89bb66798f6acf613b2264f08512c990645
+---
+ .../qs/panels/ui/compose/infinitegrid/Tile.kt        | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/qs/panels/ui/compose/infinitegrid/Tile.kt b/packages/SystemUI/src/com/android/systemui/qs/panels/ui/compose/infinitegrid/Tile.kt
+index 1d254bff9..45431fb7a 100644
+--- a/packages/SystemUI/src/com/android/systemui/qs/panels/ui/compose/infinitegrid/Tile.kt
++++ b/packages/SystemUI/src/com/android/systemui/qs/panels/ui/compose/infinitegrid/Tile.kt
+@@ -28,6 +28,7 @@ import androidx.compose.animation.animateColorAsState
+ import androidx.compose.animation.core.animateDpAsState
+ import androidx.compose.foundation.ExperimentalFoundationApi
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.border
+ import androidx.compose.foundation.combinedClickable
+ import androidx.compose.foundation.gestures.Orientation
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+@@ -200,6 +201,7 @@ fun ContentScope.Tile(
+         val tileShape by TileDefaults.animateTileShapeAsState(uiState.state)
+         val animatedColor by animateColorAsState(colors.background, label = "QSTileBackgroundColor")
+         val isDualTarget = uiState.handlesSecondaryClick
++        val einkOutlineColor = MaterialTheme.colorScheme.onSurface
+ 
+         val surfaceRevealModifier: Modifier
+         val contentRevealModifier: Modifier
+@@ -224,6 +226,11 @@ fun ContentScope.Tile(
+                 modifier
+                     .then(surfaceRevealModifier)
+                     .borderOnFocus(color = MaterialTheme.colorScheme.secondary, tileShape.topEnd)
++                    .thenIf(EINK_TILE_OUTLINE) {
++                        // E-ink: the inactive tile surface is as white as the shade, so draw the
++                        // tile edge. Active tiles are solid and the outline merges with them.
++                        Modifier.border(EinkTileOutlineWidth, einkOutlineColor, tileShape)
++                    }
+                     .fillMaxWidth()
+                     .thenIf(currentBounceableInfo != null) {
+                         Modifier.bounceable(
+@@ -364,6 +371,11 @@ private fun TileExpandable(
+     }
+ }
+ 
++/** E-ink panels (debug.sysui.eink_palette=1): outline every tile. */
++private val EINK_TILE_OUTLINE: Boolean =
++    android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)
++private val EinkTileOutlineWidth = 2.dp
++
+ @Composable
+ fun TileContainer(
+     onClick: (() -> Unit)?,
+-- 
+2.43.0
+

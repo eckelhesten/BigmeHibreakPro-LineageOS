@@ -1,0 +1,346 @@
+From 85e3dfda07be3784cf9edcd5410656c3b70fb33a Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sat, 14 Nov 2026 09:40:17 +0100
+Subject: [PATCH] sf: fast e-ink mode while the screen moves or the keyboard is
+ up
+
+For the XRZ e-ink composer (Bigme HiBreak Pro), which takes its refresh
+mode from vendor.xrz.global_refresh_mode on every commit. Its NORMAL mode
+(DU) shows a frame about every 120 ms, FAST (A2) about every 36 ms; both
+run on the kernel's self-cleaning path.
+
+With debug.sf.eink_motion=1, SurfaceFlinger sets the property to FAST
+when three composites follow each other within 150 ms, or while the input
+method's layer is visible. 700 ms after the last frame, once the kernel
+has finished cleaning up after the FAST frames, it puts the
+previous mode back and repaints once, so the still screen is drawn in the
+mode the user chose. If someone else changes the property meanwhile, that
+value becomes the mode to return to.
+
+vendor.xrz.hibreak_motion_fast and vendor.xrz.hibreak_ime_fast switch the
+two triggers; debug.sf.eink_motion.{mode,frames,gap_ms,end_ms} tune it.
+---
+ services/surfaceflinger/Android.bp            |   1 +
+ .../DisplayHardware/EinkMotion.cpp            | 161 ++++++++++++++++++
+ .../DisplayHardware/EinkMotion.h              |  81 +++++++++
+ services/surfaceflinger/SurfaceFlinger.cpp    |  22 +++
+ 4 files changed, 265 insertions(+)
+ create mode 100644 services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+ create mode 100644 services/surfaceflinger/DisplayHardware/EinkMotion.h
+
+diff --git a/services/surfaceflinger/Android.bp b/services/surfaceflinger/Android.bp
+index 27c7042..c71524a 100644
+--- a/services/surfaceflinger/Android.bp
++++ b/services/surfaceflinger/Android.bp
+@@ -187,6 +187,7 @@ filegroup {
+         "DisplayHardware/AidlComposerHal.cpp",
+         "DisplayHardware/ComposerHal.cpp",
+         "DisplayHardware/EinkEngine.cpp",
++        "DisplayHardware/EinkMotion.cpp",
+         "DisplayHardware/FramebufferSurface.cpp",
+         "DisplayHardware/HWC2.cpp",
+         "DisplayHardware/HWComposer.cpp",
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+new file mode 100644
+index 0000000..a50f3ce
+--- /dev/null
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -0,0 +1,161 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#undef LOG_TAG
++#define LOG_TAG "EinkMotion"
++
++#include "EinkMotion.h"
++
++#include <android-base/properties.h>
++#include <log/log.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <string>
++
++namespace android {
++namespace {
++
++constexpr char kModeProperty[] = "vendor.xrz.global_refresh_mode";
++
++uint32_t readUint(const prop_info* pi, uint32_t fallback) {
++    if (!pi) return fallback;
++    uint32_t value = fallback;
++    __system_property_read_callback(
++            pi,
++            [](void* cookie, const char*, const char* v, uint32_t) {
++                char* end = nullptr;
++                const unsigned long parsed = strtoul(v, &end, 0);
++                if (end != v) *static_cast<uint32_t*>(cookie) = static_cast<uint32_t>(parsed);
++            },
++            &value);
++    return value;
++}
++
++} // namespace
++
++bool EinkMotion::enabled() {
++    static const bool sEnabled = base::GetBoolProperty("debug.sf.eink_motion", false);
++    return sEnabled;
++}
++
++EinkMotion& EinkMotion::get() {
++    static EinkMotion sInstance;
++    return sInstance;
++}
++
++void EinkMotion::setRepaint(std::function<void()> repaint) {
++    std::lock_guard lock(mMutex);
++    mRepaint = std::move(repaint);
++    if (!mStarted) {
++        mStarted = true;
++        std::thread([this] { threadLoop(); }).detach(); // lives as long as SurfaceFlinger
++    }
++}
++
++void EinkMotion::reloadConfigIfChanged() {
++    // The global serial changes with every property write anywhere; reloading is cheap.
++    const uint32_t serial = __system_property_area_serial();
++    if (serial == mPropSerial) return;
++    mPropSerial = serial;
++    Config c;
++    c.motion = base::GetBoolProperty("vendor.xrz.hibreak_motion_fast", true);
++    c.ime = base::GetBoolProperty("vendor.xrz.hibreak_ime_fast", true);
++    c.fastMode = base::GetUintProperty<uint32_t>("debug.sf.eink_motion.mode", 0xb3);
++    c.frames = std::max(2u, base::GetUintProperty<uint32_t>("debug.sf.eink_motion.frames", 3));
++    c.gap = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.gap_ms", 150));
++    // The kernel cleans up after the last FAST frame in passes that take ~600 ms; a mode change
++    // before they finish cancels them and leaves ghosts.
++    c.end = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.end_ms", 700));
++    mConfig = c;
++}
++
++uint32_t EinkMotion::readMode() {
++    if (!mModeProp) mModeProp = __system_property_find(kModeProperty);
++    const uint32_t mode = readUint(mModeProp, 0);
++    return mode == 0xffffffffu ? 0 : mode;
++}
++
++void EinkMotion::writeMode(uint32_t mode) {
++    base::SetProperty(kModeProperty, std::to_string(mode));
++}
++
++bool EinkMotion::isFast(uint32_t mode) const {
++    // FAST as a policy mode, or A2 as a raw waveform (with and without the cleanup bit).
++    const uint32_t m = mode & 0xff;
++    return m == (mConfig.fastMode & 0xff) || m == 0xb3 || m == 0x10 || m == 0x11;
++}
++
++void EinkMotion::onComposite(bool imeVisible) {
++    std::lock_guard lock(mMutex);
++    reloadConfigIfChanged();
++    const nsecs_t now = systemTime();
++    mStreak = (mLastFrame != 0 && now - mLastFrame <= mConfig.gap) ? mStreak + 1 : 1;
++    mLastFrame = now;
++    mImeVisible = imeVisible;
++
++    const bool wantFast = (mConfig.motion && mStreak >= mConfig.frames) ||
++            (mConfig.ime && imeVisible);
++    const uint32_t current = readMode();
++    if (mFast && current != mWritten) {
++        // Someone else changed the mode meanwhile (e.g. another app came to the front): that is
++        // the mode to go back to.
++        mBase = current;
++        mFast = false;
++    }
++    if (wantFast && !mFast && !isFast(current)) {
++        mBase = current;
++        mWritten = mConfig.fastMode;
++        writeMode(mWritten);
++        mFast = true;
++    }
++    // The thread ends the fast mode once the frames stop.
++    if (mFast) mCondition.notify_one();
++}
++
++void EinkMotion::threadLoop() {
++    std::unique_lock lock(mMutex);
++    while (true) {
++        if (!mFast) {
++            mCondition.wait(lock);
++            continue;
++        }
++        const nsecs_t now = systemTime();
++        const nsecs_t due = mLastFrame + mConfig.end;
++        const bool held = mConfig.ime && mImeVisible;
++        if (held) {
++            // The keyboard is up; onComposite wakes us when that changes.
++            mCondition.wait(lock);
++            continue;
++        }
++        if (now < due) {
++            mCondition.wait_for(lock, std::chrono::nanoseconds(due - now));
++            continue;
++        }
++        // The screen is still: back to the user's mode, and one repaint in it.
++        if (readMode() == mWritten) writeMode(mBase);
++        mFast = false;
++        mStreak = 0;
++        mLastFrame = 0; // the repaint must not count as motion
++        const auto repaint = mRepaint;
++        lock.unlock();
++        if (repaint) repaint();
++        lock.lock();
++    }
++}
++
++} // namespace android
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+new file mode 100644
+index 0000000..f427271
+--- /dev/null
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -0,0 +1,81 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <condition_variable>
++#include <functional>
++#include <mutex>
++#include <thread>
++
++#include <sys/system_properties.h>
++#include <utils/Timers.h>
++
++namespace android {
++
++// Fast e-ink mode while the screen moves or the keyboard is up, for the XRZ e-ink composer
++// (Bigme HiBreak Pro). The composer takes its refresh mode from vendor.xrz.global_refresh_mode
++// on every commit. NORMAL (DU) shows a frame every ~120 ms, FAST (A2) every ~36 ms, both on the
++// kernel's self-cleaning path. This class switches the property to FAST while frames arrive in a
++// row or while the input method is visible, then puts the previous mode back and asks for one
++// repaint, so the still screen is drawn in the mode the user chose.
++class EinkMotion {
++public:
++    // debug.sf.eink_motion, read once.
++    static bool enabled();
++    static EinkMotion& get();
++
++    // Called once, with a thread-safe function that makes SurfaceFlinger composite again.
++    void setRepaint(std::function<void()> repaint);
++
++    // Called on the main thread for every composite, before it is presented.
++    void onComposite(bool imeVisible);
++
++private:
++    EinkMotion() = default;
++
++    struct Config {
++        bool motion = true;      // vendor.xrz.hibreak_motion_fast
++        bool ime = true;         // vendor.xrz.hibreak_ime_fast
++        uint32_t fastMode = 0xb3; // debug.sf.eink_motion.mode
++        uint32_t frames = 3;     // debug.sf.eink_motion.frames
++        nsecs_t gap = 0;         // debug.sf.eink_motion.gap_ms
++        nsecs_t end = 0;         // debug.sf.eink_motion.end_ms
++    };
++
++    void reloadConfigIfChanged();
++    uint32_t readMode();
++    void writeMode(uint32_t mode);
++    bool isFast(uint32_t mode) const;
++    void threadLoop();
++
++    std::mutex mMutex;
++    std::condition_variable mCondition;
++    bool mStarted = false;
++    std::function<void()> mRepaint;
++    Config mConfig;
++    uint32_t mPropSerial = 0xffffffffu;
++    const prop_info* mModeProp = nullptr;
++
++    nsecs_t mLastFrame = 0;
++    uint32_t mStreak = 0;
++    bool mImeVisible = false;
++    bool mFast = false;    // the property holds our fast mode
++    uint32_t mBase = 0;    // the mode to put back
++    uint32_t mWritten = 0; // what we wrote, to notice when someone else changes the mode
++};
++
++} // namespace android
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index d1dcc3d..7c7fe7d 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -137,6 +137,7 @@
+ #include "Display/DisplayIdentification.h"
+ #include "DisplayDevice.h"
+ #include "DisplayHardware/ComposerHal.h"
++#include "DisplayHardware/EinkMotion.h"
+ #include "DisplayHardware/FramebufferSurface.h"
+ #include "DisplayHardware/Hal.h"
+ #include "DisplayHardware/VirtualDisplay/LegacyVirtualDisplaySurface.h"
+@@ -949,6 +950,10 @@ void SurfaceFlinger::init() FTL_FAKE_GUARD(kMainThreadContext) {
+           "Initializing graphics H/W...");
+     addTransactionReadyFilters();
+     mTransactionHandler.setTransactionBarrierTtl(std::chrono::seconds(5));
++    if (EinkMotion::enabled()) {
++        // E-ink: a fast refresh mode while the screen moves; scheduleRepaint is thread-safe.
++        EinkMotion::get().setRepaint([this] { scheduleRepaint(); });
++    }
+     Mutex::Autolock lock(mStateLock);
+ 
+     // Get a RenderEngine for the given display / config (can't fail)
+@@ -3245,6 +3250,23 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                                              offloadedLayers);
+     }
+ 
++    if (EinkMotion::enabled()) {
++        // E-ink: tell the motion detector about this frame before the composer commits it, and
++        // whether the input method is on screen (its buffer layer is named "InputMethod#<id>").
++        // The snapshots are held by the layers' front ends while a frame is composited, not by
++        // mLayerSnapshotBuilder.
++        bool imeVisible = false;
++        for (const auto& [layer, layerFE] : layers) {
++            const auto& snapshot = layerFE->mSnapshot;
++            if (snapshot && snapshot->isVisible &&
++                snapshot->name.find("InputMethod#") != std::string::npos) {
++                imeVisible = true;
++                break;
++            }
++        }
++        EinkMotion::get().onComposite(imeVisible);
++    }
++
+     mCompositionEngine->present(mainThreadRefreshArgs);
+ 
+     finalizeReadback(mainThreadRefreshArgs.outputs);
+-- 
+2.50.1 (Apple Git-155)
+

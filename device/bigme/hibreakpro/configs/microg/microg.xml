@@ -1,0 +1,22 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<!-- microG system defaults (/system/etc/microg.xml, read by GmsCore's SettingsProvider when the
+     user has not set a value). microG ships with everything off; a phone that is meant to pass
+     Play Integrity and get push messages needs these on from the first boot.
+     - checkin_enable_service: device registration with Google, the base for everything below.
+     - gcm_enable_mcs_service: cloud messaging (push notifications of apps).
+     - safetynet_enabled, droidguard_enabled: device attestation; without it the Play Integrity
+       service answers "API is disabled".
+     - droidguard_block_hw_attestation=false: this phone's keymaster has a valid Google-rooted
+       attestation key, which Play Integrity requires on Android 13+ for any verdict; microG
+       blocks access to it by default.
+     - vending_licensing: lets apps check their Play licence with the signed-in account, which
+       Play Integrity requires on Android 13+ before it returns MEETS_BASIC_INTEGRITY.
+     See docs/play-integrity.md. -->
+<map>
+    <boolean name="checkin_enable_service" value="true" />
+    <boolean name="gcm_enable_mcs_service" value="true" />
+    <boolean name="safetynet_enabled" value="true" />
+    <boolean name="droidguard_enabled" value="true" />
+    <boolean name="droidguard_block_hw_attestation" value="false" />
+    <boolean name="vending_licensing" value="true" />
+</map>

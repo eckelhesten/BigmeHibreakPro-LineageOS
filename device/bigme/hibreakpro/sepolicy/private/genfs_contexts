@@ -1,0 +1,5 @@
+# E-ink tuning nodes (debugfs is labelled by genfscon, not file_contexts)
+genfscon debugfs /eink_debug    u:object_r:xrz_debugfs:s0
+# Front light channels (LM3630A on i2c-7), see frontlight.te
+genfscon sysfs /devices/platform/11d01000.i2c7/i2c-7/7-0036/lm3630a_cold_light    u:object_r:sysfs_hibreak_frontlight:s0
+genfscon sysfs /devices/platform/11d01000.i2c7/i2c-7/7-0036/lm3630a_warm_light    u:object_r:sysfs_hibreak_frontlight:s0

@@ -1,0 +1,238 @@
+From c685107048967630a9377db2120f177440f601ab Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Thu, 19 Nov 2026 17:35:06 +0000
+Subject: [PATCH] power: hold LAUNCH while a finger is on the e-ink screen
+ (touch boost)
+
+On the HiBreak Pro every page turn ran at the floor clocks (little cores
+500 MHz, big 650 MHz): MediaTek's power HAL ignores Boost.INTERACTION and
+boosts only for Mode.LAUNCH, and LineageOS has none of the MTK framework
+hints stock uses. After a few seconds without input the scheduler also
+forgets the reader's render thread and starts it on a little core, so the
+first page turn after reading a page lagged (up to 260 ms to the first
+panel update, against ~100 ms).
+
+DisplayPolicy now tells PowerManagerInternal.setTouchBoost() when a finger
+goes down on the default display and when the last one lifts.
+PowerManagerService then holds LAUNCH from the touch down until
+debug.eink.touch_boost_ms after the lift (0 or unset = off; at most
+debug.eink.touch_boost_max_ms, default 2000, from the down), and for as
+long as a fling moves: DisplayPolicy's fling detector already sends
+Boost.INTERACTION with the fling's duration, which now extends the touch
+boost (same cap), so the frames of a fling don't fall back to the floor
+clocks 250 ms after the finger lifts. The activity
+manager drives LAUNCH as well, for app launches, so the service keeps what
+callers asked for and what the touch needs apart and gives the HAL LAUNCH
+while either wants it. Battery saver's "no launch boost" also stops the
+touch boost. The HAL call runs on the power manager's handler, not on the
+input thread.
+
+Change-Id: I245011c9a997efc64fe8a62baa529d65b44c44ab
+---
+ .../java/android/os/PowerManagerInternal.java |   8 ++
+ .../server/power/PowerManagerService.java     | 109 ++++++++++++++++++
+ .../com/android/server/wm/DisplayPolicy.java  |   9 +-
+ 3 files changed, 125 insertions(+), 1 deletion(-)
+
+diff --git a/core/java/android/os/PowerManagerInternal.java b/core/java/android/os/PowerManagerInternal.java
+index 741b92128..ff03e9334 100644
+--- a/core/java/android/os/PowerManagerInternal.java
++++ b/core/java/android/os/PowerManagerInternal.java
+@@ -375,6 +375,14 @@ public abstract class PowerManagerInternal {
+      */
+     public abstract void setPowerMode(int mode, boolean enabled);
+ 
++    /**
++     * A finger went down on (true) or left (false) the default display. With
++     * debug.eink.touch_boost_ms set, the power HAL's LAUNCH mode is held for the touch and
++     * for that long after it, so the work a touch starts runs at full clocks (e-ink phones whose
++     * vendor HAL has no other usable touch boost). Called by the window manager.
++     */
++    public void setTouchBoost(boolean down) {}
++
+     /** Returns whether there hasn't been a user activity event for the given number of ms. */
+     public abstract boolean wasDeviceIdleFor(long ms);
+ 
+diff --git a/services/core/java/com/android/server/power/PowerManagerService.java b/services/core/java/com/android/server/power/PowerManagerService.java
+index ff600c7d0..1ae1ce9c6 100644
+--- a/services/core/java/com/android/server/power/PowerManagerService.java
++++ b/services/core/java/com/android/server/power/PowerManagerService.java
+@@ -349,6 +349,41 @@ public final class PowerManagerService extends SystemService
+     private final NativeWrapper mNativeWrapper;
+     private final SystemPropertiesWrapper mSystemProperties;
+     private final Clock mClock;
++
++    /**
++     * Touch boost (e-ink phones, HiBreak Pro): the power HAL's LAUNCH mode is held while a finger
++     * is on the default display and for debug.eink.touch_boost_ms after it lifts (0 or unset =
++     * off), at most debug.eink.touch_boost_max_ms (default 2000) from the touch down, and for
++     * as long as a fling moves (Boost.INTERACTION with a duration, same cap). MediaTek's
++     * HAL boosts only for LAUNCH (both clusters at max, top-app uclamp 100); INTERACTION does
++     * nothing there, so without this every page turn ran at the floor clocks. LAUNCH is also
++     * set by the activity manager for real launches: the HAL gets LAUNCH while either asks for
++     * it, so neither ends the other's boost.
++     */
++    private static final String PROP_TOUCH_BOOST_MS = "debug.eink.touch_boost_ms";
++    private static final String PROP_TOUCH_BOOST_MAX_MS = "debug.eink.touch_boost_max_ms";
++    private final Object mTouchBoostLock = new Object();
++    /** What callers of setPowerMode last asked for LAUNCH. */
++    @GuardedBy("mTouchBoostLock")
++    private boolean mLaunchRequested;
++    /** What the HAL was last told for LAUNCH. */
++    @GuardedBy("mTouchBoostLock")
++    private boolean mLaunchSent;
++    /** Uptime until which the touch boost holds LAUNCH (max of touch hold/tail and fling). */
++    @GuardedBy("mTouchBoostLock")
++    private long mTouchBoostUntil;
++    /** Uptime cap for the current finger-down gesture (prevents re-boosting on late release). */
++    @GuardedBy("mTouchBoostLock")
++    private long mTouchDownCap;
++    /** Uptime until which a fling (Boost.INTERACTION) extends the touch boost. */
++    @GuardedBy("mTouchBoostLock")
++    private long mFlingBoostUntil;
++    private final Runnable mTouchBoostExpired = () -> {
++        final boolean disabled = isLaunchBoostDisabled();
++        synchronized (mTouchBoostLock) {
++            sendLaunchModeLocked(false, disabled);
++        }
++    };
+     private final Injector mInjector;
+     private final PermissionCheckerWrapper mPermissionCheckerWrapper;
+     private final PowerPropertiesWrapper mPowerPropertiesWrapper;
+@@ -5004,6 +5039,10 @@ public final class PowerManagerService extends SystemService
+ 
+     private void setPowerBoostInternal(int boost, int durationMs) {
+         // Maybe filter the event.
++        if (mSystemReady && boost == Boost.INTERACTION && durationMs > 0) {
++            // A fling (DisplayPolicy): the touch boost lasts as long as the fling moves.
++            mHandler.post(() -> extendTouchBoostInternal(durationMs));
++        }
+         mNativeWrapper.nativeSetPowerBoost(boost, durationMs);
+     }
+ 
+@@ -5013,9 +5052,86 @@ public final class PowerManagerService extends SystemService
+                 && mBatterySaverStateMachine.getBatterySaverController().isLaunchBoostDisabled()) {
+             return false;
+         }
++        if (mode == Mode.LAUNCH) {
++            final boolean disabled = isLaunchBoostDisabled();
++            synchronized (mTouchBoostLock) {
++                mLaunchRequested = enabled;
++                return sendLaunchModeLocked(true, disabled);
++            }
++        }
+         return mNativeWrapper.nativeSetPowerMode(mode, enabled);
+     }
+ 
++    private boolean isLaunchBoostDisabled() {
++        return mBatterySaverStateMachine != null
++                && mBatterySaverStateMachine.getBatterySaverController().isLaunchBoostDisabled();
++    }
++
++    /** LAUNCH for the HAL: what callers asked for, or a touch boost that is still running. */
++    @GuardedBy("mTouchBoostLock")
++    private boolean sendLaunchModeLocked(boolean always, boolean touchDisabled) {
++        final boolean touch = !touchDisabled && mClock.uptimeMillis() < mTouchBoostUntil;
++        final boolean on = mLaunchRequested || touch;
++        if (!always && on == mLaunchSent) {
++            return true;
++        }
++        mLaunchSent = on;
++        return mNativeWrapper.nativeSetPowerMode(Mode.LAUNCH, on);
++    }
++
++    private void extendTouchBoostInternal(int durationMs) {
++        if (SystemProperties.getInt(PROP_TOUCH_BOOST_MS, 0) <= 0) {
++            return;
++        }
++        final int maxMs = SystemProperties.getInt(PROP_TOUCH_BOOST_MAX_MS, 2000);
++        final boolean disabled = isLaunchBoostDisabled();
++        synchronized (mTouchBoostLock) {
++            final long now = mClock.uptimeMillis();
++            final long until = now + Math.min(durationMs, maxMs);
++            if (until > mFlingBoostUntil) {
++                mFlingBoostUntil = until;
++            }
++            if (mFlingBoostUntil <= mTouchBoostUntil) {
++                return;
++            }
++            mTouchBoostUntil = mFlingBoostUntil;
++            sendLaunchModeLocked(false, disabled);
++            mHandler.removeCallbacks(mTouchBoostExpired);
++            mHandler.postDelayed(mTouchBoostExpired, mTouchBoostUntil - now + 1);
++        }
++    }
++
++    private void setTouchBoostInternal(boolean down) {
++        final int tailMs = SystemProperties.getInt(PROP_TOUCH_BOOST_MS, 0);
++        final boolean disabled = isLaunchBoostDisabled();
++        synchronized (mTouchBoostLock) {
++            if (tailMs <= 0 && mTouchBoostUntil == 0) {
++                return;
++            }
++            final long now = mClock.uptimeMillis();
++            if (tailMs <= 0) {
++                mTouchBoostUntil = 0;
++                mTouchDownCap = 0;
++                mFlingBoostUntil = 0;
++            } else if (down) {
++                mTouchDownCap = now + Math.max(tailMs,
++                        SystemProperties.getInt(PROP_TOUCH_BOOST_MAX_MS, 2000));
++                mFlingBoostUntil = 0;
++                mTouchBoostUntil = mTouchDownCap;
++            } else {
++                // On finger-up, shorten the finger-down hold to tailMs (never past mTouchDownCap),
++                // while preserving any fling extension queued right before ACTION_UP.
++                final long tailUntil = Math.min(mTouchDownCap, now + tailMs);
++                mTouchBoostUntil = Math.max(tailUntil, mFlingBoostUntil);
++            }
++            sendLaunchModeLocked(false, disabled);
++            mHandler.removeCallbacks(mTouchBoostExpired);
++            if (mTouchBoostUntil > now) {
++                mHandler.postDelayed(mTouchBoostExpired, mTouchBoostUntil - now + 1);
++            }
++        }
++    }
++
+     @VisibleForTesting
+     boolean wasDeviceIdleForInternal(long ms) {
+         synchronized (mLock) {
+@@ -8071,6 +8187,15 @@ public final class PowerManagerService extends SystemService
+             setPowerModeInternal(mode, enabled);
+         }
+ 
++        @Override
++        public void setTouchBoost(boolean down) {
++            if (!mSystemReady) {
++                return;
++            }
++            // Off the input thread: the HAL call is a binder transaction.
++            mHandler.post(() -> setTouchBoostInternal(down));
++        }
++
+         @Override
+         public boolean wasDeviceIdleFor(long ms) {
+             return wasDeviceIdleForInternal(ms);
+diff --git a/services/core/java/com/android/server/wm/DisplayPolicy.java b/services/core/java/com/android/server/wm/DisplayPolicy.java
+index 9df7a6277..cc9010221 100644
+--- a/services/core/java/com/android/server/wm/DisplayPolicy.java
++++ b/services/core/java/com/android/server/wm/DisplayPolicy.java
+@@ -169,7 +169,14 @@ public class DisplayPolicy {
+     private static final String EINK_TOUCH_PROPERTY = "vendor.xrz.hibreak_touch";
+ 
+     private void setEinkTouch(boolean down) {
+-        if (!EINK_MOTION || mDisplayContent.getDisplayId() != android.view.Display.DEFAULT_DISPLAY) {
++        if (mDisplayContent.getDisplayId() != android.view.Display.DEFAULT_DISPLAY) {
++            return;
++        }
++        // CPU boost for the work a touch starts (PowerManagerService, debug.eink.touch_boost_ms).
++        if (mService.mPowerManagerInternal != null) {
++            mService.mPowerManagerInternal.setTouchBoost(down);
++        }
++        if (!EINK_MOTION) {
+             return;
+         }
+         try {
+-- 
+2.43.0
+

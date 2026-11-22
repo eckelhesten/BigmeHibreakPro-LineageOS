@@ -1,0 +1,661 @@
+From 26f11322767d9e932dbbf8ee626379f1528c347c Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Fri, 20 Nov 2026 17:21:51 +0000
+Subject: [PATCH] sf: e-ink render pass, the frame as the panel will show it
+
+SurfaceFlinger now turns the composed frame into exactly what the e-ink
+panel shows, so the kernel has nothing left to guess
+(debug.sf.eink_render=3, the default while debug.sf.eink_enhance is on;
+2 = the enhancement pass of 0009/0011/0012, unchanged, for comparison).
+
+Why: the kernel dithers NORMAL (DU) frames with an Atkinson error
+diffusion (threshold 150, 1/8 of the previous frame mixed in), so a
+change anywhere moves the dither pattern elsewhere and the old screen
+imprints into the greys of the new one; FAST (A2) frames are not
+dithered at all, so every grey becomes a partial drive that lands on an
+unstable grey (residue after scrolling); and the contrast stretch that
+hid light-grey speckle also erased cards, fields, separators and photo
+tones (docs/wip/kernel-dither.md, scripts/eink-bench).
+
+What the pass does, by the composer's refresh mode:
+- NORMAL: anti-aliased edges snap to the local extremes (as before);
+  thin strokes, whose surroundings out to 3 x 3.5 px are mostly on the
+  other side of the local mid level, become pure black or white: grey
+  text of any weight is solid, while the wide fill around white labels
+  keeps its tone (no halo); low-contrast steps between light flat tones
+  become a 1-px line (dotted below 10 % contrast) before light greys are
+  bleached to white, so cards, fields, chips and grid lines stay visible;
+  a dithered fill pixel touching a light label becomes white, so white
+  text on grey or coloured buttons gets a clear 1-px margin; dark greys
+  are crushed to black; then a tone curve (power 1.25 for the
+  panel's dot gain, measured with a camera) and an ordered dither with a
+  64x64 blue-noise map to pure black and white.
+- FAST and HYPER: the same full pass by default (FAST is also the typing
+  mode, so key outlines and solid text must stay, and nothing changes
+  look when a scroll ends); debug.sf.eink.fast_full=0 gives a cheap
+  version (tone curve and dither only), still pure black and white.
+- HD, CLEAN and the grey waveforms: 16 levels sent as 16 * level + 4,
+  which the kernel's 16-level dither passes unchanged.
+
+Tunable at runtime: debug.sf.eink.{minority0_x1000 (500), minority1_x1000
+(650), minspread_x1000 (250), contour (1), contour0_x1000 (30),
+contourmax_x1000 (320), contourlight_x1000 (750), contoursolid_x1000
+(100), gamma_x100 (125), gamma16_x100 (125), mintone_x1000 (1000: every
+thin stroke solid; e.g. 350 keeps links on web pages grey), knock (1)};
+the contrast setting of
+HiBreakParts sets vendor.xrz.hibreak_eink_{bleach (194), crush (92)}, and
+its per-app "inverted" mode vendor.xrz.hibreak_eink_invert (the frame's
+lightness is inverted first, for apps that are always dark; screenshots
+are not inverted).
+
+Change-Id: I4312512632d315717b893c11929990b2be4c5d15
+---
+ .../include/renderengine/DisplaySettings.h    |  50 ++++-
+ libs/renderengine/skia/EinkBlueNoise.h        |  96 +++++++++
+ libs/renderengine/skia/SkiaRenderEngine.cpp   | 192 +++++++++++++++++-
+ libs/renderengine/skia/SkiaRenderEngine.h     |   2 +
+ .../CompositionEngine/src/Output.cpp          |  92 +++++++++
+ .../surfaceflinger/ScreenCaptureOutput.cpp    |   1 +
+ 6 files changed, 430 insertions(+), 3 deletions(-)
+ create mode 100644 libs/renderengine/skia/EinkBlueNoise.h
+
+diff --git a/libs/renderengine/include/renderengine/DisplaySettings.h b/libs/renderengine/include/renderengine/DisplaySettings.h
+index 45ee3bb..b0ae706 100644
+--- a/libs/renderengine/include/renderengine/DisplaySettings.h
++++ b/libs/renderengine/include/renderengine/DisplaySettings.h
+@@ -93,8 +93,45 @@ struct DisplaySettings {
+     float einkBlack = 0.f;
+     float einkWhite = 1.f;
+ 
++    // E-ink render pass (einkRender = 3, replaces the enhancement above): the frame is turned
++    // into exactly what the panel shows, so the kernel's own dither has nothing left to do and
++    // passes it unchanged (docs/wip/kernel-dither.md).
++    // - einkMode 0 (NORMAL): anti-aliased edges snap to the local extremes; thin strokes
++    //   (pixels whose surroundings out to 3 * einkEnhanceRadius are mostly on the other side
++    //   of the local mid level, einkMinority0/1) go to pure black or white, so text of any grey
++    //   or weight is solid while wide fills keep their tone; low-contrast steps between light
++    //   flat tones (cards, fields, separators: range einkContour0 to einkContourMax, light side
++    //   from einkContourLight) become a 1-px line, dotted below einkContourSolid; then the tone
++    //   curve and an ordered blue-noise dither to pure black and white.
++    // - einkMode 1 (FAST, motion): tone curve and dither only, cheap, still pure black and
++    //   white (the A2 waveform isn't dithered by the kernel: greys would become partial drives).
++    // - einkMode 2 (HD, CLEAN): 16 levels, 16 * level + 4, ordered dither between levels.
++    // einkMinTone: strokes lighter than this keep their tone instead (1 = every stroke solid; e.g.
++    // 0.35 leaves links of web pages grey). einkKnock: a dithered fill pixel touching a light
++    // label becomes white, so white text on grey or coloured buttons gets a clear 1-px margin.
++    // einkInvert: the frame's lightness is inverted first (per app, for apps that are always dark).
++    // Tone curve: (luma - 0.04) / 0.92, light greys from einkBleach up go to white (1 = off),
++    // greys below einkCrush to black (0 = off), then to the power einkGamma (einkGamma16 in
++    // mode 2): the panel's dot gain makes dithered greys darker than their share of white.
++    int32_t einkRender = 0;
++    int32_t einkMode = 0;
++    float einkMinority0 = 0.50f;
++    float einkMinority1 = 0.65f;
++    float einkMinSpread = 0.25f;
++    float einkContour0 = 0.03f;
++    float einkContourMax = 0.32f;
++    float einkContourLight = 0.75f;
++    float einkContourSolid = 0.10f;
++    float einkBleach = 0.76f;
++    float einkCrush = 0.36f;
++    float einkGamma = 1.25f;
++    float einkGamma16 = 1.25f;
++    float einkMinTone = 1.f;
++    bool einkKnock = true;
++    bool einkInvert = false;
++
+     bool einkPass() const {
+-        return einkEnhanceStrength > 0.f || einkBlack > 0.f || einkWhite < 1.f;
++        return einkRender >= 3 || einkEnhanceStrength > 0.f || einkBlack > 0.f || einkWhite < 1.f;
+     }
+ 
+     // An additional orientation flag to be applied after clipping the output.
+@@ -151,7 +188,16 @@ static inline bool operator==(const DisplaySettings& lhs, const DisplaySettings&
+             lhs.einkEnhanceT1 == rhs.einkEnhanceT1 && lhs.einkEnhanceT2 == rhs.einkEnhanceT2 &&
+             lhs.einkSolid1 == rhs.einkSolid1 && lhs.einkSolid2 == rhs.einkSolid2 &&
+             lhs.einkGate0 == rhs.einkGate0 && lhs.einkGate1 == rhs.einkGate1 &&
+-            lhs.einkBlack == rhs.einkBlack && lhs.einkWhite == rhs.einkWhite;
++            lhs.einkBlack == rhs.einkBlack && lhs.einkWhite == rhs.einkWhite &&
++            lhs.einkRender == rhs.einkRender && lhs.einkMode == rhs.einkMode &&
++            lhs.einkMinority0 == rhs.einkMinority0 && lhs.einkMinority1 == rhs.einkMinority1 &&
++            lhs.einkMinSpread == rhs.einkMinSpread && lhs.einkContour0 == rhs.einkContour0 &&
++            lhs.einkContourMax == rhs.einkContourMax &&
++            lhs.einkContourLight == rhs.einkContourLight &&
++            lhs.einkContourSolid == rhs.einkContourSolid && lhs.einkBleach == rhs.einkBleach &&
++            lhs.einkCrush == rhs.einkCrush && lhs.einkGamma == rhs.einkGamma &&
++            lhs.einkGamma16 == rhs.einkGamma16 && lhs.einkMinTone == rhs.einkMinTone &&
++            lhs.einkKnock == rhs.einkKnock && lhs.einkInvert == rhs.einkInvert;
+ }
+ 
+ static const char* orientation_to_string(uint32_t orientation) {
+diff --git a/libs/renderengine/skia/EinkBlueNoise.h b/libs/renderengine/skia/EinkBlueNoise.h
+new file mode 100644
+index 0000000..d609480
+--- /dev/null
++++ b/libs/renderengine/skia/EinkBlueNoise.h
+@@ -0,0 +1,96 @@
++/*
++ * Copyright 2026 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <cstdint>
++
++namespace android::renderengine::skia {
++
++// 64x64 blue-noise threshold map for the e-ink render pass (SkiaRenderEngine::drawEinkRender),
++// made with Ulichney's void-and-cluster method (Gaussian sigma 1.5, toroidal), ranks scaled to
++// 0..255 (each value 16 times). Ordered dithering with it keeps every pixel's output a function
++// of its own value only: a change in one place never moves the dither pattern elsewhere, which
++// on e-ink would mean extra drives and ghosting. Generated by scripts/eink-bench/noise.py.
++static constexpr int kEinkBlueNoiseSize = 64;
++static constexpr uint8_t kEinkBlueNoise[kEinkBlueNoiseSize * kEinkBlueNoiseSize] = {
++    156, 38, 75, 123, 58, 105, 5, 199, 239, 12, 121, 173, 26, 148, 42, 81, 134, 235, 2, 129, 36, 241, 102, 127, 26, 142, 101, 76, 204, 222, 174, 130, 247, 61, 210, 84, 21, 233, 154, 5, 73, 38, 244, 202, 144, 241, 209, 129, 192, 238, 170, 16, 195, 97, 55, 18, 190, 138, 58, 196, 225, 15, 216, 64,
++    108, 250, 176, 21, 207, 232, 133, 177, 110, 162, 74, 243, 215, 102, 205, 168, 58, 105, 160, 74, 184, 15, 151, 206, 72, 173, 231, 44, 136, 13, 84, 43, 17, 143, 104, 165, 193, 47, 95, 176, 210, 139, 102, 7, 87, 46, 72, 9, 148, 64, 39, 141, 241, 30, 154, 226, 104, 29, 164, 111, 36, 146, 81, 191,
++    48, 212, 142, 99, 36, 158, 83, 29, 55, 224, 37, 134, 16, 64, 238, 9, 187, 220, 45, 210, 143, 59, 221, 41, 250, 119, 23, 162, 246, 110, 152, 235, 181, 219, 28, 242, 75, 138, 251, 113, 23, 162, 54, 193, 126, 226, 111, 174, 216, 92, 122, 212, 81, 114, 206, 129, 75, 243, 207, 71, 251, 175, 128, 23,
++    164, 86, 9, 192, 224, 66, 189, 253, 96, 140, 200, 83, 181, 153, 120, 92, 144, 27, 118, 253, 94, 115, 165, 85, 2, 196, 64, 93, 188, 53, 206, 100, 72, 120, 56, 128, 10, 206, 35, 62, 227, 82, 235, 171, 32, 153, 198, 24, 53, 251, 2, 184, 50, 169, 65, 5, 180, 48, 144, 8, 94, 52, 206, 235,
++    132, 66, 237, 127, 49, 111, 147, 19, 211, 167, 6, 107, 232, 29, 196, 41, 243, 69, 172, 6, 194, 28, 236, 186, 103, 152, 219, 129, 8, 229, 33, 169, 2, 201, 176, 228, 160, 88, 181, 152, 194, 130, 15, 108, 253, 64, 97, 231, 135, 165, 106, 147, 233, 21, 248, 152, 223, 97, 124, 232, 188, 118, 12, 98,
++    177, 202, 25, 161, 181, 2, 231, 126, 44, 68, 245, 128, 56, 217, 78, 166, 206, 130, 223, 84, 52, 139, 67, 126, 46, 238, 27, 178, 79, 145, 66, 131, 253, 89, 43, 106, 29, 238, 116, 2, 95, 47, 213, 77, 139, 4, 185, 41, 80, 200, 65, 33, 194, 98, 137, 79, 35, 203, 23, 169, 65, 153, 218, 36,
++    253, 51, 117, 81, 245, 70, 201, 86, 177, 101, 190, 39, 162, 136, 1, 105, 53, 18, 100, 157, 205, 230, 170, 19, 203, 138, 55, 112, 249, 198, 104, 218, 23, 155, 135, 210, 68, 143, 50, 203, 243, 146, 179, 34, 193, 221, 156, 124, 239, 11, 225, 87, 124, 214, 46, 189, 112, 157, 85, 212, 39, 243, 77, 143,
++    4, 94, 229, 144, 36, 107, 154, 25, 220, 146, 13, 209, 90, 252, 179, 227, 153, 191, 248, 36, 116, 10, 96, 252, 76, 174, 91, 214, 41, 15, 160, 51, 187, 77, 241, 8, 184, 217, 78, 170, 26, 66, 116, 238, 87, 49, 103, 28, 173, 111, 154, 180, 59, 7, 164, 233, 19, 253, 60, 136, 114, 16, 196, 111,
++    209, 168, 189, 13, 216, 193, 52, 251, 118, 59, 239, 113, 70, 21, 119, 35, 82, 123, 63, 175, 78, 218, 151, 38, 117, 224, 24, 164, 124, 191, 87, 235, 116, 35, 172, 100, 121, 20, 253, 133, 107, 223, 163, 19, 132, 170, 249, 72, 215, 53, 21, 252, 135, 226, 102, 65, 126, 175, 1, 224, 180, 88, 164, 59,
++    132, 37, 68, 121, 89, 171, 128, 9, 81, 185, 31, 170, 149, 196, 60, 207, 240, 8, 146, 199, 28, 133, 182, 61, 193, 9, 143, 71, 240, 59, 139, 6, 206, 146, 63, 200, 47, 163, 93, 36, 190, 7, 92, 212, 62, 202, 10, 145, 190, 131, 95, 197, 35, 78, 205, 150, 41, 198, 103, 148, 50, 231, 23, 240,
++    78, 225, 158, 249, 59, 29, 233, 160, 208, 136, 97, 222, 47, 236, 132, 91, 161, 47, 222, 94, 235, 52, 106, 227, 156, 247, 107, 182, 26, 208, 108, 177, 83, 249, 18, 220, 136, 232, 62, 204, 141, 52, 246, 149, 37, 109, 230, 91, 40, 241, 70, 148, 114, 168, 22, 245, 87, 228, 68, 27, 192, 124, 101, 153,
++    8, 111, 23, 182, 140, 220, 96, 62, 38, 237, 14, 126, 85, 6, 178, 25, 189, 110, 130, 18, 160, 190, 1, 77, 33, 86, 51, 218, 92, 149, 36, 227, 53, 127, 97, 156, 79, 1, 174, 114, 229, 75, 180, 121, 196, 70, 162, 126, 19, 171, 213, 2, 234, 51, 181, 136, 10, 118, 163, 247, 81, 214, 42, 186,
++    128, 211, 82, 44, 201, 1, 116, 182, 144, 194, 73, 175, 210, 153, 103, 247, 73, 213, 57, 253, 83, 117, 243, 176, 122, 198, 134, 168, 3, 254, 72, 161, 13, 194, 171, 41, 245, 105, 212, 28, 157, 12, 100, 29, 235, 4, 185, 53, 204, 107, 60, 161, 85, 203, 104, 63, 216, 185, 46, 133, 6, 170, 70, 252,
++    51, 169, 234, 102, 127, 165, 75, 247, 18, 103, 50, 253, 29, 64, 223, 40, 140, 4, 173, 151, 31, 208, 49, 147, 216, 13, 238, 43, 117, 190, 132, 212, 109, 240, 69, 22, 187, 134, 45, 89, 251, 131, 223, 167, 85, 142, 254, 80, 226, 134, 33, 250, 120, 20, 230, 158, 35, 91, 208, 105, 236, 143, 30, 202,
++    97, 21, 148, 63, 242, 31, 216, 45, 125, 220, 159, 113, 142, 193, 122, 166, 89, 195, 101, 227, 70, 140, 96, 22, 66, 104, 153, 77, 222, 58, 20, 93, 44, 143, 206, 119, 224, 72, 165, 184, 61, 199, 38, 59, 214, 106, 41, 156, 14, 179, 74, 145, 195, 46, 130, 79, 254, 143, 18, 61, 180, 87, 117, 157,
++    75, 190, 223, 10, 179, 91, 145, 198, 171, 84, 5, 202, 92, 13, 54, 236, 20, 217, 44, 123, 12, 194, 238, 164, 225, 182, 28, 200, 99, 176, 156, 233, 183, 4, 87, 48, 153, 10, 237, 115, 17, 104, 150, 189, 130, 23, 199, 122, 94, 235, 209, 9, 93, 174, 217, 5, 169, 114, 227, 196, 38, 220, 15, 239,
++    132, 41, 106, 137, 207, 57, 108, 23, 63, 228, 40, 243, 69, 174, 205, 111, 149, 65, 181, 244, 158, 110, 39, 79, 129, 50, 246, 138, 9, 242, 35, 74, 127, 221, 169, 251, 101, 205, 37, 141, 214, 241, 83, 8, 245, 75, 224, 171, 60, 36, 108, 164, 65, 245, 102, 59, 189, 32, 73, 152, 121, 167, 54, 207,
++    7, 246, 167, 80, 28, 254, 161, 233, 139, 117, 184, 151, 125, 225, 37, 78, 252, 130, 26, 88, 59, 218, 174, 19, 205, 113, 87, 172, 63, 118, 145, 203, 54, 106, 31, 192, 62, 131, 84, 193, 69, 46, 176, 112, 163, 50, 141, 1, 249, 197, 131, 232, 39, 142, 27, 205, 134, 237, 99, 3, 251, 80, 105, 179,
++    69, 120, 217, 49, 184, 127, 3, 87, 191, 15, 97, 53, 20, 100, 161, 1, 189, 98, 169, 207, 7, 131, 95, 253, 150, 1, 228, 39, 215, 188, 84, 24, 246, 162, 80, 145, 18, 222, 172, 2, 159, 125, 229, 34, 212, 94, 190, 115, 71, 150, 22, 84, 186, 214, 111, 160, 86, 46, 171, 208, 136, 22, 229, 147,
++    95, 197, 22, 149, 102, 224, 69, 210, 50, 250, 165, 217, 188, 241, 139, 211, 55, 227, 42, 147, 240, 188, 67, 43, 184, 74, 162, 134, 100, 15, 235, 175, 136, 8, 206, 120, 239, 44, 110, 253, 90, 22, 195, 66, 132, 17, 239, 40, 180, 98, 220, 56, 121, 19, 71, 243, 10, 220, 114, 61, 183, 48, 200, 33,
++    160, 56, 234, 85, 193, 39, 152, 173, 115, 33, 81, 131, 67, 42, 85, 114, 177, 19, 123, 76, 105, 27, 221, 137, 103, 211, 28, 250, 55, 157, 113, 43, 93, 228, 57, 179, 76, 154, 202, 59, 218, 142, 100, 248, 156, 201, 81, 161, 228, 14, 192, 166, 253, 147, 177, 52, 189, 146, 28, 244, 87, 155, 110, 248,
++    1, 173, 133, 13, 247, 123, 23, 92, 236, 145, 203, 6, 230, 157, 16, 248, 70, 151, 235, 203, 51, 154, 170, 17, 237, 50, 123, 191, 78, 204, 222, 67, 192, 116, 35, 218, 10, 103, 30, 129, 170, 44, 180, 5, 56, 112, 30, 138, 61, 125, 45, 105, 5, 89, 224, 129, 98, 74, 197, 131, 10, 217, 65, 127,
++    223, 92, 211, 69, 157, 54, 228, 188, 14, 63, 175, 120, 91, 181, 200, 127, 34, 95, 185, 4, 112, 245, 84, 120, 197, 90, 171, 21, 148, 6, 129, 27, 161, 254, 141, 89, 168, 245, 191, 83, 12, 238, 72, 122, 217, 236, 174, 96, 250, 208, 155, 233, 67, 194, 40, 22, 236, 163, 42, 228, 97, 170, 30, 186,
++    43, 116, 27, 182, 107, 200, 78, 136, 109, 212, 46, 245, 32, 108, 56, 226, 167, 210, 60, 135, 174, 35, 213, 58, 5, 144, 219, 110, 244, 91, 172, 234, 104, 1, 61, 204, 118, 46, 145, 224, 115, 209, 149, 190, 85, 18, 52, 187, 7, 77, 24, 120, 214, 135, 169, 110, 206, 2, 120, 178, 53, 140, 242, 80,
++    201, 254, 139, 45, 237, 4, 169, 35, 254, 157, 83, 138, 221, 151, 3, 79, 140, 17, 251, 86, 223, 73, 147, 183, 249, 75, 38, 59, 198, 32, 208, 47, 76, 188, 156, 26, 227, 69, 17, 166, 52, 96, 24, 41, 168, 132, 211, 147, 110, 197, 172, 94, 31, 58, 244, 82, 142, 66, 254, 82, 210, 14, 105, 150,
++    20, 159, 73, 215, 87, 145, 221, 60, 95, 8, 196, 21, 70, 207, 186, 241, 103, 41, 121, 161, 12, 196, 25, 130, 105, 159, 230, 180, 139, 70, 119, 150, 215, 129, 242, 107, 172, 136, 200, 78, 242, 135, 197, 252, 100, 226, 71, 32, 238, 46, 139, 248, 183, 153, 12, 222, 46, 193, 151, 31, 116, 189, 227, 60,
++    184, 103, 10, 176, 121, 25, 113, 194, 176, 129, 229, 161, 105, 34, 123, 51, 176, 220, 191, 55, 109, 242, 94, 46, 211, 22, 122, 8, 100, 167, 240, 14, 95, 34, 53, 83, 11, 249, 100, 31, 179, 1, 70, 157, 57, 9, 117, 166, 90, 209, 64, 1, 80, 200, 125, 99, 174, 17, 104, 230, 159, 74, 38, 125,
++    85, 240, 197, 56, 247, 162, 47, 239, 74, 33, 115, 57, 175, 234, 82, 156, 21, 75, 142, 234, 35, 152, 175, 227, 66, 197, 88, 250, 216, 25, 56, 182, 232, 168, 199, 220, 181, 41, 123, 208, 152, 109, 231, 122, 204, 144, 233, 186, 15, 154, 127, 219, 110, 43, 216, 68, 237, 135, 202, 62, 7, 245, 169, 219,
++    50, 130, 34, 143, 76, 208, 98, 14, 143, 199, 249, 88, 212, 11, 137, 254, 199, 115, 5, 90, 204, 124, 76, 19, 137, 166, 35, 149, 76, 201, 137, 115, 68, 6, 138, 119, 65, 154, 225, 58, 83, 215, 45, 18, 179, 35, 85, 52, 254, 102, 38, 238, 177, 148, 16, 162, 32, 86, 47, 177, 122, 92, 141, 14,
++    208, 166, 231, 107, 3, 186, 134, 232, 165, 53, 1, 141, 44, 189, 107, 30, 62, 229, 186, 164, 61, 11, 252, 190, 98, 239, 57, 188, 109, 43, 246, 88, 214, 159, 99, 25, 233, 92, 7, 140, 25, 186, 161, 94, 244, 107, 213, 137, 74, 193, 162, 20, 91, 54, 251, 194, 118, 217, 248, 144, 211, 34, 187, 109,
++    70, 20, 82, 158, 219, 62, 37, 83, 109, 218, 180, 99, 157, 68, 219, 167, 98, 134, 43, 244, 107, 210, 140, 49, 117, 1, 211, 131, 12, 175, 150, 19, 39, 189, 250, 47, 204, 165, 192, 254, 103, 233, 67, 134, 49, 165, 3, 181, 26, 215, 118, 66, 206, 136, 101, 73, 151, 3, 103, 22, 74, 231, 61, 252,
++    122, 201, 181, 46, 119, 254, 171, 206, 23, 67, 123, 228, 24, 246, 127, 50, 208, 17, 154, 77, 27, 174, 84, 160, 227, 73, 171, 93, 225, 71, 197, 235, 123, 65, 144, 85, 114, 18, 74, 126, 40, 147, 15, 223, 190, 76, 119, 230, 95, 48, 144, 228, 184, 11, 231, 34, 187, 62, 168, 195, 114, 157, 4, 146,
++    30, 98, 243, 13, 147, 94, 17, 127, 151, 245, 34, 199, 79, 175, 5, 89, 242, 179, 113, 218, 130, 232, 40, 16, 199, 151, 45, 254, 30, 118, 50, 102, 168, 228, 1, 185, 240, 148, 52, 211, 178, 86, 203, 116, 28, 250, 146, 61, 167, 241, 6, 84, 42, 113, 163, 211, 124, 240, 88, 227, 41, 179, 91, 223,
++    170, 50, 129, 211, 65, 196, 231, 48, 185, 93, 163, 52, 144, 106, 195, 151, 33, 66, 197, 2, 56, 192, 115, 247, 102, 24, 124, 190, 156, 214, 142, 14, 80, 207, 54, 132, 36, 171, 226, 111, 3, 246, 59, 155, 100, 43, 201, 16, 126, 196, 103, 173, 244, 145, 54, 93, 17, 48, 140, 26, 128, 244, 55, 196,
++    74, 235, 155, 85, 33, 165, 110, 76, 215, 5, 117, 236, 17, 217, 61, 234, 109, 140, 86, 252, 145, 90, 168, 67, 142, 223, 83, 60, 4, 89, 244, 182, 34, 151, 103, 220, 76, 99, 26, 69, 163, 128, 185, 11, 217, 177, 89, 223, 38, 70, 138, 212, 28, 78, 198, 252, 179, 155, 220, 68, 207, 106, 16, 135,
++    25, 101, 1, 180, 223, 135, 11, 248, 137, 59, 209, 179, 97, 133, 39, 162, 13, 210, 44, 163, 31, 219, 13, 186, 49, 202, 163, 235, 113, 167, 64, 204, 119, 253, 192, 24, 178, 247, 200, 144, 232, 33, 79, 237, 137, 63, 114, 155, 180, 254, 18, 58, 121, 169, 0, 128, 72, 108, 192, 5, 172, 80, 163, 220,
++    187, 210, 121, 250, 51, 99, 187, 40, 169, 84, 153, 32, 69, 254, 185, 79, 226, 176, 125, 236, 103, 63, 129, 230, 97, 10, 134, 40, 210, 21, 131, 43, 92, 11, 66, 128, 155, 7, 121, 53, 91, 214, 109, 49, 166, 25, 240, 9, 77, 108, 151, 187, 236, 101, 215, 43, 230, 27, 90, 235, 138, 45, 254, 113,
++    34, 159, 67, 27, 146, 74, 205, 121, 222, 14, 243, 110, 204, 3, 146, 117, 30, 96, 66, 7, 180, 202, 156, 34, 120, 244, 71, 183, 84, 240, 178, 222, 141, 166, 236, 45, 93, 225, 38, 192, 167, 20, 202, 125, 188, 87, 204, 124, 229, 46, 217, 88, 39, 148, 67, 187, 140, 167, 57, 117, 204, 14, 151, 60,
++    134, 234, 93, 198, 173, 237, 21, 63, 98, 141, 191, 49, 130, 91, 219, 55, 247, 198, 152, 224, 116, 48, 250, 75, 170, 195, 25, 151, 124, 54, 104, 17, 75, 214, 108, 181, 208, 71, 141, 110, 255, 62, 154, 0, 248, 37, 145, 57, 193, 160, 5, 131, 205, 16, 249, 114, 9, 211, 244, 32, 182, 97, 215, 86,
++    6, 208, 44, 123, 8, 109, 154, 229, 179, 29, 77, 226, 174, 40, 190, 159, 16, 130, 43, 84, 22, 142, 93, 2, 218, 51, 107, 232, 200, 32, 158, 249, 190, 56, 3, 135, 25, 241, 174, 10, 82, 134, 231, 100, 74, 213, 104, 176, 29, 99, 247, 63, 178, 83, 163, 48, 78, 101, 149, 73, 125, 49, 239, 174,
++    64, 183, 140, 243, 78, 214, 36, 128, 53, 202, 119, 154, 13, 242, 72, 111, 88, 180, 233, 164, 209, 187, 228, 114, 135, 158, 88, 8, 68, 226, 133, 89, 37, 149, 202, 79, 159, 57, 100, 219, 197, 23, 182, 54, 172, 123, 9, 243, 81, 138, 199, 112, 33, 234, 126, 224, 197, 176, 20, 220, 162, 195, 26, 111,
++    251, 99, 23, 161, 57, 184, 93, 240, 159, 0, 251, 58, 102, 142, 26, 209, 239, 61, 9, 121, 68, 28, 57, 178, 37, 199, 249, 179, 110, 166, 12, 183, 120, 226, 96, 252, 117, 193, 32, 150, 48, 117, 221, 28, 147, 234, 67, 153, 219, 51, 17, 150, 212, 98, 19, 144, 34, 120, 60, 248, 2, 82, 133, 155,
++    37, 76, 222, 107, 200, 144, 15, 73, 209, 106, 81, 170, 198, 224, 124, 167, 41, 139, 215, 93, 251, 158, 103, 240, 81, 17, 60, 131, 38, 216, 79, 239, 63, 20, 165, 45, 12, 230, 128, 71, 237, 160, 85, 111, 192, 46, 204, 26, 113, 188, 231, 78, 172, 57, 191, 71, 242, 206, 91, 143, 105, 207, 56, 217,
++    192, 123, 175, 6, 42, 255, 123, 177, 33, 136, 222, 18, 42, 87, 64, 3, 200, 106, 177, 35, 136, 195, 9, 127, 209, 146, 221, 96, 194, 148, 49, 105, 207, 129, 187, 73, 212, 168, 89, 181, 4, 206, 63, 247, 13, 97, 130, 177, 89, 162, 39, 131, 0, 252, 155, 106, 7, 165, 44, 188, 32, 235, 171, 10,
++    147, 236, 52, 137, 229, 97, 56, 219, 152, 52, 185, 122, 240, 161, 189, 255, 82, 152, 18, 234, 80, 48, 226, 62, 171, 113, 33, 168, 0, 255, 124, 17, 157, 34, 241, 101, 141, 54, 22, 246, 102, 141, 33, 125, 158, 216, 72, 255, 9, 61, 239, 95, 218, 119, 37, 209, 132, 80, 219, 124, 157, 73, 119, 92,
++    29, 68, 203, 84, 168, 26, 194, 111, 12, 234, 70, 96, 148, 29, 112, 133, 47, 225, 64, 202, 108, 155, 183, 95, 19, 244, 77, 229, 63, 90, 203, 176, 232, 84, 150, 0, 192, 112, 216, 132, 45, 196, 173, 229, 55, 184, 37, 139, 207, 118, 197, 145, 24, 187, 87, 237, 57, 177, 24, 255, 14, 200, 48, 247,
++    105, 183, 16, 114, 213, 149, 72, 245, 90, 167, 193, 5, 209, 59, 232, 15, 185, 95, 166, 128, 4, 247, 31, 139, 205, 45, 158, 129, 188, 32, 141, 71, 52, 116, 213, 62, 249, 32, 163, 67, 224, 88, 18, 79, 109, 0, 235, 91, 156, 21, 77, 175, 49, 69, 161, 11, 142, 230, 113, 64, 100, 143, 215, 167,
++    133, 224, 155, 248, 49, 3, 180, 140, 29, 125, 45, 248, 109, 171, 78, 216, 146, 29, 238, 42, 189, 73, 118, 219, 86, 182, 104, 14, 214, 112, 243, 7, 221, 185, 24, 173, 127, 86, 201, 11, 149, 120, 249, 154, 213, 128, 170, 60, 223, 44, 249, 105, 205, 227, 122, 195, 99, 45, 203, 163, 184, 38, 81, 0,
++    55, 90, 31, 75, 132, 106, 220, 58, 200, 227, 155, 83, 137, 38, 198, 102, 56, 119, 210, 82, 143, 225, 51, 168, 6, 66, 248, 149, 54, 170, 96, 161, 131, 42, 98, 146, 231, 47, 108, 234, 181, 37, 191, 66, 42, 195, 30, 107, 185, 126, 160, 4, 137, 90, 21, 250, 31, 153, 81, 6, 242, 123, 228, 189,
++    243, 119, 210, 163, 194, 237, 38, 87, 115, 9, 64, 213, 18, 237, 153, 0, 250, 160, 13, 106, 173, 18, 102, 146, 232, 122, 199, 27, 82, 231, 36, 201, 79, 252, 207, 69, 8, 189, 139, 78, 57, 106, 6, 137, 240, 83, 149, 246, 12, 82, 215, 64, 240, 41, 169, 72, 182, 222, 132, 212, 51, 94, 27, 153,
++    40, 175, 8, 57, 93, 16, 150, 171, 244, 188, 102, 169, 120, 187, 71, 130, 182, 68, 194, 242, 58, 202, 255, 29, 188, 40, 97, 221, 134, 186, 67, 15, 152, 110, 20, 166, 122, 221, 26, 255, 164, 203, 231, 172, 98, 20, 209, 69, 138, 198, 34, 114, 186, 149, 214, 125, 101, 59, 24, 107, 142, 173, 205, 75,
++    98, 229, 145, 255, 182, 118, 208, 70, 25, 142, 42, 255, 55, 92, 30, 221, 44, 94, 138, 38, 126, 156, 67, 89, 133, 62, 173, 154, 0, 108, 246, 126, 225, 53, 192, 236, 86, 51, 177, 98, 15, 131, 73, 48, 225, 121, 169, 47, 233, 98, 173, 229, 15, 96, 53, 6, 229, 160, 239, 192, 70, 252, 15, 135,
++    191, 24, 111, 68, 29, 222, 51, 134, 226, 80, 206, 13, 152, 230, 195, 113, 166, 234, 23, 215, 96, 2, 176, 211, 228, 11, 250, 74, 49, 202, 159, 43, 175, 94, 137, 33, 157, 111, 206, 147, 42, 213, 115, 26, 150, 187, 7, 111, 159, 22, 58, 133, 80, 203, 246, 144, 196, 41, 88, 11, 155, 43, 117, 221,
++    51, 82, 207, 133, 158, 86, 175, 2, 99, 166, 122, 183, 106, 22, 143, 81, 8, 199, 152, 74, 185, 236, 112, 46, 148, 101, 191, 118, 227, 94, 23, 78, 216, 8, 244, 75, 186, 2, 68, 243, 89, 158, 241, 195, 80, 56, 253, 213, 76, 195, 242, 155, 36, 166, 118, 24, 70, 112, 183, 129, 227, 198, 65, 148,
++    246, 162, 7, 232, 42, 245, 112, 193, 238, 30, 61, 241, 77, 210, 58, 251, 127, 48, 108, 246, 53, 141, 23, 82, 201, 21, 164, 32, 138, 177, 241, 119, 147, 201, 58, 125, 214, 233, 133, 30, 188, 62, 4, 105, 221, 135, 95, 35, 144, 118, 2, 104, 216, 61, 186, 90, 215, 158, 248, 30, 79, 108, 4, 183,
++    34, 115, 181, 99, 196, 16, 63, 143, 45, 217, 159, 6, 130, 168, 31, 180, 213, 90, 171, 12, 125, 210, 165, 231, 124, 72, 242, 58, 217, 9, 66, 190, 30, 107, 168, 19, 99, 49, 165, 116, 224, 137, 178, 40, 164, 20, 201, 173, 54, 221, 183, 71, 255, 14, 136, 236, 51, 0, 139, 55, 208, 172, 237, 94,
++    132, 218, 50, 73, 148, 124, 213, 85, 185, 116, 95, 198, 44, 230, 108, 72, 148, 27, 222, 191, 36, 91, 62, 180, 39, 152, 205, 112, 88, 160, 129, 48, 231, 80, 252, 138, 178, 85, 202, 16, 53, 83, 251, 127, 65, 238, 112, 10, 246, 89, 31, 140, 176, 114, 37, 200, 106, 178, 219, 97, 122, 22, 141, 71,
++    10, 157, 250, 26, 223, 167, 33, 253, 11, 71, 140, 248, 86, 153, 205, 0, 241, 54, 113, 69, 147, 253, 109, 19, 237, 95, 3, 182, 40, 251, 199, 100, 152, 5, 198, 43, 218, 25, 247, 102, 157, 195, 12, 213, 90, 184, 139, 79, 158, 122, 207, 50, 92, 212, 162, 80, 150, 32, 72, 239, 156, 42, 228, 204,
++    188, 101, 82, 178, 109, 55, 95, 174, 150, 225, 20, 170, 25, 62, 126, 96, 173, 133, 233, 164, 199, 4, 216, 136, 194, 50, 126, 214, 146, 77, 16, 221, 184, 124, 65, 155, 114, 76, 183, 140, 230, 37, 115, 150, 47, 27, 219, 60, 196, 19, 230, 153, 7, 238, 60, 20, 250, 123, 198, 14, 185, 88, 165, 57,
++    125, 211, 17, 135, 232, 0, 203, 126, 41, 191, 55, 120, 222, 187, 245, 21, 197, 76, 12, 44, 86, 128, 54, 172, 77, 159, 243, 64, 27, 120, 169, 60, 31, 91, 239, 13, 226, 133, 59, 0, 72, 174, 96, 236, 204, 167, 104, 233, 39, 179, 108, 75, 193, 110, 132, 218, 183, 93, 47, 138, 64, 255, 116, 32,
++    234, 150, 47, 186, 65, 149, 242, 69, 109, 237, 81, 205, 101, 36, 143, 52, 225, 159, 104, 212, 181, 238, 101, 31, 228, 15, 104, 178, 226, 203, 96, 245, 136, 209, 164, 104, 176, 35, 241, 211, 125, 199, 55, 21, 76, 128, 0, 149, 90, 135, 58, 249, 28, 175, 44, 85, 10, 164, 234, 208, 103, 7, 218, 79,
++    24, 69, 245, 116, 212, 90, 29, 184, 16, 160, 137, 3, 163, 71, 178, 89, 119, 31, 251, 138, 22, 68, 207, 145, 119, 201, 39, 134, 86, 11, 148, 45, 181, 77, 25, 56, 205, 87, 160, 101, 28, 248, 159, 135, 191, 255, 66, 184, 242, 11, 204, 164, 91, 141, 232, 201, 145, 61, 113, 27, 154, 194, 139, 178,
++    203, 166, 94, 13, 40, 172, 130, 222, 99, 213, 39, 252, 127, 229, 11, 209, 151, 65, 172, 50, 115, 158, 8, 247, 88, 63, 156, 255, 55, 165, 233, 112, 3, 224, 126, 255, 142, 14, 191, 49, 147, 83, 12, 220, 97, 40, 118, 216, 52, 156, 116, 42, 217, 4, 67, 117, 36, 215, 178, 75, 244, 39, 54, 99,
++    3, 132, 225, 194, 154, 249, 77, 47, 146, 65, 195, 92, 56, 189, 112, 246, 24, 193, 92, 226, 201, 81, 177, 48, 190, 223, 5, 186, 117, 30, 68, 197, 93, 158, 37, 183, 115, 67, 218, 121, 230, 182, 115, 60, 172, 19, 162, 84, 28, 100, 225, 73, 128, 179, 255, 161, 88, 238, 0, 131, 92, 170, 121, 239,
++};
++
++} // namespace android::renderengine::skia
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+index aac5596..532c941 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -35,6 +35,7 @@
+ #include <SkMatrix.h>
+ #include <SkPaint.h>
+ #include <SkPath.h>
++#include <SkPixmap.h>
+ #include <SkPoint.h>
+ #include <SkPoint3.h>
+ #include <SkRRect.h>
+@@ -73,6 +74,7 @@
+ 
+ #include "Cache.h"
+ #include "ColorSpaces.h"
++#include "EinkBlueNoise.h"
+ #include "ShaderCache.h"
+ #include "compat/SkiaGpuContext.h"
+ #include "filters/BlurFilter.h"
+@@ -867,6 +869,250 @@ void SkiaRenderEngine::drawEinkEnhance(const DisplaySettings& display,
+     canvas->drawPaint(paint);
+ }
+ 
++// E-ink render pass, see DisplaySettings::einkRender. One pass over the composed frame; its
++// output is exactly what the panel shows (pure black/white, or 16 levels in einkMode 2).
++// Split into three specialized SkRuntimeEffects (full NORMAL/IME, cheap FAST scroll, 16-level HD)
++// so Mali-G68 doesn't carry the full pass's register footprint while scrolling.
++// Prototype and scores: scripts/eink-bench (variants.py render_v3).
++static const char* const kEinkRenderSkSL = R"(
++    uniform shader img;
++    uniform shader noise;
++    uniform float r;
++    uniform float t1;
++    uniform float t2;
++    uniform float g0;
++    uniform float g1;
++    uniform float m0;
++    uniform float m1;
++    uniform float ms;
++    uniform float c0;
++    uniform float cmax;
++    uniform float clight;
++    uniform float csolid;
++    uniform float bleach;
++    uniform float crush;
++    uniform float gamma;
++    uniform float strength;
++    uniform float mtone;
++    uniform float knock;
++    uniform float invert;
++    const half3 W = half3(0.299, 0.587, 0.114);
++    half luma(float2 p) {
++        half v = dot(img.eval(p).rgb, W);
++        return invert > 0.5 ? 1.0 - v : v;  // per-app inversion for apps that are always dark
++    }
++    half onSide(half t, half lo, half hi, half e) {
++        return (t - lo <= e || hi - t <= e) ? 1.0 : 0.0;
++    }
++    half other(half t, half mid, bool dark) {
++        return dark ? (t > mid ? 1.0 : 0.0) : (t < mid ? 1.0 : 0.0);
++    }
++    half tone(half y) {
++        half t = saturate((y - 0.04) / 0.92);
++        if (bleach < 1.0) {
++            t = mix(t, 1.0, smoothstep(bleach, bleach + 0.10, y));
++        }
++        if (crush > 0.0) {
++            t *= smoothstep(crush * 0.6, crush, y);
++        }
++        return t <= 0.0 ? 0.0 : pow(t, gamma);
++    }
++    half4 main(float2 xy) {
++        half l = luma(xy);
++        // the map holds round(rank / 16) as 0..255: thresholds strictly inside (0, 1)
++        half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
++        half a0 = luma(xy + r * float2(1.0, 0.0));
++        half a1 = luma(xy + r * float2(0.5, 0.866));
++        half a2 = luma(xy + r * float2(-0.5, 0.866));
++        half a3 = luma(xy + r * float2(-1.0, 0.0));
++        half a4 = luma(xy + r * float2(-0.5, -0.866));
++        half a5 = luma(xy + r * float2(0.5, -0.866));
++        half b0 = luma(xy + r * float2(1.732, 1.0));
++        half b1 = luma(xy + r * float2(0.0, 2.0));
++        half b2 = luma(xy + r * float2(-1.732, 1.0));
++        half b3 = luma(xy + r * float2(-1.732, -1.0));
++        half b4 = luma(xy + r * float2(0.0, -2.0));
++        half b5 = luma(xy + r * float2(1.732, -1.0));
++        half lo = min(min(min(min(a0, a1), min(a2, a3)), min(min(a4, a5), min(b0, b1))), min(min(min(b2, b3), min(b4, b5)), l));
++        half hi = max(max(max(max(a0, a1), max(a2, a3)), max(max(a4, a5), max(b0, b1))), max(max(max(b2, b3), max(b4, b5)), l));
++        half spread = hi - lo;
++        half mid = 0.5 * (lo + hi);
++        half e = 0.25 * spread;
++        half n = 1.0 + onSide(a0, lo, hi, e) + onSide(a1, lo, hi, e) + onSide(a2, lo, hi, e) +
++                   onSide(a3, lo, hi, e) + onSide(a4, lo, hi, e) + onSide(a5, lo, hi, e) +
++                   onSide(b0, lo, hi, e) + onSide(b1, lo, hi, e) + onSide(b2, lo, hi, e) +
++                   onSide(b3, lo, hi, e) + onSide(b4, lo, hi, e) + onSide(b5, lo, hi, e);
++        half gate = g1 > 0.0 ? smoothstep(g0, g1, n / 13.0) : 1.0;
++        bool dark = l < mid;
++        // anti-aliased edges to the nearer local extreme
++        half s = smoothstep(t1, t2, spread) * gate * strength;
++        half y = mix(l, dark ? lo : hi, s);
++        // thin strokes (mostly surrounded by the other side) to pure black or white;
++        // skip the 6 outer-ring fetches on flat/photo pixels where push is guaranteed 0
++        half push = 0.0;
++        if (spread > ms * 0.6 && gate > 0.0 && !(dark && lo > mtone)) {
++            half k0 = luma(xy + r * float2(2.598, 1.5));
++            half k1 = luma(xy + r * float2(0.0, 3.0));
++            half k2 = luma(xy + r * float2(-2.598, 1.5));
++            half k3 = luma(xy + r * float2(-2.598, -1.5));
++            half k4 = luma(xy + r * float2(0.0, -3.0));
++            half k5 = luma(xy + r * float2(2.598, -1.5));
++            half o = other(a0, mid, dark) + other(a1, mid, dark) + other(a2, mid, dark) +
++                       other(a3, mid, dark) + other(a4, mid, dark) + other(a5, mid, dark) +
++                       other(b0, mid, dark) + other(b1, mid, dark) + other(b2, mid, dark) +
++                       other(b3, mid, dark) + other(b4, mid, dark) + other(b5, mid, dark) +
++                       other(k0, mid, dark) + other(k1, mid, dark) + other(k2, mid, dark) +
++                       other(k3, mid, dark) + other(k4, mid, dark) + other(k5, mid, dark);
++            push = smoothstep(m0, m1, o / 18.0) * smoothstep(ms * 0.6, ms, spread) * gate *
++                    strength;
++            y = mix(y, dark ? 0.0 : 1.0, push);
++        }
++        bool line = false;
++        bool knocked = false;
++        if (dark) {
++            bool wantContour = spread >= c0 && spread < cmax && hi >= clight;
++            // gate > 0.5 keeps knockout off high-contrast edges inside photos
++            bool wantKnock = knock > 0.5 && push < 0.5 && spread >= ms && gate > 0.5;
++            if (wantContour || wantKnock) {
++                half n4 = max(max(luma(xy + float2(1.0, 0.0)), luma(xy - float2(1.0, 0.0))),
++                              max(luma(xy + float2(0.0, 1.0)), luma(xy - float2(0.0, 1.0))));
++                if (n4 >= mid) {
++                    // low-contrast steps between light flat tones: a 1-px line on the darker
++                    // side (dotted below csolid)
++                    if (wantContour) {
++                        float2 ip = floor(xy);
++                        line = spread >= csolid || mod(ip.x + ip.y, 2.0) < 0.5;
++                    }
++                    // a dithered fill pixel touching a light label: clear 1-px margin
++                    knocked = wantKnock;
++                }
++            }
++        }
++        half t = line ? 0.0 : tone(y);
++        if (knocked && t > 0.0 && t < 1.0) {
++            t = 1.0;
++        }
++        half v = t > th ? 1.0 : 0.0;
++        return half4(v, v, v, 1.0);
++    }
++)";
++
++static const char* const kEinkRenderFastSkSL = R"(
++    uniform shader img;
++    uniform shader noise;
++    uniform float bleach;
++    uniform float crush;
++    uniform float gamma;
++    uniform float invert;
++    const half3 W = half3(0.299, 0.587, 0.114);
++    half4 main(float2 xy) {
++        half y = dot(img.eval(xy).rgb, W);
++        if (invert > 0.5) y = 1.0 - y;
++        half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
++        half t = saturate((y - 0.04) / 0.92);
++        if (bleach < 1.0) {
++            t = mix(t, 1.0, smoothstep(bleach, bleach + 0.10, y));
++        }
++        if (crush > 0.0) {
++            t *= smoothstep(crush * 0.6, crush, y);
++        }
++        t = t <= 0.0 ? 0.0 : pow(t, gamma);
++        half v = t > th ? 1.0 : 0.0;
++        return half4(v, v, v, 1.0);
++    }
++)";
++
++static const char* const kEinkRenderHdSkSL = R"(
++    uniform shader img;
++    uniform shader noise;
++    uniform float gamma16;
++    uniform float invert;
++    const half3 W = half3(0.299, 0.587, 0.114);
++    half4 main(float2 xy) {
++        half l = dot(img.eval(xy).rgb, W);
++        if (invert > 0.5) l = 1.0 - l;
++        half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
++        half t = saturate((l - 0.04) / 0.92);
++        t = t <= 0.0 ? 0.0 : pow(t, gamma16);
++        half q = clamp(floor(t * 15.0 + th), 0.0, 15.0);
++        half v = (q * 16.0 + 4.0) / 255.0;  // passes the kernel's 16-level dither unchanged
++        return half4(v, v, v, 1.0);
++    }
++)";
++
++void SkiaRenderEngine::drawEinkRender(const DisplaySettings& display,
++                                      const sk_sp<SkSurface>& surface, SkCanvas* canvas) {
++    SFTRACE_CALL();
++    static const sk_sp<SkRuntimeEffect> sEffectFull = [] {
++        auto [effect, error] = SkRuntimeEffect::MakeForShader(SkString(kEinkRenderSkSL));
++        if (!effect) ALOGE("e-ink render shader: %s", error.c_str());
++        return effect;
++    }();
++    static const sk_sp<SkRuntimeEffect> sEffectFast = [] {
++        auto [effect, error] = SkRuntimeEffect::MakeForShader(SkString(kEinkRenderFastSkSL));
++        if (!effect) ALOGE("e-ink fast shader: %s", error.c_str());
++        return effect;
++    }();
++    static const sk_sp<SkRuntimeEffect> sEffectHd = [] {
++        auto [effect, error] = SkRuntimeEffect::MakeForShader(SkString(kEinkRenderHdSkSL));
++        if (!effect) ALOGE("e-ink hd shader: %s", error.c_str());
++        return effect;
++    }();
++    static const sk_sp<SkImage> sNoise = [] {
++        const SkImageInfo info = SkImageInfo::Make(kEinkBlueNoiseSize, kEinkBlueNoiseSize,
++                                                   kGray_8_SkColorType, kOpaque_SkAlphaType);
++        return SkImages::RasterFromPixmapCopy(
++                SkPixmap(info, kEinkBlueNoise, static_cast<size_t>(kEinkBlueNoiseSize)));
++    }();
++    const sk_sp<SkRuntimeEffect>& effect = display.einkMode >= 2 ? sEffectHd
++            : display.einkMode == 1                              ? sEffectFast
++                                                                 : sEffectFull;
++    if (!effect || !sNoise) return;
++    sk_sp<SkImage> frame = surface->makeImageSnapshot();
++    if (!frame) return;
++    SkRuntimeShaderBuilder builder(effect);
++    builder.child("img") = frame->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
++                                             SkSamplingOptions(SkFilterMode::kNearest));
++    // a data texture: no colour conversion, no filtering
++    builder.child("noise") = sNoise->makeRawShader(SkTileMode::kRepeat, SkTileMode::kRepeat,
++                                                   SkSamplingOptions(SkFilterMode::kNearest));
++    builder.uniform("invert") = display.einkInvert ? 1.f : 0.f;
++    if (display.einkMode >= 2) {
++        builder.uniform("gamma16") = std::max(display.einkGamma16, 0.1f);
++    } else if (display.einkMode == 1) {
++        builder.uniform("bleach") = display.einkBleach;
++        builder.uniform("crush") = display.einkCrush;
++        builder.uniform("gamma") = std::max(display.einkGamma, 0.1f);
++    } else {
++        builder.uniform("r") = display.einkEnhanceRadius;
++        builder.uniform("t1") = display.einkEnhanceT1;
++        builder.uniform("t2") = std::max(display.einkEnhanceT2, display.einkEnhanceT1 + 0.001f);
++        builder.uniform("g0") = display.einkGate0;
++        builder.uniform("g1") = display.einkGate1 > 0.f
++                ? std::max(display.einkGate1, display.einkGate0 + 0.001f)
++                : 0.f;
++        builder.uniform("m0") = display.einkMinority0;
++        builder.uniform("m1") = std::max(display.einkMinority1, display.einkMinority0 + 0.001f);
++        builder.uniform("ms") = std::max(display.einkMinSpread, 0.001f);
++        builder.uniform("c0") = display.einkContour0;
++        builder.uniform("cmax") = display.einkContourMax;
++        builder.uniform("clight") = display.einkContourLight;
++        builder.uniform("csolid") = display.einkContourSolid;
++        builder.uniform("bleach") = display.einkBleach;
++        builder.uniform("crush") = display.einkCrush;
++        builder.uniform("gamma") = std::max(display.einkGamma, 0.1f);
++        builder.uniform("strength") = std::min(display.einkEnhanceStrength, 1.f);
++        builder.uniform("mtone") = display.einkMinTone;
++        builder.uniform("knock") = display.einkKnock ? 1.f : 0.f;
++    }
++    SkPaint paint;
++    paint.setShader(builder.makeShader());
++    paint.setBlendMode(SkBlendMode::kSrc);
++    SkAutoCanvasRestore restore(canvas, true);
++    canvas->resetMatrix();
++    canvas->drawPaint(paint);
++}
++
+ void SkiaRenderEngine::drawLayersInternal(
+         const std::shared_ptr<std::promise<FenceResult>>&& resultPromise,
+         const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+@@ -1440,7 +1686,9 @@ void SkiaRenderEngine::drawLayersInternal(
+ 
+     surfaceAutoSaveRestore.restore();
+ 
+-    if (display.einkPass()) {
++    if (display.einkRender >= 3) {
++        drawEinkRender(display, dstSurface, dstCanvas);
++    } else if (display.einkPass()) {
+         drawEinkEnhance(display, dstSurface, dstCanvas);
+     }
+ 
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.h b/libs/renderengine/skia/SkiaRenderEngine.h
+index 4fee3b4..9d778e1 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.h
++++ b/libs/renderengine/skia/SkiaRenderEngine.h
+@@ -158,6 +158,8 @@ private:
+                     const ShadowSettings& shadowSettings);
+     void drawEinkEnhance(const DisplaySettings& display, const sk_sp<SkSurface>& surface,
+                          SkCanvas* canvas);
++    void drawEinkRender(const DisplaySettings& display, const sk_sp<SkSurface>& surface,
++                        SkCanvas* canvas);
+     void drawLayersInternal(const std::shared_ptr<std::promise<FenceResult>>&& resultPromise,
+                             const DisplaySettings& display,
+                             const std::vector<LayerSettings>& layers,
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index e35229b..6e6f4aa 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -1535,8 +1535,30 @@ struct EinkEnhance {
+     // white (vendor.xrz.hibreak_contrast_black / _white).
+     float black = 0.f;
+     float white = 1.f;
++    // The render pass (debug.sf.eink_render=3, the default; 2 = the enhancement pass above).
++    // See renderengine::DisplaySettings::einkRender.
++    int32_t render = 0;
++    int32_t mode = 0;
++    float minority0 = 0.50f;
++    float minority1 = 0.65f;
++    float minSpread = 0.25f;
++    float contour0 = 0.03f;
++    float contourMax = 0.32f;
++    float contourLight = 0.75f;
++    float contourSolid = 0.10f;
++    float bleach = 0.76f;
++    float crush = 0.36f;
++    float gamma = 1.25f;
++    float gamma16 = 1.25f;
++    float minTone = 1.f;
++    bool knock = true;
++    bool invert = false;
+ };
+ 
++float einkProp(const char* name, uint32_t def, float scale) {
++    return base::GetUintProperty<uint32_t>(name, def) / scale;
++}
++
+ EinkEnhance getEinkEnhance() {
+     static std::mutex sMutex;
+     static uint32_t sSerial = 0xffffffffu;
+@@ -1575,6 +1597,60 @@ EinkEnhance getEinkEnhance() {
+         c.white = std::max(135u, std::min(255u, base::GetUintProperty<uint32_t>(
+                                                         "vendor.xrz.hibreak_contrast_white",
+                                                         255u))) / 255.f;
++        c.render = static_cast<int32_t>(
++                base::GetUintProperty<uint32_t>("debug.sf.eink_render", 3u));
++        if (c.render >= 3 && base::GetUintProperty<uint32_t>("debug.sf.eink_enhance", 0u) > 0) {
++            // The panel's mode decides what the frame must become: NORMAL (DU, dithered by the
++            // kernel) gets the full pass; FAST and HYPER (A2, never dithered by the kernel: greys
++            // would become partial drives and grey residue) the cheap one; the grey modes
++            // (HD, CLEAN, GL16) 16 levels.
++            switch (mode) {
++                case 0xb3: case 0x10: case 0x11: case 0xb7:
++                    // FAST is also the typing mode (the whole time the keyboard is up), so by
++                    // default it gets the full pass too: key outlines and solid text stay, and
++                    // nothing changes look when a scroll ends. debug.sf.eink.fast_full=0: the
++                    // cheap version (tone and dither only) for a shorter composition.
++                    c.mode = base::GetBoolProperty("debug.sf.eink.fast_full", true) ? 0 : 1;
++                    break;
++                case 0xb1: case 0x21: case 0xb0: case 0x04: case 0x20: case 0x84: case 0x40:
++                case 0xb4:
++                    c.mode = 2;
++                    break;
++                default:
++                    c.mode = 0;
++            }
++            c.strength = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance", 0u) / 100.f;
++            c.minority0 = einkProp("debug.sf.eink.minority0_x1000", 500u, 1000.f);
++            c.minority1 = einkProp("debug.sf.eink.minority1_x1000", 650u, 1000.f);
++            c.minSpread = einkProp("debug.sf.eink.minspread_x1000", 250u, 1000.f);
++            if (base::GetBoolProperty("debug.sf.eink.contour", true)) {
++                c.contour0 = einkProp("debug.sf.eink.contour0_x1000", 30u, 1000.f);
++            } else {
++                c.contour0 = 2.f;
++            }
++            c.contourMax = einkProp("debug.sf.eink.contourmax_x1000", 320u, 1000.f);
++            c.contourLight = einkProp("debug.sf.eink.contourlight_x1000", 750u, 1000.f);
++            c.contourSolid = einkProp("debug.sf.eink.contoursolid_x1000", 100u, 1000.f);
++            c.gamma = einkProp("debug.sf.eink.gamma_x100", 125u, 100.f);
++            c.gamma16 = einkProp("debug.sf.eink.gamma16_x100", 125u, 100.f);
++            c.minTone = einkProp("debug.sf.eink.mintone_x1000", 1000u, 1000.f);
++            c.knock = base::GetBoolProperty("debug.sf.eink.knock", true);
++            // HiBreakParts' per-app "inverted" mode, set while such an app is in front
++            c.invert = base::GetBoolProperty("vendor.xrz.hibreak_eink_invert", false);
++            // HiBreakParts' contrast for this pass: light greys from `bleach` up become white
++            // (keeping an outline), greys below `crush` black; 255 / 0 turn them off. The
++            // enhancement pass keeps its own vendor.xrz.hibreak_contrast_black/white, so
++            // debug.sf.eink_render=2 still shows exactly what it did.
++            c.bleach = std::max(128u, std::min(255u, base::GetUintProperty<uint32_t>(
++                                                             "vendor.xrz.hibreak_eink_bleach",
++                                                             194u))) / 255.f;
++            c.crush = std::min(128u, base::GetUintProperty<uint32_t>(
++                                             "vendor.xrz.hibreak_eink_crush", 92u)) / 255.f;
++            c.black = 0.f;
++            c.white = 1.f;
++        } else {
++            c.render = 0;
++        }
+         sConfig = c;
+     }
+     return sConfig;
+@@ -1636,6 +1712,22 @@ void Output::applyEinkEnhance(renderengine::DisplaySettings& settings) {
+     settings.einkGate1 = eink.gate1;
+     settings.einkBlack = eink.black;
+     settings.einkWhite = eink.white;
++    settings.einkRender = eink.render;
++    settings.einkMode = eink.mode;
++    settings.einkMinority0 = eink.minority0;
++    settings.einkMinority1 = eink.minority1;
++    settings.einkMinSpread = eink.minSpread;
++    settings.einkContour0 = eink.contour0;
++    settings.einkContourMax = eink.contourMax;
++    settings.einkContourLight = eink.contourLight;
++    settings.einkContourSolid = eink.contourSolid;
++    settings.einkBleach = eink.bleach;
++    settings.einkCrush = eink.crush;
++    settings.einkGamma = eink.gamma;
++    settings.einkGamma16 = eink.gamma16;
++    settings.einkMinTone = eink.minTone;
++    settings.einkKnock = eink.knock;
++    settings.einkInvert = eink.invert;
+ }
+ 
+ std::vector<LayerFE::LayerSettings> Output::generateClientCompositionRequests(
+diff --git a/services/surfaceflinger/ScreenCaptureOutput.cpp b/services/surfaceflinger/ScreenCaptureOutput.cpp
+index caf0957..28fabe6 100644
+--- a/services/surfaceflinger/ScreenCaptureOutput.cpp
++++ b/services/surfaceflinger/ScreenCaptureOutput.cpp
+@@ -95,6 +95,7 @@ renderengine::DisplaySettings ScreenCaptureOutput::generateClientCompositionDisp
+         clientCompositionDisplay.einkEnhanceStrength = 0.f;
+         clientCompositionDisplay.einkBlack = 0.f;
+         clientCompositionDisplay.einkWhite = 1.f;
++        clientCompositionDisplay.einkRender = 0;
+     }
+ 
+     auto renderIntent = static_cast<ui::RenderIntent>(clientCompositionDisplay.renderIntent);
+-- 
+2.43.0
+

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-License-Identifier: Apache-2.0
+     E-ink: the flash after an accepted touch fills the ridge solid for 300 ms and empties it
+     again, in two steps (two clean panel updates) instead of a 600 ms grey-blue fade.
+-->
+<set
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:ordering="sequentially" >
+    <objectAnimator
+        android:duration="300"
+        android:propertyName="fillAlpha"
+        android:valueFrom="1"
+        android:valueTo="1" />
+    <objectAnimator
+        android:duration="1"
+        android:propertyName="fillAlpha"
+        android:valueFrom="0"
+        android:valueTo="0" />
+</set>

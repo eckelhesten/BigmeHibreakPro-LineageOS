@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- E-ink: icons on light backgrounds are pure black. AOSP draws the navigation buttons, the
+     gesture handle and single-tone quick settings icons in translucent black (60-70 %), which
+     the panel can only show as a dither pattern. -->
+<resources>
+    <color name="dark_mode_icon_color_single_tone">#ff000000</color>
+    <color name="dark_mode_qs_icon_color_single_tone">#ff000000</color>
+    <color name="dark_mode_icon_color_dual_tone_fill">#ff000000</color>
+    <color name="dark_mode_qs_icon_color_dual_tone_fill">#ff000000</color>
+    <color name="light_mode_icon_color_single_tone">#ffffffff</color>
+    <color name="light_mode_icon_color_dual_tone_fill">#ffffffff</color>
+    <color name="navigation_bar_home_handle_dark_color">#ff000000</color>
+    <color name="navigation_bar_home_handle_light_color">#ffffffff</color>
+</resources>

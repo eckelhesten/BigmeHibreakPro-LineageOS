@@ -1,0 +1,66 @@
+From a4200efae48c1b9d74daa2528990a3452a5d1307 Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Fri, 13 Nov 2026 10:34:55 +0100
+Subject: [PATCH] libgui: fall back to epoll_wait when epoll_pwait2 is
+ unavailable
+
+BufferReleaseReader::readBlocking() waits for buffer releases with
+epoll_pwait2(), which needs Linux 5.11. On legacy kernels (here 4.19 on
+MT6877, prebuilt vendor kernel without source) every call fails with
+ENOSYS, so no app ever gets a released buffer back: SystemUI logged
+~100k 'epoll_wait error ... errno=38' in four minutes, the boot
+animation stalled and the screen stayed black.
+
+Remember ENOSYS once per process and use epoll_wait() with the timeout
+rounded up to whole milliseconds instead.
+---
+ libs/gui/BLASTBufferQueue.cpp | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/libs/gui/BLASTBufferQueue.cpp b/libs/gui/BLASTBufferQueue.cpp
+index 05fbc14..2d4602d 100644
+--- a/libs/gui/BLASTBufferQueue.cpp
++++ b/libs/gui/BLASTBufferQueue.cpp
+@@ -31,6 +31,9 @@
+ #include <sys/epoll.h>
+ #include <sys/eventfd.h>
+ 
++#include <atomic>
++#include <climits>
++
+ #include <gui/FrameRateUtils.h>
+ #include <gui/GLConsumer.h>
+ #include <gui/IProducerListener.h>
+@@ -1466,9 +1469,27 @@ status_t BufferReleaseReader::readBlocking(ReleaseCallbackId& outId, sp<Fence>&
+ 
+     epoll_event event{};
+     int eventCount;
++    // epoll_pwait2 needs Linux 5.11. Legacy kernels (e.g. 4.19 on MT6877 devices without kernel
++    // source) return ENOSYS, which would fail every wait and leave apps without free buffers.
++    // Fall back to epoll_wait with the timeout rounded up to whole milliseconds.
++    static std::atomic<bool> sHasEpollPwait2{true};
+     do {
+-        eventCount = epoll_pwait2(mEpollFd.get(), &event, 1 /*maxevents*/,
+-                                  timespec ? &(*timespec) : nullptr, nullptr /*sigmask*/);
++        if (sHasEpollPwait2.load(std::memory_order_relaxed)) {
++            eventCount = epoll_pwait2(mEpollFd.get(), &event, 1 /*maxevents*/,
++                                      timespec ? &(*timespec) : nullptr, nullptr /*sigmask*/);
++            if (eventCount == -1 && errno == ENOSYS) {
++                sHasEpollPwait2.store(false, std::memory_order_relaxed);
++                errno = EINTR;
++                continue;
++            }
++        } else {
++            int timeoutMs = -1;
++            if (timeout >= 0) {
++                const nsecs_t ms = timeout / 1000000 + (timeout % 1000000 != 0 ? 1 : 0);
++                timeoutMs = ms > INT_MAX ? INT_MAX : static_cast<int>(ms);
++            }
++            eventCount = epoll_wait(mEpollFd.get(), &event, 1 /*maxevents*/, timeoutMs);
++        }
+     } while (eventCount == -1 && errno == EINTR);
+ 
+     if (eventCount == -1) {
+-- 
+2.50.1 (Apple Git-155)
+

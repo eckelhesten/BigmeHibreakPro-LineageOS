@@ -1,0 +1,17 @@
+// E-ink font bench (scripts/eink-bench/fontbench.py), not part of the ROM: draws the same page
+// (a settings list, a chat list, a paragraph, test glyphs) in any font file and weights, through
+// the phone's real text path (hwui 1-bit glyphs on e-ink), so typefaces can be compared on the
+// panel. Build with `m HiBreakFontLab`, install with adb. Fonts come from the app's external
+// files dir (pushed by the bench) or /system/fonts.
+android_app {
+    name: "HiBreakFontLab",
+    srcs: ["src/**/*.java"],
+    sdk_version: "current",
+    manifest: "AndroidManifest.xml",
+    optimize: {
+        enabled: false,
+    },
+    dex_preopt: {
+        enabled: false,
+    },
+}

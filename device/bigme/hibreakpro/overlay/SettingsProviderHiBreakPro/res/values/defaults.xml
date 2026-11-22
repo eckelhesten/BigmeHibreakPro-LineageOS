@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Defaults that apply when the settings database is created (first boot / after a wipe). -->
+<resources>
+    <!-- Auto front light on: HiBreakParts' FrontLightController gives more light the darker the
+         room and none in daylight, around the level the slider sets. -->
+    <bool name="def_screen_brightness_automatic_mode">true</bool>
+</resources>

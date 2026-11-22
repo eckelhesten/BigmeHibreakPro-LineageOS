@@ -1,0 +1,5 @@
+# MediaTek IMS service (ims.te): the binder services it registers, as on stock's system_ext.
+mtkIms                                    u:object_r:radio_service:s0
+mwis                                      u:object_r:radio_service:s0
+vodata                                    u:object_r:radio_service:s0
+imsa                                      u:object_r:radio_service:s0

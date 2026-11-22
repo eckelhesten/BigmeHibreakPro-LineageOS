@@ -29,13 +29,12 @@ two triggers; debug.sf.eink_motion.{mode,frames,gap_ms,end_ms} tune it.
  create mode 100644 services/surfaceflinger/DisplayHardware/EinkMotion.h
 
 diff --git a/services/surfaceflinger/Android.bp b/services/surfaceflinger/Android.bp
-index 27c7042..c71524a 100644
+index d39f7ad..c71524a 100644
 --- a/services/surfaceflinger/Android.bp
 +++ b/services/surfaceflinger/Android.bp
-@@ -187,6 +187,7 @@ filegroup {
+@@ -187,5 +187,6 @@ filegroup {
          "DisplayHardware/AidlComposerHal.cpp",
          "DisplayHardware/ComposerHal.cpp",
-         "DisplayHardware/EinkEngine.cpp",
 +        "DisplayHardware/EinkMotion.cpp",
          "DisplayHardware/FramebufferSurface.cpp",
          "DisplayHardware/HWC2.cpp",

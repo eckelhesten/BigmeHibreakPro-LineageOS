@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Keep the build server's compiler cache (/srv/ccache) between throwaway servers, on a store host
-# at home (the Arch box, ~/hibreak/ccache-store since 2026-11-17). A full build with a warm cache takes ~1-1.5 h instead of ~2.5 h.
+# Keep the build server's compiler cache (/srv/ccache) between throwaway servers on a remote
+# store host. A full build with a warm cache takes ~1-1.5 h instead of ~2.5 h.
 # The source tree and out/ are not kept: a fresh sync is 20 min, and moving ~300 GB through a home
 # line takes as long as building.
 #

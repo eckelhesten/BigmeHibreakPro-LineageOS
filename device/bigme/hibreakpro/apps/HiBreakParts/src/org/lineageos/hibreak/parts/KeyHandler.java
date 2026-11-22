@@ -140,10 +140,13 @@ public class KeyHandler implements DeviceKeyHandler {
                     if (interactive) {
                         // Device-wide, like the refresh request: EinkPolicy and FrontLightController
                         // run in user 0 and only observe user 0's settings.
-                        int mode = Eink.clampMode(Settings.System.getIntForUser(cr,
-                                Keys.EINK_MODE, 0, UserHandle.USER_SYSTEM));
-                        Settings.System.putIntForUser(cr, Keys.EINK_MODE,
-                                (mode + 1) % Eink.MODE_VALUES.length, UserHandle.USER_SYSTEM);
+                        // Default <-> Reading.
+                        int profile = Eink.clampProfile(Settings.System.getIntForUser(cr,
+                                Keys.EINK_PROFILE, Eink.PROFILE_DEFAULT, UserHandle.USER_SYSTEM));
+                        Settings.System.putIntForUser(cr, Keys.EINK_PROFILE,
+                                profile == Eink.PROFILE_READING
+                                        ? Eink.PROFILE_DEFAULT : Eink.PROFILE_READING,
+                                UserHandle.USER_SYSTEM);
                     }
                     break;
                 case "frontlight":

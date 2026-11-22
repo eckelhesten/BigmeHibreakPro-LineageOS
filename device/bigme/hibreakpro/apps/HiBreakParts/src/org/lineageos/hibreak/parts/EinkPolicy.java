@@ -25,8 +25,9 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Applies the e-ink settings to the composer: the global refresh mode, overridden per app while
- * that app's task is in front, plus the auto-clean and anti-flicker switches. Also clears
+ * Applies the e-ink profile to the composer: the global profile (Default or Reading), overridden
+ * per app while that app's task is in front, and the fixed settings (Eink.applyFixedSettings)
+ * that used to be switches. Also clears
  * ghosting with a full refresh after unlocking and every Nth app switch (Keys.EINK_CLEAN):
  * measured on camera (scripts/eink-bench/ghost.py, 2026-11-20), white areas got 70 % darker
  * over seven app switches without one, and a full refresh brought them back to clean.
@@ -43,18 +44,12 @@ class EinkPolicy {
     private String mTopPackage;
     private int mAppliedValue = Integer.MIN_VALUE;
     private boolean mAppliedInvert;
-    private int mAppliedContrast = Integer.MIN_VALUE;
-    private Boolean mAppliedAutoClean;
-    private Boolean mAppliedAntiFlicker;
-    private Boolean mAppliedMotionFast;
-    private Boolean mAppliedImeFast;
-    private Boolean mAppliedFastGreys;
     // Battery temperature (deg C) the fast-grey band was last picked for; NaN = not known yet.
     private float mBatteryTemp = Float.NaN;
     private float mBandTemp = Float.NaN;
     private String mAppliedFastBand;
-    private String mCachedAppModesRaw;
-    private Map<String, Integer> mAppModes = Collections.emptyMap();
+    private String mCachedAppProfilesRaw;
+    private Map<String, Integer> mAppProfiles = Collections.emptyMap();
     private int mSwitches;
     /** After a switch the new app draws for a while; refresh once it has settled. */
     private static final long CLEAN_AFTER_SWITCH_MS = 900;
@@ -92,10 +87,8 @@ class EinkPolicy {
                 applyAll();
             }
         };
-        for (String key : new String[] {Keys.EINK_MODE, Keys.EINK_APP_MODES,
-                Keys.EINK_AUTO_CLEAN, Keys.EINK_ANTI_FLICKER, Keys.EINK_MOTION_FAST,
-                Keys.EINK_IME_FAST, Keys.EINK_FAST_GREYS, Keys.EINK_FAST_MAPS,
-                Keys.EINK_CONTRAST}) {
+        for (String key : new String[] {Keys.EINK_PROFILE, Keys.EINK_APP_PROFILES,
+                Keys.EINK_BENCH_MODE, Keys.EINK_FAST_MAPS}) {
             mResolver.registerContentObserver(Settings.System.getUriFor(key), false, observer);
         }
         try {
@@ -123,9 +116,8 @@ class EinkPolicy {
         //   inverts the sleep screen or lock screen.
         // - After waking up, the sleep screen's big clock (and the lock screen) are still in the
         //   ink. With a lock screen that is after "user present"; without one (no keyguard at all,
-        //   as on the owner's phone) the screen goes straight from the sleep screen to the app and
-        //   no "user present" is sent, so the screen coming on counts then.
-        // Greys in Fast mode drift with the panel's temperature (the kernel's synthesised A2 table
+        //   sleep screen to the app and no "user present" is sent, so the screen coming on counts then.
+        // Default's greys drift with the panel's temperature (the kernel's synthesised A2 table
         // is the same from 12 deg C up, the panel isn't): follow the battery temperature, which
         // is one of the two the kernel picks its waveform by.
         mContext.registerReceiver(new BroadcastReceiver() {
@@ -161,6 +153,7 @@ class EinkPolicy {
                 scheduleClean(CLEAN_AFTER_UNLOCK_MS);
             }
         }, power, Context.RECEIVER_NOT_EXPORTED);
+        Eink.applyFixedSettings();
         updateTopPackage();
         applyAll();
     }
@@ -203,80 +196,47 @@ class EinkPolicy {
         // 0.5 deg C of hysteresis against flapping at a band edge
         float t = (!Float.isNaN(mBandTemp) && Math.abs(mBatteryTemp - mBandTemp) < 0.5f)
                 ? mBandTemp : mBatteryTemp;
-        String[] band = Eink.fastGreyBand(
-                Settings.System.getString(mResolver, Keys.EINK_FAST_MAPS), t);
+        String maps = Settings.System.getString(mResolver, Keys.EINK_FAST_MAPS);
+        String[] band = Eink.fastGreyBand(maps != null ? maps : Keys.DEFAULT_FAST_MAPS, t);
         String key = band == null ? "" : band[0] + "/" + band[1];
         mBandTemp = t;
         if (key.equals(mAppliedFastBand)) return;
         mAppliedFastBand = key;
         SystemProperties.set(Eink.PROP_FAST_LEVELS, band == null ? "" : band[0]);
         SystemProperties.set(Eink.PROP_FAST_GAMMA, band == null ? "" : band[1]);
-        if (Boolean.TRUE.equals(mAppliedFastGreys)) Eink.requestRepaint();
+        Eink.requestRepaint();
     }
 
-    private Boolean syncBoolProp(String key, String prop, Boolean prev) {
-        return syncBoolProp(key, prop, prev, true);
-    }
-
-    private Boolean syncBoolProp(String key, String prop, Boolean prev, boolean def) {
-        boolean val = Settings.System.getInt(mResolver, key, def ? 1 : 0) != 0;
-        if (prev == null || val != prev) {
-            SystemProperties.set(prop, val ? "1" : "0");
-            return val;
+    private Map<String, Integer> getCachedAppProfiles() {
+        String raw = Settings.System.getString(mResolver, Keys.EINK_APP_PROFILES);
+        if (mCachedAppProfilesRaw == null || !Objects.equals(raw, mCachedAppProfilesRaw)) {
+            mCachedAppProfilesRaw = raw;
+            mAppProfiles = Eink.parseAppProfiles(raw);
         }
-        return prev;
-    }
-
-    private Map<String, Integer> getCachedAppModes() {
-        String raw = Settings.System.getString(mResolver, Keys.EINK_APP_MODES);
-        if (mCachedAppModesRaw == null || !Objects.equals(raw, mCachedAppModesRaw)) {
-            mCachedAppModesRaw = raw;
-            mAppModes = Eink.parseAppModes(raw);
-        }
-        return mAppModes;
+        return mAppProfiles;
     }
 
     private void applyAll() {
-        mAppliedAutoClean = syncBoolProp(Keys.EINK_AUTO_CLEAN, Eink.PROP_AUTO_CLEAN,
-                mAppliedAutoClean);
-        boolean antiFlicker = Settings.System.getInt(mResolver, Keys.EINK_ANTI_FLICKER, 1) != 0;
-        if (mAppliedAntiFlicker == null || antiFlicker != mAppliedAntiFlicker) {
-            mAppliedAntiFlicker = antiFlicker;
-            Eink.setAntiFlicker(antiFlicker);
-        }
-        mAppliedMotionFast = syncBoolProp(Keys.EINK_MOTION_FAST, Eink.PROP_MOTION_FAST,
-                mAppliedMotionFast);
-        mAppliedImeFast = syncBoolProp(Keys.EINK_IME_FAST, Eink.PROP_IME_FAST,
-                mAppliedImeFast);
-        boolean greysBefore = Boolean.TRUE.equals(mAppliedFastGreys);
-        mAppliedFastGreys = syncBoolProp(Keys.EINK_FAST_GREYS, Eink.PROP_FAST_GREYS,
-                mAppliedFastGreys, false);
-        if (mAppliedFastGreys != greysBefore) Eink.requestRepaint();
         applyFastGreyBand();
-        int contrast = Settings.System.getInt(mResolver, Keys.EINK_CONTRAST,
-                Keys.DEFAULT_CONTRAST);
-        if (contrast != mAppliedContrast) {
-            mAppliedContrast = contrast;
-            Eink.setContrast(contrast);
-            Eink.requestRepaint();
-        }
         applyMode();
     }
 
     private void applyMode() {
-        int index = Eink.getGlobalMode(mResolver);
-        if (mTopPackage != null) {
-            Integer appIndex = getCachedAppModes().get(mTopPackage);
-            if (appIndex != null) index = appIndex;
-        }
-        boolean invert = index == Eink.MODE_INVERTED;
+        int profile = Eink.profileFor(getCachedAppProfiles(), mTopPackage,
+                Eink.getProfile(mResolver));
+        boolean invert = profile == Eink.APP_INVERTED;
         if (invert && ((mPowerManager != null && !mPowerManager.isInteractive())
                 || (mKeyguardManager != null && mKeyguardManager.isKeyguardLocked()))) {
             // Never invert the sleep screen or lock screen when an inverted app (e.g. Clock)
             // happens to be in the foreground.
             invert = false;
         }
-        int value = Eink.MODE_VALUES[index == Eink.MODE_INVERTED ? 0 : index];
+        int value = Eink.modeFor(profile);
+        int bench = Eink.benchMode(Settings.System.getInt(mResolver, Keys.EINK_BENCH_MODE, -1));
+        if (bench >= 0) {
+            value = bench;
+            invert = false;
+        }
         boolean valueChanged = value != mAppliedValue;
         boolean invertChanged = mAppliedValue == Integer.MIN_VALUE || invert != mAppliedInvert;
         if (!valueChanged && !invertChanged) return;

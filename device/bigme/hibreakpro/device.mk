@@ -1,5 +1,5 @@
 #
-# Bigme HiBreak Pro: product configuration (bring-up stage 1)
+# Bigme HiBreak Pro: product configuration
 #
 DEVICE_PATH := device/bigme/hibreakpro
 
@@ -12,7 +12,7 @@ PRODUCT_USE_DYNAMIC_PARTITIONS := true
 # Virtual A/B without compression: updates use the kernel's dm-snapshot. Compressed VAB needs
 # snapuserd handed over to its SELinux domain while the kernel is still permissive, but Bigme's
 # 4.19 kernel enforces from the first policy load, so the first boot after an update failed in
-# first-stage init (2026-11-16, docs/signing.md "Updates"). The stock vendor still declares
+# first-stage init (2026-11-16). The stock vendor still declares
 # ro.virtual_ab.compression.enabled; the update package decides, and ours says no compression.
 $(call inherit-product, $(SRC_TARGET_DIR)/product/virtual_ab_ota/launch.mk)
 
@@ -48,13 +48,13 @@ PRODUCT_PACKAGES += \
     NotoSans-VF.ttf.product \
     NotoSans-Italic-VF.ttf.product
 
-# Google services flavour (docs/building.md "Flavours"), from the environment at build time:
+# Google services flavour (docs/building.md), from the environment at build time:
 #   vanilla  no Google services at all
-#   microg   microG (official release, signed by microG): the owner's daily driver, the default
+#   microg   microG (official release, signed by microG): the default
 #   gapps    MindTheGapps (Google Play services and Play Store)
 # The flavour goes into the build name (lineage-23.2-<date>-UNOFFICIAL-<flavour>-hibreakpro).
 # There is no update server: releases are downloaded from GitHub and installed with Updater >
-# "Install local update" (docs/building.md "Releases").
+# "Install local update" (docs/building.md).
 ifeq ($(strip $(HIBREAK_FLAVOR)),)
 HIBREAK_FLAVOR := microg
 endif
@@ -109,11 +109,11 @@ AB_OTA_POSTINSTALL_CONFIG += \
     FILESYSTEM_TYPE_system=ext4 \
     POSTINSTALL_OPTIONAL_system=true
 
-# VoLTE: MediaTek's IMS service from the stock firmware (docs/volte.md). The APK comes from
+# VoLTE: MediaTek's IMS service from the stock firmware. The APK comes from
 # the private vendor tree, built from the stock system_ext by tools/ims/extract-ims.py; without
 # it there are no voice calls on LTE-only networks, so its absence is an error, not a silent skip.
 ifeq ($(wildcard vendor/bigme/hibreakpro/proprietary/system_ext/priv-app/ImsService/Android.bp),)
-$(error MediaTek IMS service missing from vendor/bigme/hibreakpro: run device/bigme/hibreakpro/tools/ims/extract-ims.py (docs/volte.md))
+$(error MediaTek IMS service missing from vendor/bigme/hibreakpro: run device/bigme/hibreakpro/tools/ims/extract-ims.py)
 endif
 PRODUCT_PACKAGES += \
     MtkImsService \
@@ -135,7 +135,7 @@ PRODUCT_COPY_FILES += \
     $(DEVICE_PATH)/rootdir/etc/fstab.mt6877:$(TARGET_COPY_OUT_RECOVERY)/root/first_stage_ramdisk/fstab.mt6877 \
     $(DEVICE_PATH)/rootdir/etc/init.recovery.mt6877.rc:$(TARGET_COPY_OUT_RECOVERY)/root/init.recovery.mt6877.rc
 
-# E-ink: system-side pieces the stock vendor composer expects (docs/eink-interface.md)
+# E-ink: system-side pieces the stock vendor composer expects
 PRODUCT_COPY_FILES += \
     $(DEVICE_PATH)/rootdir/etc/init.hibreakpro.eink.rc:$(TARGET_COPY_OUT_SYSTEM_EXT)/etc/init/init.hibreakpro.eink.rc
 

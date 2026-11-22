@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000022 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sun, 22 Nov 2026 21:00:00 +0100
+Subject: [PATCH] sf: e-ink: keep light tones and subtle UI edges distinguishable
+ in 16-level greys
+
+With Greys in Fast mode on, the screen ran the 16-level pass (mode 2)
+while the keyboard was down and dropped to the full 1-bit pass (mode 0)
+while the keyboard was up. Light UI surfaces (WhatsApp's #EFEAE2 chat
+background, doodles and bubbles, Signal's cards, keyboard backdrops)
+looked much more distinguishable with the keyboard up than down:
+
+- kEinkRenderHdSkSL clipped luma >= 0.96 to pure white via
+  (l - 0.04) / 0.92 and stretched #EFEAE2 (0.92) up to 0.957, where
+  A2's top levels sit within ~2 L* of paper white.
+- Mode 2 had no contour pass for flat-to-flat light boundaries (cards,
+  bubbles, doodles, key outlines), which mode 0 drew via wantContour.
+
+Fix mode 2 so it always has that distinguishability at the same fast
+speed, and keep greys active while typing too:
+
+- White point of mode 2 is now 1.0 by default (runtime tunable
+  debug.sf.eink.white16_x1000, default 1000; 960 restores the old clip).
+- Lightweight 4-neighbor (1-px reach) contour on flat-to-flat light
+  steps: diff = nmax - l in [c0, cmax), nmax >= clight, and
+  (l - nmin) < diff * 0.5 (which rejects smooth photo gradients and
+  anti-aliased text fringes). Darkens the edge pixel by
+  debug.sf.eink.contour16_drop_x1000 (default 300, clamped >= 0.25;
+  debug.sf.eink.contour16=0 or debug.sf.eink.contour=0 disables it).
+  Client-target damage padding covers its 1-px reach.
+- debug.sf.eink.fast_greys=1 (HiBreakParts' default) now stays in
+  16-level greys while the keyboard is up as well (value 3 restores the
+  previous 1-bit IME fallback for A/B testing).
+
+Scored offline across 8 corpus screens (whatsapp, signal, calendar,
+fairemail, settings-search-kbd, web-news, web-wiki, web-images) with
+GR III A2 measurements: low-contrast edge loss drops from 26.4 % to
+3.7 %, mid-contrast loss stays 0.0 %, WhatsApp chat background contrast
+rises from 2.1 L* to 7.9 L* (with the updated level map), and text/ramp
+scores remain better than baseline.
+---
+ .../include/renderengine/DisplaySettings.h    |  8 ++-
+ libs/renderengine/skia/SkiaRenderEngine.cpp   | 35 ++++++++++++-
+ .../CompositionEngine/src/Output.cpp          | 51 +++++++++++++++----
+ 3 files changed, 81 insertions(+), 13 deletions(-)
+
+diff --git a/libs/renderengine/include/renderengine/DisplaySettings.h b/libs/renderengine/include/renderengine/DisplaySettings.h
+index 522f7a0..7c9b412 100644
+--- a/libs/renderengine/include/renderengine/DisplaySettings.h
++++ b/libs/renderengine/include/renderengine/DisplaySettings.h
+@@ -131,6 +131,10 @@ struct DisplaySettings {
+     // Identity for HD/CLEAN; for greys in FAST (A2) a map measured on the panel skips levels
+     // that A2's proportional drives don't reach reliably.
+     uint64_t einkLevelMap = 0xFEDCBA9876543210ull;
++    // Upper white point of einkMode 2 (1.0 preserves light UI surfaces instead of clipping >= 0.96
++    // to white) and darkening drop for its 1-px flat-to-flat light-step contour (0 = off).
++    float einkWhite16 = 1.f;
++    float einkContour16 = 0.30f;
+     float einkMinTone = 1.f;
+     bool einkKnock = true;
+     bool einkInvert = false;
+@@ -205,7 +209,8 @@ static inline bool operator==(const DisplaySettings& lhs, const DisplaySettings&
+             lhs.einkContourSolid == rhs.einkContourSolid && lhs.einkBleach == rhs.einkBleach &&
+             lhs.einkCrush == rhs.einkCrush && lhs.einkGamma == rhs.einkGamma &&
+             lhs.einkGamma16 == rhs.einkGamma16 && lhs.einkLevelMap == rhs.einkLevelMap &&
+-            lhs.einkMinTone == rhs.einkMinTone &&
++            lhs.einkWhite16 == rhs.einkWhite16 && lhs.einkContour16 == rhs.einkContour16 &&
++            lhs.einkMinTone == rhs.einkMinTone &&
+             lhs.einkKnock == rhs.einkKnock && lhs.einkInvert == rhs.einkInvert &&
+             lhs.einkOffscreen == rhs.einkOffscreen;
+ }
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+index 0264d56..8a4d2c1 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -1025,6 +1025,11 @@ static const char* const kEinkRenderHdSkSL = R"(
+     uniform shader img;
+     uniform shader noise;
+     uniform float gamma16;
++    uniform float white16;
++    uniform float c0;
++    uniform float cmax;
++    uniform float clight;
++    uniform float cdrop;
+     uniform float invert;
+     // panel level per step: lv0 = steps 0-3, ..., lv3 = steps 12-15 (DisplaySettings::einkLevelMap)
+     uniform half4 lv0;
+@@ -1032,12 +1037,30 @@ static const char* const kEinkRenderHdSkSL = R"(
+     uniform half4 lv2;
+     uniform half4 lv3;
+     const half3 W = half3(0.299, 0.587, 0.114);
++    half luma(float2 p) {
++        half v = dot(img.eval(p).rgb, W);
++        return invert > 0.5 ? 1.0 - v : v;
++    }
+     half4 main(float2 xy) {
+-        half l = dot(img.eval(xy).rgb, W);
+-        if (invert > 0.5) l = 1.0 - l;
++        half l = luma(xy);
+         half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
+-        half t = saturate((l - 0.04) / 0.92);
++        half span = max(white16 - 0.04, 0.1);
++        half t = saturate((l - 0.04) / span);
+         t = t <= 0.0 ? 0.0 : pow(t, gamma16);
++        if (cdrop > 0.0) {
++            half n0 = luma(xy + float2(1.0, 0.0));
++            half n1 = luma(xy - float2(1.0, 0.0));
++            half n2 = luma(xy + float2(0.0, 1.0));
++            half n3 = luma(xy - float2(0.0, 1.0));
++            half nmax = max(max(n0, n1), max(n2, n3));
++            half nmin = min(min(n0, n1), min(n2, n3));
++            half diff = nmax - l;
++            // 1-px contour on flat-to-flat light steps (bubbles, cards, doodles, keys);
++            // (l - nmin) < diff * 0.5 keeps it off smooth photo gradients and AA text fringes.
++            if (diff >= c0 && diff < cmax && nmax >= clight && (l - nmin) < diff * 0.5) {
++                t = min(t, max(0.25, t - cdrop));
++            }
++        }
+         half q = clamp(floor(t * 15.0 + th), 0.0, 15.0);
+         const half4 steps = half4(0.0, 1.0, 2.0, 3.0);
+         const half4 near = half4(0.5);
+@@ -1086,6 +1109,12 @@ bool SkiaRenderEngine::drawEinkRender(const DisplaySettings& display,
+     builder.uniform("invert") = display.einkInvert ? 1.f : 0.f;
+     if (display.einkMode >= 2) {
+         builder.uniform("gamma16") = std::max(display.einkGamma16, 0.1f);
++        builder.uniform("white16") = std::max(0.5f, std::min(1.f, display.einkWhite16));
++        builder.uniform("c0") = display.einkContour0;
++        builder.uniform("cmax") = display.einkContourMax;
++        builder.uniform("clight") = display.einkContourLight;
++        builder.uniform("cdrop") =
++                std::max(0.f, std::min(1.f, display.einkContour16));
+         float lv[16];
+         for (int k = 0; k < 16; k++) {
+             lv[k] = static_cast<float>((display.einkLevelMap >> (4 * k)) & 0xFu);
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index 85080d6..4a2f81b 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -1572,6 +1572,8 @@ struct EinkEnhance {
+     // Panel level for each of the 16 steps of the 16-level version, 4 bits each (step k in
+     // bits 4k..4k+3); identity except for greys in FAST.
+     uint64_t levelMap = 0xFEDCBA9876543210ull;
++    float white16 = 1.f;
++    float contour16 = 0.30f;
+     float minTone = 1.f;
+     bool knock = true;
+     bool invert = false;
+@@ -1666,15 +1668,16 @@ EinkEnhance getEinkEnhance(bool trackKernelDither) {
+                     // where HD takes 443 ms (scripts/eink-bench/greys.py). Tone curve
+                     // (debug.sf.eink.gamma_fast_x100) and level map (debug.sf.eink.fast_levels)
+                     // are measured on the panel. debug.sf.eink.fast_greys (default: HiBreakParts'
+-                    // vendor.xrz.hibreak_fast_greys): 1 = greys except while the keyboard is up
+-                    // (the full pass then, as above), 2 = greys always, 0 = off.
++                    // vendor.xrz.hibreak_fast_greys): 1 or 2 = greys always (including while the
++                    // keyboard is up: mode 2 keeps light tones and key outlines distinguishable),
++                    // 3 = greys except while the keyboard is up, 0 = off.
+                     const uint32_t greys = base::GetUintProperty<uint32_t>(
+                             "debug.sf.eink.fast_greys",
+                             base::GetUintProperty<uint32_t>("vendor.xrz.hibreak_fast_greys", 0u));
+                     // Only the whole-panel A2 path is undithered: partial A2 (0x10) and HYPER
+                     // (0xb7) get the kernel's 1-bit Atkinson.
+                     const bool a2 = effectiveMode == 0xb3 || effectiveMode == 0x11;
+-                    if (a2 && (greys == 2 || (greys == 1 && c.mode == 1))) {
++                    if (a2 && (greys == 1 || greys == 2 || (greys == 3 && c.mode == 1))) {
+                         c.mode = 2;
+                         fastGreys = true;
+                     }
+@@ -1690,17 +1693,29 @@ EinkEnhance getEinkEnhance(bool trackKernelDither) {
+             c.minority0 = einkProp("debug.sf.eink.minority0_x1000", 500u, 1000.f);
+             c.minority1 = einkProp("debug.sf.eink.minority1_x1000", 650u, 1000.f);
+             c.minSpread = einkProp("debug.sf.eink.minspread_x1000", 250u, 1000.f);
+-            if (base::GetBoolProperty("debug.sf.eink.contour", true)) {
++            const bool contourOn = base::GetBoolProperty("debug.sf.eink.contour", true);
++            if (contourOn) {
+                 c.contour0 = einkProp("debug.sf.eink.contour0_x1000", 30u, 1000.f);
+             } else {
+                 c.contour0 = 2.f;
+             }
+             c.contourMax = einkProp("debug.sf.eink.contourmax_x1000", 320u, 1000.f);
+             c.contourLight = einkProp("debug.sf.eink.contourlight_x1000", 750u, 1000.f);
+             c.contourSolid = einkProp("debug.sf.eink.contoursolid_x1000", 100u, 1000.f);
++            c.contour16 = (contourOn && base::GetBoolProperty("debug.sf.eink.contour16", true))
++                    ? std::max(0.f,
++                               std::min(1.f,
++                                        einkProp("debug.sf.eink.contour16_drop_x1000", 300u,
++                                                 1000.f)))
++                    : 0.f;
+             c.gamma = einkProp("debug.sf.eink.gamma_x100", 125u, 100.f);
+             c.gamma16 = einkProp("debug.sf.eink.gamma16_x100", 125u, 100.f);
+             c.levelMap = 0xFEDCBA9876543210ull;
++            // Upper white point of the 16-level pass: 1.0 keeps light UI surfaces (#F5F5F5,
++            // #EFEAE2, #D9FDD3) distinct from white instead of clipping >= 0.96 to white.
++            c.white16 = std::max(
++                    0.5f,
++                    std::min(1.f, einkProp("debug.sf.eink.white16_x1000", 1000u, 1000.f)));
+             if (fastGreys) {
+                 // Measured per temperature band: HiBreakParts publishes the band's curve and map
+                 // (vendor.xrz.hibreak_fast_gamma_x100 / _fast_levels) from the battery
+@@ -1784,10 +1799,11 @@ EinkEnhance getEinkEnhance(bool trackKernelDither) {
+ // The render pass's full version reads its outer ring 3 r away (r = radius), the enhancement
+-// pass 2 r; the FAST and 16-level versions work per pixel.
++// pass 2 r, the 16-level version's contour 1 px away; the cheap FAST version works per pixel.
+ int32_t einkDamagePadding(const EinkEnhance& e) {
+     if (!e.damagePad) return 0;
+     float reach = 0.f;
+     if (e.render >= 3) {
+-        reach = e.mode == 0 ? 3.f * e.radius : 0.f;
++        reach = e.mode == 0 ? 3.f * e.radius
++                            : (e.mode >= 2 && e.contour16 > 0.f ? 1.f : 0.f);
+     } else if (e.strength > 0.f) {
+         reach = 2.f * e.radius;
+     }
+@@ -1860,6 +1876,8 @@ void Output::applyEinkEnhance(renderengine::DisplaySettings& settings, bool trac
+     settings.einkGamma = eink.gamma;
+     settings.einkGamma16 = eink.gamma16;
+     settings.einkLevelMap = eink.levelMap;
++    settings.einkWhite16 = eink.white16;
++    settings.einkContour16 = eink.contour16;
+     settings.einkMinTone = eink.minTone;
+     settings.einkKnock = eink.knock;
+     settings.einkInvert = eink.invert;
+-- 
+2.50.1 (Apple Git-155)

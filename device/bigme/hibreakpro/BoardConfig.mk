@@ -1,6 +1,6 @@
 #
 # Bigme HiBreak Pro (B/W): MediaTek MT6877, kernel 4.19 (prebuilt), stock vendor (FCM 5 / VNDK 31)
-# Bring-up stage 1: prebuilt kernel/DTB/DTBO + prebuilt stock vendor image. See PLAN.md Phase 3.
+# Prebuilt kernel/DTB/DTBO + prebuilt stock vendor image.
 #
 DEVICE_PATH := device/bigme/hibreakpro
 VENDOR_PATH := vendor/bigme/hibreakpro
@@ -131,7 +131,7 @@ DEVICE_FRAMEWORK_COMPATIBILITY_MATRIX_FILE += $(DEVICE_PATH)/configs/vintf/frame
 
 # SELinux: XRZ e-ink types the stock vendor policy expects (sepolicy/private/xrz.te)
 SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy/private
-# Debug builds only: bring-up log collector and SF e-ink engine policy (never on user builds)
+# Debug builds only: bring-up log collector policy (never on user builds)
 ifneq (,$(filter eng userdebug,$(TARGET_BUILD_VARIANT)))
 SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy/debug
 endif

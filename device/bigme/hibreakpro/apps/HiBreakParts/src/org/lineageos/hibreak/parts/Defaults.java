@@ -36,7 +36,7 @@ import java.io.IOException;
  * Version 6: text is drawn black or white by hwui itself (debug.hwui.eink_text), so the "Crisp
  * text" switch, which turned on high-contrast text and its grey backing pills, is gone; turn
  * high-contrast text off again where it was switched on.
- * Version 7 (2026-11-17): the owner's daily-driver setup after a week on the phone, so a fresh
+ * Version 7 (2026-11-17): curated out-of-the-box defaults, so a fresh
  * install starts the same way: animations on (the e-ink composer's fast mode handles motion; off
  * felt broken), text size 115 %, contrast level 1.0, auto brightness for the front light, no
  * lift to wake, no QR scanner shortcut on the lock screen, fingerprint unlock with the screen
@@ -47,13 +47,15 @@ import java.io.IOException;
  * camera-checked), gets the per-app "colours inverted" mode unless it already has a mode.
  * Version 9 (2026-11-21): bold text off again. The system font (IBM Plex Sans then, Roboto, Noto Sans
  * since) is drawn half a weight step darker for e-ink by the font configuration itself (the
- * 450 curve); with +300 on top, regular, medium and bold text came out alike on the 1-bit panel
- * (docs/eink-fonts.md). The switch in Settings > Display > E-ink stays the user's choice.
+ * 450 curve); with +300 on top, regular, medium and bold text came out alike on the 1-bit panel.
+ * The switch in Settings > Display > E-ink stays the user's choice.
+ * Version 10 (2026-11-22): two e-ink profiles, Default and Reading, replace the four refresh modes
+ * and their switches; the old global and per-app modes are carried over (migrateToProfiles).
  */
 final class Defaults {
     private static final String APPLIED = Keys.PREFIX + "defaults_applied";
     private static final String APPLIED_CE = Keys.PREFIX + "defaults_ce_applied";
-    private static final int VERSION = 9;
+    private static final int VERSION = 10;
     private static final String TAG = "HiBreakDefaults";
     private static final String THEME_SETTING = "theme_customization_overlay_packages";
     private static final String CONTRAST_SETTING = "contrast_level"; // Settings.Secure, -1..1
@@ -63,6 +65,8 @@ final class Defaults {
     /** Settings > Security > Fingerprint: unlock without waking the screen first. */
     private static final String SFPS_UNLOCK_ANYTIME = "sfps_performant_auth_enabled_v2";
     private static final String DESK_CLOCK = "com.android.deskclock";
+    private static final String LEGACY_FAST_MAPS =
+            "100:0,0,0,4,4,5,6,6,7,7,8,9,10,11,12,15:100";
     private static final Object CE_LOCK = new Object();
     private static boolean sUnlockReceiverRegistered;
 
@@ -92,14 +96,17 @@ final class Defaults {
                 Settings.Secure.putInt(cr, SFPS_UNLOCK_ANYTIME, 1);
             }
             if (applied < 8) {
-                java.util.Map<String, Integer> modes = Eink.getAppModes(cr);
-                if (!modes.containsKey(DESK_CLOCK)) {
-                    modes.put(DESK_CLOCK, Eink.MODE_INVERTED);
-                    Eink.putAppModes(cr, modes);
+                java.util.Map<String, Integer> profiles = Eink.getAppProfiles(cr);
+                if (!profiles.containsKey(DESK_CLOCK)) {
+                    profiles.put(DESK_CLOCK, Eink.APP_INVERTED);
+                    Eink.putAppProfiles(cr, profiles);
                 }
             }
             if (applied < 9) {
                 Settings.Secure.putInt(cr, Settings.Secure.FONT_WEIGHT_ADJUSTMENT, 0);
+            }
+            if (applied < 10) {
+                migrateToProfiles(cr);
             }
             Settings.System.putInt(cr, APPLIED, VERSION);
         }
@@ -117,6 +124,39 @@ final class Defaults {
                 retryWhenUnlocked(context);
             }
         }
+    }
+
+    /**
+     * The four modes and their switches became two profiles (version 10): Clear and Balanced
+     * become Reading, Default (DU) and Fast become Default, per-app "inverted" stays. Choices
+     * already made in the new settings win.
+     */
+    private static void migrateToProfiles(ContentResolver cr) {
+        if (LEGACY_FAST_MAPS.equals(Settings.System.getString(cr, Keys.EINK_FAST_MAPS))) {
+            Settings.System.putString(cr, Keys.EINK_FAST_MAPS, null);
+        }
+        int mode = Settings.System.getInt(cr, Keys.LEGACY_EINK_MODE, 0);
+        if (Settings.System.getString(cr, Keys.EINK_PROFILE) == null) {
+            Eink.setProfile(cr, mode == 1 || mode == 2 ? Eink.PROFILE_READING : Eink.PROFILE_DEFAULT);
+        }
+        String legacy = Settings.System.getString(cr, Keys.LEGACY_EINK_APP_MODES);
+        if (legacy == null || legacy.isEmpty()) return;
+        java.util.Map<String, Integer> profiles = Eink.getAppProfiles(cr);
+        for (String entry : legacy.split(";")) {
+            int eq = entry.indexOf('=');
+            if (eq <= 0) continue;
+            String pkg = entry.substring(0, eq);
+            int old;
+            try {
+                old = Integer.parseInt(entry.substring(eq + 1));
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            int profile = old == 4 ? Eink.APP_INVERTED
+                    : (old == 1 || old == 2) ? Eink.PROFILE_READING : Eink.PROFILE_DEFAULT;
+            profiles.putIfAbsent(pkg, profile);
+        }
+        Eink.putAppProfiles(cr, profiles);
     }
 
     private static void applyCeDefaults(Context context) {

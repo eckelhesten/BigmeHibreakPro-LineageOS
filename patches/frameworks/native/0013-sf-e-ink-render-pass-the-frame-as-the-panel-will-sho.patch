@@ -15,7 +15,7 @@ imprints into the greys of the new one; FAST (A2) frames are not
 dithered at all, so every grey becomes a partial drive that lands on an
 unstable grey (residue after scrolling); and the contrast stretch that
 hid light-grey speckle also erased cards, fields, separators and photo
-tones (docs/wip/kernel-dither.md, scripts/eink-bench).
+tones (docs/lessons-learned.md, scripts/eink-bench).
 
 What the pass does, by the composer's refresh mode:
 - NORMAL: anti-aliased edges snap to the local extremes (as before);
@@ -69,7 +69,7 @@ index 45ee3bb..b0ae706 100644
  
 +    // E-ink render pass (einkRender = 3, replaces the enhancement above): the frame is turned
 +    // into exactly what the panel shows, so the kernel's own dither has nothing left to do and
-+    // passes it unchanged (docs/wip/kernel-dither.md).
++    // passes it unchanged (docs/lessons-learned.md).
 +    // - einkMode 0 (NORMAL): anti-aliased edges snap to the local extremes; thin strokes
 +    //   (pixels whose surroundings out to 3 * einkEnhanceRadius are mostly on the other side
 +    //   of the local mid level, einkMinority0/1) go to pure black or white, so text of any grey

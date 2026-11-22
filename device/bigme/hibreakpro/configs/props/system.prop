@@ -41,10 +41,6 @@ debug.hwui.eink_glyphs=2
 debug.hwui.eink_text_faded_alpha=70
 # No dim layer behind dialogs and popups; they get a solid outline instead. frameworks/base patch 0005.
 debug.eink.windows=1
-# Own e-ink engine in SurfaceFlinger (frameworks/native patch 0005), read at boot. Off: the vendor
-# composer sends whole-panel updates, the only kind the kernel runs on its fast, self-cleaning
-# path (docs/eink-stock-policy.md). The engine's partial updates are slower and ghost.
-debug.sf.eink_engine=0
 # Fast e-ink mode (A2, ~36 ms per frame) while the screen moves or the keyboard is up, the
 # chosen mode again once it is still. frameworks/native patch 0006; the two triggers have
 # switches in HiBreakParts (vendor.xrz.hibreak_motion_fast, vendor.xrz.hibreak_ime_fast).
@@ -60,24 +56,18 @@ debug.sf.dpi_override=300
 # (frameworks/native EinkMotion, debug.sf.eink_sleep.* to tune).
 debug.sysui.eink_sleep=1
 debug.sf.eink_sleep=1
-# Black-and-white rendering for every app (frameworks/native, SurfaceFlinger's e-ink pass): text,
-# icons and lines of any colour become solid black or white (each pixel goes to the darkest or
-# lightest value around it), anti-aliased edges become hard, flat areas and photos are left to
-# the panel's dither; it never pushes a side to pure black (0012: that smeared white labels on
-# coloured buttons). Strength in percent, 0 = off; frameworks/native 0009, 0011, 0012,
-# debug.sf.eink_enhance.{radius_x10,t1_x1000,
-# t2_x1000,solid1_x1000,solid2_x1000,gate0_x1000,gate1_x1000} to tune.
+# Enable SurfaceFlinger's e-ink render pass (percent > 0 is required for debug.sf.eink_render=3;
+# 0 = off). For comparison mode (eink_render=2), debug.sf.eink_enhance.* tunes the legacy pass.
 debug.sf.eink_enhance=100
-# Since 2026-11-20 the pass renders the frame as the panel will show it (frameworks/native 0013):
+# The pass renders the frame as the panel will show it (frameworks/native 0013+):
 # grey text of any weight solid, faint cards, fields and separators kept as 1-px outlines, light
-# greys bleached and dark greys crushed (HiBreakParts' contrast setting), then a blue-noise
-# dither to pure black and white (16 exact levels in the grey modes; FAST gets a cheap version).
-# 2 = the enhancement pass above, for comparison. Scored offline and on camera with
-# scripts/eink-bench; tunables debug.sf.eink.* (see the patch).
+# greys bleached and dark greys crushed, then a blue-noise dither to pure black and white
+# (16 exact levels in the grey modes; FAST gets a cheap 1-bit pass unless fast_greys is active).
+# 2 = the legacy enhancement pass above, for comparison. Tunables: debug.sf.eink.*.
 debug.sf.eink_render=3
-# Tone curve of the render pass, measured on camera with a grey ramp (scripts/eink-bench/calib.py,
-# 2026-11-20): the blue-noise dither has little dot gain, so a power of 2.0 (2.4 for HD's 16
-# greys) brings an app's grey closest to its lightness on an LCD (error 0.10, was 0.15).
+# Tone curve of the render pass, measured on camera with a grey ramp (2026-11-20): the blue-noise
+# dither has little dot gain, so a power of 2.0 (2.4 for HD's 16 greys) brings an app's grey
+# closest to its lightness on an LCD.
 debug.sf.eink.gamma_x100=200
 debug.sf.eink.gamma16_x100=240
 # FAST frames: the cheap pass while scrolling (steadier: 0-2 % of panel frames without new content
@@ -98,7 +88,7 @@ debug.eink.touch_boost_ms=250
 debug.eink.no_ripple=1
 debug.hwui.eink_no_shadow=1
 
-# VoLTE (docs/volte.md): MediaTek modems set up the IMS PDN only for a modem-cognitive IMS profile
+# VoLTE: MediaTek modems set up the IMS PDN only for a modem-cognitive IMS profile
 # with id 2 (RILConstants.DATA_PROFILE_IMS). IMS-only APNs from the APN database have neither,
 # so frameworks/opt/telephony 0002 sends them with this id; -1 or unset keeps AOSP behaviour.
 # persist.debug.telephony.ims_apn_profile_id overrides it at runtime for testing.

@@ -131,7 +131,7 @@ jobs:
 
       - name: Make sure this run's build server is not left running
         if: always()
-        # Only this run's server/keys: a build started from the Mac at the same time is labelled
+        # Only this run's server/keys: a build started locally at the same time is labelled
         # hibreak=ci too.
         run: |
           command -v hcloud >/dev/null 2>&1 && [ -n "${HCLOUD_TOKEN:-}" ] || exit 0
@@ -164,23 +164,28 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # One release per version with every flavour: its zip (name carries the flavour), its
-          # images as <flavour>-<image>.img and SHA256SUMS-<flavour>. No update server: people
-          # download the zip and install it with Updater > "Install local update".
+          # One release per version with every flavour: install zip (via scripts/release/package.sh),
+          # OTA update zip (for Updater > "Install local update"), and combined SHA256SUMS.
           dirs=(dist/lineage-*-hibreakpro)
           [ "${#dirs[@]}" -gt 0 ] || { echo "::error::no artifact directory in dist/"; exit 1; }
+          rel=dist/release
+          rm -rf "$rel" && mkdir -p "$rel"
           assets=(); notes=""
           for d in "${dirs[@]}"; do
             zips=("$d"/lineage-*-UNOFFICIAL-*-hibreakpro.zip)
             [ "${#zips[@]}" -eq 1 ] || { echo "::error::expected one zip in $d"; exit 1; }
-            zip=${zips[0]}
-            f=$(basename "$zip" .zip); f=${f%-hibreakpro}; f=${f##*-}
-            [[ "$f" =~ ^(vanilla|microg|gapps)$ ]] || { echo "::error::no flavour in $zip"; exit 1; }
+            ota_zip=${zips[0]}
+            f=$(basename "$ota_zip" .zip); f=${f%-hibreakpro}; f=${f##*-}
+            [[ "$f" =~ ^(vanilla|microg|gapps)$ ]] || { echo "::error::no flavour in $ota_zip"; exit 1; }
             for img in "$d"/*.img; do mv "$img" "$d/$f-$(basename "$img")"; done
-            ( cd "$d" && sha256sum "$(basename "$zip")" "$f"-*.img > "SHA256SUMS-$f" )
-            assets+=("$zip" "$d"/"$f"-*.img "$d/SHA256SUMS-$f")
-            notes+="- **$f**: \`$(basename "$zip")\`"$'\n'
+            scripts/release/package.sh "$VERSION" "$f" "$d" "$rel"
+            install_zip="$rel/lineage-23.2-hibreakpro-$VERSION-$f.zip"
+            ln -f "$ota_zip" "$rel/$(basename "$ota_zip")"
+            assets+=("$install_zip" "$rel/$(basename "$ota_zip")")
+            notes+="- **$f**: install \`$(basename "$install_zip")\`, update \`$(basename "$ota_zip")\`"$'\n'
           done
+          ( cd "$rel" && sha256sum *.zip > SHA256SUMS )
+          assets+=("$rel/SHA256SUMS")
           tag="v$VERSION"
           {
             echo "HiBreak Pro LineageOS $VERSION"

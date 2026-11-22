@@ -41,59 +41,21 @@
 
     <PreferenceCategory android:title="@string/cat_eink">
         <ListPreference
-            android:key="eink_mode"
-            android:title="@string/eink_mode"
-            android:entries="@array/mode_entries"
-            android:entryValues="@array/mode_values"
+            android:key="eink_profile"
+            android:title="@string/eink_profile"
+            android:entries="@array/profile_entries"
+            android:entryValues="@array/profile_values"
             android:defaultValue="0"
             app:useSimpleSummaryProvider="true" />
-        <SwitchPreferenceCompat
-            android:key="eink_motion_fast"
-            android:title="@string/eink_motion_fast"
-            android:summary="@string/eink_motion_fast_summary"
-            android:defaultValue="true" />
-        <SwitchPreferenceCompat
-            android:key="eink_fast_greys"
-            android:title="@string/eink_fast_greys"
-            android:summary="@string/eink_fast_greys_summary"
-            android:defaultValue="false" />
-        <SwitchPreferenceCompat
-            android:key="eink_ime_fast"
-            android:title="@string/eink_ime_fast"
-            android:summary="@string/eink_ime_fast_summary"
-            android:defaultValue="true" />
-        <ListPreference
-            android:key="eink_contrast"
-            android:title="@string/eink_contrast"
-            android:entries="@array/contrast_entries"
-            android:entryValues="@array/contrast_values"
-            android:defaultValue="2"
-            app:useSimpleSummaryProvider="true" />
-        <ListPreference
-            android:key="eink_clean"
-            android:title="@string/eink_clean"
-            android:entries="@array/clean_entries"
-            android:entryValues="@array/clean_values"
-            android:defaultValue="4"
-            app:useSimpleSummaryProvider="true" />
+        <Preference
+            android:key="eink_app_profiles"
+            android:title="@string/eink_app_profiles"
+            android:summary="@string/eink_app_profiles_summary"
+            android:fragment="org.lineageos.hibreak.parts.AppModesFragment" />
         <Preference
             android:key="eink_refresh_now"
             android:title="@string/eink_refresh_now"
             android:summary="@string/eink_refresh_now_summary" />
-        <SwitchPreferenceCompat
-            android:key="eink_auto_clean"
-            android:title="@string/eink_auto_clean"
-            android:summary="@string/eink_auto_clean_summary"
-            android:defaultValue="true" />
-        <SwitchPreferenceCompat
-            android:key="eink_anti_flicker"
-            android:title="@string/eink_anti_flicker"
-            android:defaultValue="true" />
-        <Preference
-            android:key="eink_app_modes"
-            android:title="@string/eink_app_modes"
-            android:summary="@string/eink_app_modes_summary"
-            android:fragment="org.lineageos.hibreak.parts.AppModesFragment" />
     </PreferenceCategory>
 
     <PreferenceCategory android:title="@string/cat_keys">

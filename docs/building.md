@@ -18,8 +18,8 @@
 - `patches/<path in the LineageOS tree>/*.patch`: changes to LineageOS projects, applied with
   `scripts/ci/apply-patches.sh <tree> patches` after `repo sync`.
 - `manifests/`: local manifests, copied into `.repo/local_manifests/`.
-- `scripts/`: the build pipeline (`buildserver-*.sh`, `scripts/ci`) and the release packaging
-  (`scripts/release`).
+- `scripts/`: the build pipeline (`scripts/build/`, `scripts/ci/`) and the release packaging
+  (`scripts/release/`).
 
 ## Build on a cloud server
 
@@ -38,7 +38,7 @@ top of the script.
 
 ## Build on your own machine
 
-The steps are the ones `scripts/buildserver-pipeline.sh` runs:
+The steps are the ones `scripts/build/buildserver-pipeline.sh` runs:
 1. `repo init -u https://github.com/LineageOS/android.git -b lineage-23.2 --git-lfs`, copy
    `manifests/*.xml` into `.repo/local_manifests/`, `repo sync`.
 2. Put `device/bigme` and `vendor/bigme` into the tree.
@@ -55,7 +55,7 @@ The steps are the ones `scripts/buildserver-pipeline.sh` runs:
 - `gapps`: MindTheGapps, pinned in `manifests/flavors/gapps.xml`.
 
 Run `m installclean` before switching flavour in the same tree, or apps from the previous one end
-up in the images (`buildserver-build.sh` does this for you).
+up in the images (`scripts/build/buildserver-build.sh` does this for you).
 
 ## Checks and release packages
 

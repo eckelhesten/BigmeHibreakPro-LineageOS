@@ -1,6 +1,6 @@
 #!/bin/bash
 # Runs ON the build server after a release-key build, before flashing: catch the signing mistakes
-# that make a user build loop before adb is up (see docs/signing.md, "Pitfalls").
+# that make a user build loop before adb is up (see docs/signing.md).
 # - Every APEX: the public key it embeds (apex_pubkey) must be the key its payload is signed with,
 #   otherwise apexd rejects it at boot. Reports APEXes not on our keys (the CTS shim is expected).
 # - Every APK on system, system_ext and product must verify and must not use an AOSP test key.

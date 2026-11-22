@@ -1,6 +1,6 @@
 # HiBreak Pro e-ink: system-side setup the stock vendor composer and kernel expect.
-# Clean-room port of the relevant parts of stock /system/etc/init/init.eink.rc
-# (see docs/eink-interface.md). Bigme's perf/antutu and pen hooks are intentionally not carried.
+# Clean-room port of the relevant parts of stock /system/etc/init/init.eink.rc.
+# Bigme's perf/antutu and pen hooks are intentionally not carried.
 
 on init
     # Front light controller (HiBreakParts uses the sysfs channels below; keep /dev node non-world-writable)
@@ -22,7 +22,7 @@ on boot
     chown system system /sys/devices/platform/11d01000.i2c7/i2c-7/7-0036/lm3630a_warm_light
     chmod 0660 /sys/devices/platform/11d01000.i2c7/i2c-7/7-0036/lm3630a_cold_light
     chmod 0660 /sys/devices/platform/11d01000.i2c7/i2c-7/7-0036/lm3630a_warm_light
-    # Stock defaults for the XRZ composer policy (see docs/eink-interface.md "Properties")
+    # Stock defaults for the XRZ composer policy
     setprop vendor.xrz.force_global_refresh_mode -1
     setprop vendor.xrz.hwc_idle 1
     setprop vendor.xrz.disable_eink_vsync 1
@@ -34,7 +34,7 @@ on boot
 # The kernel's own ghost cleanup (eink_debug/clean_a2). It is off after boot; the stock framework
 # switches it on. It is much more than a cleanup: only with it on do whole-panel DU/A2 updates run
 # on the kernel's fast path (10-frame DU, ~120 ms per frame, pipelined, with cleanup passes once
-# the screen is still). Off, the same updates take ~250 ms each (docs/eink-stock-policy.md).
+# the screen is still). Off, the same updates take ~250 ms each.
 on property:vendor.xrz.auto_clean_enabled=1
     write /sys/kernel/debug/eink_debug/clean_a2 1
 
@@ -46,12 +46,6 @@ on property:vendor.xrz.anti_flicker_enabled=1
 
 on property:vendor.xrz.anti_flicker_enabled=0
     write /sys/kernel/debug/eink_debug/anti_flicker 0
-
-# SurfaceFlinger's e-ink engine sets vendor.xrz.disable_commit itself once the vendor composer
-# has committed the first frames (the kernel driver needs those). Switching the engine off hands
-# the panel back to the composer.
-on property:debug.sf.eink_engine=0
-    setprop vendor.xrz.disable_commit 0
 
 # The kernel's own dither (eink_debug/global_dither: 0 = per mode, 5 = none). Kernel Atkinson
 # dither mixes 1/8 of the previous frame into the next (anti-flicker) and matches system.prop

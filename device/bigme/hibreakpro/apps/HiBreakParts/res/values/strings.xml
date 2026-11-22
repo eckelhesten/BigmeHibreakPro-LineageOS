@@ -2,19 +2,21 @@
 <resources>
     <string name="app_name">HiBreak parts</string>
     <string name="settings_title">E-ink &amp; front light</string>
-    <string name="settings_summary">Refresh modes, per-app modes, front light, side keys</string>
+    <string name="settings_summary">E-ink profile, front light, sleep screen, side keys</string>
 
     <string name="tile_refresh">Refresh screen</string>
-    <string name="tile_mode">E-ink mode</string>
+    <string name="tile_mode">Reading mode</string>
     <string name="tile_warmth">Light warmth</string>
     <string name="warmth_value">%1$d%% warm</string>
 
-    <string name="mode_default">Default</string>
-    <string name="mode_clear">Clear</string>
-    <string name="mode_balanced">Balanced</string>
-    <string name="mode_fast">Fast</string>
-    <string name="mode_global">Use global mode</string>
-    <string name="mode_inverted">Default, colours inverted (for dark apps)</string>
+    <string name="profile_default">Default: fast, for scrolling and everyday use</string>
+    <string name="profile_reading">Reading: cleaner text and pictures, a little slower</string>
+    <string name="profile_default_short">Default</string>
+    <string name="profile_reading_short">Reading</string>
+    <string name="profile_inverted">Default, colours inverted (for dark apps)</string>
+    <string name="app_profile_automatic">Automatic</string>
+    <string name="app_profile_auto">Automatic: follows the e-ink profile</string>
+    <string name="app_profile_auto_reading">Automatic: Reading (e-reader)</string>
 
     <string name="cat_sleep">Sleep screen</string>
     <string name="sleep_title">Weather and calendar</string>
@@ -67,29 +69,11 @@
     <string name="no_animations">No animations</string>
     <string name="no_animations_summary">Turn off window, transition and app animations</string>
     <string name="cat_eink">E-ink display</string>
-    <string name="eink_mode">Refresh mode</string>
-    <string name="eink_motion_fast">Smooth scrolling</string>
-    <string name="eink_motion_fast_summary">Fast mode while the screen moves: pictures turn black and white until it stops</string>
-    <string name="eink_fast_greys">Greys in Fast mode</string>
-    <string name="eink_fast_greys_summary">Fast mode and scrolling draw greys instead of black and white dots: smoother text and pictures at the same speed</string>
-    <string name="eink_ime_fast">Fast typing</string>
-    <string name="eink_ime_fast_summary">Fast mode while the keyboard is open</string>
-    <string name="eink_contrast">Contrast</string>
-    <string name="contrast_off">Off</string>
-    <string name="contrast_medium">Medium</string>
-    <string name="contrast_strong">Strong</string>
-    <string name="eink_clean">Clear ghosting</string>
-    <string name="clean_manual">Only when asked</string>
-    <string name="clean_unlock">After unlocking</string>
-    <string name="clean_every4">After unlocking and every 4th app switch</string>
-    <string name="clean_every">After unlocking and every app switch</string>
+    <string name="eink_profile">E-ink profile</string>
     <string name="eink_refresh_now">Refresh screen now</string>
     <string name="eink_refresh_now_summary">One full refresh to clear ghosting</string>
-    <string name="eink_auto_clean">Automatic clean refresh</string>
-    <string name="eink_auto_clean_summary">The panel removes ghosting itself after each change. Off makes the screen slower and leaves ghosts</string>
-    <string name="eink_anti_flicker">Reduce flicker</string>
-    <string name="eink_app_modes">Per-app refresh modes</string>
-    <string name="eink_app_modes_summary">Use a different refresh mode while an app is in front</string>
+    <string name="eink_app_profiles">Profile per app</string>
+    <string name="eink_app_profiles_summary">E-readers use Reading automatically; choose for any other app</string>
 
     <string name="cat_keys">Side keys</string>
     <string name="key_f1">Key 1 (F1)</string>
@@ -98,7 +82,7 @@
 
     <string name="action_none">Do nothing</string>
     <string name="action_eink_refresh">Refresh screen</string>
-    <string name="action_eink_mode">Next e-ink mode</string>
+    <string name="action_eink_mode">Reading mode on/off</string>
     <string name="action_frontlight">Front light on/off</string>
     <string name="action_flashlight">Flashlight on/off</string>
     <string name="action_screenshot">Screenshot</string>
@@ -107,55 +91,25 @@
     <string name="action_app">Launch an app…</string>
     <string name="action_app_named">Launch %1$s</string>
 
-    <string-array name="mode_entries">
-        <item>@string/mode_default</item>
-        <item>@string/mode_clear</item>
-        <item>@string/mode_balanced</item>
-        <item>@string/mode_fast</item>
+    <string-array name="profile_entries">
+        <item>@string/profile_default</item>
+        <item>@string/profile_reading</item>
     </string-array>
-    <string-array name="mode_values">
+    <string-array name="profile_values">
         <item>0</item>
         <item>1</item>
-        <item>2</item>
-        <item>3</item>
     </string-array>
-    <string-array name="contrast_entries">
-        <item>@string/contrast_off</item>
-        <item>@string/contrast_medium</item>
-        <item>@string/contrast_strong</item>
+    <string-array name="app_profile_entries">
+        <item>@string/app_profile_automatic</item>
+        <item>@string/profile_default_short</item>
+        <item>@string/profile_reading_short</item>
+        <item>@string/profile_inverted</item>
     </string-array>
-    <string-array name="contrast_values">
-        <item>0</item>
-        <item>1</item>
-        <item>2</item>
-    </string-array>
-    <string-array name="clean_entries">
-        <item>@string/clean_manual</item>
-        <item>@string/clean_unlock</item>
-        <item>@string/clean_every4</item>
-        <item>@string/clean_every</item>
-    </string-array>
-    <string-array name="clean_values">
-        <item>-1</item>
-        <item>0</item>
-        <item>4</item>
-        <item>1</item>
-    </string-array>
-    <string-array name="app_mode_entries">
-        <item>@string/mode_global</item>
-        <item>@string/mode_default</item>
-        <item>@string/mode_clear</item>
-        <item>@string/mode_balanced</item>
-        <item>@string/mode_fast</item>
-        <item>@string/mode_inverted</item>
-    </string-array>
-    <string-array name="app_mode_values">
+    <string-array name="app_profile_values">
         <item>-1</item>
         <item>0</item>
         <item>1</item>
         <item>2</item>
-        <item>3</item>
-        <item>4</item>
     </string-array>
     <string-array name="key_action_entries">
         <item>@string/action_none</item>

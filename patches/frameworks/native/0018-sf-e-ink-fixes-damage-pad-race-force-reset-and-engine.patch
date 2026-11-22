@@ -1,18 +1,15 @@
 From 2b036cbe8d0df496b486a2445fe6becc5cbe1170 Mon Sep 17 00:00:00 2001
 From: hibreak <hibreak@localhost>
 Date: Sat, 21 Nov 2026 12:12:41 +0100
-Subject: [PATCH] sf: e-ink fixes (damage-pad race, force-mode reset,
- EinkEngine bounds)
+Subject: [PATCH] sf: e-ink fixes (damage-pad race, force-mode reset)
 
 ---
  libs/renderengine/skia/SkiaRenderEngine.cpp   |  2 +-
  .../include/compositionengine/impl/Output.h   |  4 +-
  .../CompositionEngine/src/Output.cpp          | 66 +++++++++++--------
- .../DisplayHardware/EinkEngine.cpp            | 28 ++++----
- .../DisplayHardware/EinkEngine.h              |  3 +-
  .../DisplayHardware/EinkMotion.cpp            | 10 ++-
  .../DisplayHardware/EinkMotion.h              |  1 +
- 7 files changed, 64 insertions(+), 50 deletions(-)
+ 5 files changed, 50 insertions(+), 33 deletions(-)
 
 diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
 index 4cef2b2..adfcafe 100644
@@ -184,125 +181,6 @@ index 785f069..010d5d8 100644
      settings.einkEnhanceStrength = eink.strength;
      settings.einkEnhanceRadius = eink.radius;
      settings.einkEnhanceT1 = eink.t1;
-diff --git a/services/surfaceflinger/DisplayHardware/EinkEngine.cpp b/services/surfaceflinger/DisplayHardware/EinkEngine.cpp
-index 330f461..01f4a7f 100644
---- a/services/surfaceflinger/DisplayHardware/EinkEngine.cpp
-+++ b/services/surfaceflinger/DisplayHardware/EinkEngine.cpp
-@@ -211,10 +211,6 @@ void EinkEngine::loadConfig() {
-     c.convertThreads = std::clamp(prop("debug.sf.eink.convert_threads", 4), 1u, 8u);
-     c.black = base::GetIntProperty("debug.sf.eink.black", 48, 0, 254);
-     c.white = std::max(c.black + 1, base::GetIntProperty("debug.sf.eink.white", 208, 1, 255));
--    for (int v = 0; v < 256; v++) {
--        int out = v <= c.black ? 0 : v >= c.white ? 255 : (v - c.black) * 255 / (c.white - c.black);
--        mLut[v] = static_cast<uint8_t>(out);
--    }
-     if (c.policy != mConfig.policy) ALOGI("policy %u", c.policy);
-     mConfig = c;
- }
-@@ -237,12 +233,13 @@ bool EinkEngine::allocate(uint32_t size) {
-     ion_heap_query query = {.cnt = 32, .heaps = reinterpret_cast<uintptr_t>(heaps)};
-     int heap = -1;
-     if (ioctl(ion, kIonHeapQuery, &query) == 0) {
--        for (uint32_t i = 0; i < query.cnt && heap < 0; i++) {
-+        const uint32_t cnt = std::min(query.cnt, 32u);
-+        for (uint32_t i = 0; i < cnt && heap < 0; i++) {
-             if (heaps[i].type == kIonHeapTypeSystem) heap = static_cast<int>(heaps[i].heap_id);
-         }
-     }
--    if (heap < 0) {
--        ALOGE("no ION system heap");
-+    if (heap < 0 || heap >= 32) {
-+        ALOGE("no valid ION system heap (%d)", heap);
-         close(ion);
-         return false;
-     }
-@@ -318,7 +315,7 @@ bool EinkEngine::init(uint32_t width, uint32_t height) {
- }
- 
- Region EinkEngine::convert(const sp<GraphicBuffer>& buffer, const Region& region,
--                           std::vector<uint8_t>* greyTiles) {
-+                           std::vector<uint8_t>* greyTiles, const Config& config) {
-     Region changed;
-     const PixelFormat format = buffer->getPixelFormat();
-     const bool bgra = format == PIXEL_FORMAT_BGRA_8888;
-@@ -340,9 +337,9 @@ Region EinkEngine::convert(const sp<GraphicBuffer>& buffer, const Region& region
-     const nsecs_t start = systemTime();
-     const std::vector<Rect> rects(region.begin(), region.end());
-     const bool countGrey = greyTiles != nullptr;
--    const int32_t black = mConfig.black;
--    // Fixed-point form of the black/white clamp (mLut), so the loop has no table lookup.
--    const int32_t scale = (255 << 16) / std::max(16, mConfig.white - mConfig.black);
-+    const int32_t black = config.black;
-+    // Fixed-point form of the black/white clamp, so the loop has no table lookup.
-+    const int32_t scale = (255 << 16) / std::max(16, config.white - config.black);
-     // Reading the uncached mapping is bound by memory latency, not by one core's speed, so
-     // several threads read faster together. Each thread takes whole tile rows (row / kTile %
-     // threads), so no two threads write the same tile counters, shadow rows or buffer rows.
-@@ -398,7 +395,7 @@ Region EinkEngine::convert(const sp<GraphicBuffer>& buffer, const Region& region
-         }
-     };
-     const int64_t pixels = area(bounds);
--    const size_t parts = pixels >= 128 * 1024 ? mConfig.convertThreads : 1;
-+    const size_t parts = pixels >= 128 * 1024 ? config.convertThreads : 1;
-     std::vector<std::thread> helpers;
-     for (size_t i = 1; i < parts; i++) helpers.emplace_back(work, i, parts);
-     work(0, parts);
-@@ -417,7 +414,7 @@ Region EinkEngine::convert(const sp<GraphicBuffer>& buffer, const Region& region
-     if (greyTiles) {
-         greyTiles->assign(mTilesX * mTilesY, 0);
-         for (size_t i = 0; i < greyTiles->size(); i++) {
--            (*greyTiles)[i] = dirty[i] && mGreyCount[i] >= mConfig.greyPixels;
-+            (*greyTiles)[i] = dirty[i] && mGreyCount[i] >= config.greyPixels;
-         }
-     }
-     changed = tileRegion(dirty);
-@@ -685,6 +682,7 @@ bool EinkEngine::convertNewest(std::unique_lock<std::mutex>& lock) {
-     const nsecs_t when = mDeferredTime;
-     const bool forced = mForcedPending;
-     const uint32_t forcedMode = mForcedMode;
-+    const Config config = mConfig;
-     mDeferred.clear();
-     mDeferredFence.clear();
-     mPendingDamage.clear();
-@@ -698,7 +696,7 @@ bool EinkEngine::convertNewest(std::unique_lock<std::mutex>& lock) {
-     }
-     std::vector<uint8_t> grey;
-     Region changed;
--    if (ok) changed = convert(buffer, region, forced ? nullptr : &grey);
-+    if (ok) changed = convert(buffer, region, forced ? nullptr : &grey, config);
-     lock.lock();
-     mReading = nullptr;
-     mReadDone.notify_all();
-@@ -879,7 +877,7 @@ void EinkEngine::onFrameV1(const sp<GraphicBuffer>& buffer, const sp<Fence>& acq
-         ALOGW("client target fence timeout, skipping frame");
-         return;
-     }
--    const Region changed = convert(buffer, region, nullptr);
-+    const Region changed = convert(buffer, region, nullptr, mConfig);
-     const Region update = (forced || !mHadFrame) ? region : changed;
-     mHadFrame = true;
-     if (update.isEmpty()) return;
-diff --git a/services/surfaceflinger/DisplayHardware/EinkEngine.h b/services/surfaceflinger/DisplayHardware/EinkEngine.h
-index b1d506f..f8bf77c 100644
---- a/services/surfaceflinger/DisplayHardware/EinkEngine.h
-+++ b/services/surfaceflinger/DisplayHardware/EinkEngine.h
-@@ -168,7 +168,7 @@ private:
-     bool init(uint32_t width, uint32_t height);
-     bool allocate(uint32_t size);
-     Region convert(const sp<GraphicBuffer>& buffer, const Region& region,
--                   std::vector<uint8_t>* greyTiles);
-+                   std::vector<uint8_t>* greyTiles, const Config& config);
-     bool convertNewest(std::unique_lock<std::mutex>& lock);
-     Region tileRegion(const std::vector<uint8_t>& tiles) const;
-     void markChanged(const Region& region, nsecs_t when);
-@@ -200,7 +200,6 @@ private:
-     uint8_t* mGrey = nullptr;
-     uint32_t mWidth = 0;
-     uint32_t mHeight = 0;
--    uint8_t mLut[256];
-     std::vector<uint8_t> mShadow; // cached copy of mGrey
-     std::vector<uint16_t> mGreyCount; // per tile, grey pixels in the last conversion
-     std::vector<uint8_t> mDirty;      // per tile, changed in the last conversion
 diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
 index 9c3269a..3c870d0 100644
 --- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp

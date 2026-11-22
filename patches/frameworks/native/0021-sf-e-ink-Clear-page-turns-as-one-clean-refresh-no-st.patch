@@ -31,7 +31,7 @@ diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/s
 index ad0a376..1c9ee53 100644
 --- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
 +++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
-@@ -104,6 +104,12 @@ void EinkMotion::reloadConfigIfChanged() {
+@@ -102,5 +102,11 @@ void EinkMotion::reloadConfigIfChanged() {
      c.touchRecent =
              ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.touch_recent_ms", 2000));
      c.settleForce = base::GetBoolProperty("debug.sf.eink_motion.settle_force", true);
@@ -41,8 +41,7 @@ index ad0a376..1c9ee53 100644
 +            ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.clean_hold_ms", 600));
 +    c.cleanQuiet =
 +            ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.clean_quiet_ms", 100));
-     c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true) &&
-             !base::GetBoolProperty("debug.sf.eink_engine", false);
+     c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true);
      c.asleep = base::GetBoolProperty("vendor.xrz.hibreak_sleep", false);
 @@ -151,6 +157,23 @@ bool EinkMotion::isFast(uint32_t mode) const {
      return m == (mConfig.fastMode & 0xff) || m == 0xb3 || m == 0x10 || m == 0x11;

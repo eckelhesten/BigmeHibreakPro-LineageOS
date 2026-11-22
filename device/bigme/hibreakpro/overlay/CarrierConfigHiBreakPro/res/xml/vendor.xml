@@ -5,7 +5,7 @@
 
      VoLTE needs carrier_volte_available_bool on top of the device's
      config_device_volte_available (com.android.ims.ImsManager.isVolteEnabledByPlatform);
-     AOSP defaults it to false. docs/volte.md. -->
+     AOSP defaults it to false. -->
 <carrier_config_list>
     <!-- 3 Sweden (Hi3G Access, carrier id 1691): no 2G, 3G switched off, so voice is VoLTE only.
          AOSP has no config for it. Filter by cid rather than mcc/mnc: aapt2 compiles mnc="02"

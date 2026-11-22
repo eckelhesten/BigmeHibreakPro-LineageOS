@@ -10,8 +10,7 @@
        attestation key, which Play Integrity requires on Android 13+ for any verdict; microG
        blocks access to it by default.
      - vending_licensing: lets apps check their Play licence with the signed-in account, which
-       Play Integrity requires on Android 13+ before it returns MEETS_BASIC_INTEGRITY.
-     See docs/play-integrity.md. -->
+       Play Integrity requires on Android 13+ before it returns MEETS_BASIC_INTEGRITY. -->
 <map>
     <boolean name="checkin_enable_service" value="true" />
     <boolean name="gcm_enable_mcs_service" value="true" />

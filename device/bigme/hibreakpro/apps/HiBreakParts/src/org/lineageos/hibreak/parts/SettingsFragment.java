@@ -79,7 +79,7 @@ public class SettingsFragment extends PreferenceFragmentCompat {
     public void onStart() {
         super.onStart();
         ContentResolver cr = requireContext().getContentResolver();
-        for (String key : new String[] {Keys.EINK_MODE, Keys.FRONTLIGHT_ENABLED,
+        for (String key : new String[] {Keys.EINK_PROFILE, Keys.FRONTLIGHT_ENABLED,
                 Keys.FRONTLIGHT_WARMTH, Keys.KEY_F1, Keys.KEY_F2}) {
             cr.registerContentObserver(Settings.System.getUriFor(key), false, mObserver);
         }
@@ -135,8 +135,10 @@ public class SettingsFragment extends PreferenceFragmentCompat {
             ListPreference pref = findPreference(key);
             if (pref != null) pref.setValue(mStore.getString(key, pref.getValue()));
         }
-        ListPreference mode = findPreference("eink_mode");
-        if (mode != null) mode.setValue(mStore.getString("eink_mode", mode.getValue()));
+        ListPreference profile = findPreference("eink_profile");
+        if (profile != null) {
+            profile.setValue(mStore.getString("eink_profile", profile.getValue()));
+        }
         SwitchPreferenceCompat fl = findPreference("frontlight_enabled");
         if (fl != null) fl.setChecked(mStore.getBoolean("frontlight_enabled", true));
         SeekBarPreference warmth = findPreference("frontlight_warmth");

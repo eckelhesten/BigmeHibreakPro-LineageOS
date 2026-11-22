@@ -17,7 +17,8 @@ import androidx.preference.PreferenceScreen;
 import java.util.List;
 import java.util.Map;
 
-/** One refresh-mode choice per launchable app; "Use global mode" removes the override. */
+/** One e-ink profile per launchable app; "Automatic" removes the choice (Reading for known
+ *  e-readers, otherwise the global profile). */
 public class AppModesFragment extends PreferenceFragmentCompat {
     @Override
     public void onCreatePreferences(Bundle savedInstanceState, String rootKey) {
@@ -44,40 +45,47 @@ public class AppModesFragment extends PreferenceFragmentCompat {
                 }
                 Context prefContext = getPreferenceManager().getContext();
                 ContentResolver cr = appContext.getContentResolver();
-                Map<String, Integer> modes = Eink.getAppModes(cr);
+                Map<String, Integer> profiles = Eink.getAppProfiles(cr);
                 for (AppList.App app : apps) {
                     ListPreference pref = new ListPreference(prefContext);
                     pref.setPersistent(false);
-                    pref.setKey("app_mode_" + app.packageName);
+                    pref.setKey("app_profile_" + app.packageName);
                     pref.setTitle(app.label);
                     pref.setIcon(app.icon);
                     pref.setDialogTitle(app.label);
-                    pref.setEntries(R.array.app_mode_entries);
-                    pref.setEntryValues(R.array.app_mode_values);
-                    Integer mode = modes.get(app.packageName);
-                    pref.setValue(mode != null ? Integer.toString(mode) : "-1");
-                    pref.setSummaryProvider(ListPreference.SimpleSummaryProvider.getInstance());
+                    pref.setEntries(R.array.app_profile_entries);
+                    pref.setEntryValues(R.array.app_profile_values);
+                    Integer own = profiles.get(app.packageName);
+                    pref.setValue(own != null ? Integer.toString(own) : "-1");
+                    // "Automatic" says what it means for this app: Reading for known e-readers.
+                    boolean reader = Eink.READING_APPS.contains(app.packageName);
+                    pref.setSummaryProvider(p -> {
+                        ListPreference lp = (ListPreference) p;
+                        if (!"-1".equals(lp.getValue())) return lp.getEntry();
+                        return prefContext.getString(reader ? R.string.app_profile_auto_reading
+                                : R.string.app_profile_auto);
+                    });
                     pref.setOnPreferenceChangeListener((p, value) -> {
                         if (!isAdded()) return false;
-                        Map<String, Integer> current = Eink.getAppModes(cr);
+                        Map<String, Integer> current = Eink.getAppProfiles(cr);
                         int v = Integer.parseInt((String) value);
                         if (v < 0) {
                             current.remove(app.packageName);
                         } else {
                             current.put(app.packageName, v);
                         }
-                        Eink.putAppModes(cr, current);
+                        Eink.putAppProfiles(cr, current);
                         return true;
                     });
                     screen.addPreference(pref);
                 }
             });
-        }, "HiBreakAppModes").start();
+        }, "HiBreakAppProfiles").start();
     }
 
     @Override
     public void onResume() {
         super.onResume();
-        requireActivity().setTitle(R.string.eink_app_modes);
+        requireActivity().setTitle(R.string.eink_app_profiles);
     }
 }

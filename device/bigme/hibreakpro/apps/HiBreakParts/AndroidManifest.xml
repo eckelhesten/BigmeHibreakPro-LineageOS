@@ -12,7 +12,7 @@
     <!-- Protected broadcasts MediaTek's stock ImsService registers for without an explicit
          RECEIVER_EXPORTED/NOT_EXPORTED flag (targetSdk 34). Stock declared these in
          system_ext/app/mediatek-res/mediatek-res.apk; without them BroadcastController throws
-         SecurityException on startup (docs/volte.md). -->
+         SecurityException on startup. -->
     <protected-broadcast android:name="com.mediatek.common.carrierexpress.operator_config_changed" />
     <protected-broadcast android:name="com.mediatek.ims.ACTION_VODATA_PDN_STATUS" />
     <protected-broadcast android:name="com.mediatek.ims.MTK_RCS_REG_STATE" />

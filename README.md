@@ -5,7 +5,7 @@
 Clean Android without Bigme's bundled apps, paired with a custom e-ink stack built for this screen:
 
 - **Your choice of Google:** microG, vanilla (no Google), or Google Play.
-- **Made for e-ink:** Crisp 1-bit text, four refresh modes, per-app modes (including colour inversion for dark apps), smooth scrolling, and fast typing.
+- **Made for e-ink:** Two profiles that just work: **Default** for fast, smooth everyday use and **Reading** for the cleanest pages. E-reader apps switch to Reading by themselves.
 - **Hardware support:** Front light with warmth and auto-brightness, sleep screen (clock, optional weather, next calendar event), Quick Settings tiles, and remappable side keys.
 - **On-device updates:** Seamless A/B updates straight from Settings, with automatic rollback if an update fails to boot.
 
@@ -70,30 +70,26 @@ Switching flavours later requires a wipe.
 2. Go to **Settings → System → Updater → ⋮ → Install local update** and pick the zip.
 3. Reboot when prompted. Your apps and data stay intact.
 
-## E-ink Modes
+## E-ink Profiles
 
-Change modes in **Settings → E-ink & front light**, from the **E-ink mode** Quick Settings tile, or with a remapped **side key**. You can also set a mode per app (including **Default, colours inverted** for dark apps).
+There are two, and nothing else to tune:
 
-**Recommended starting point:** **Default** globally, **Clear** for e-book apps, **Fast** for browsing, and **Smooth scrolling** on.
+| Profile | Look | Speed | For |
+|---|---|---|---|
+| **Default** | Smooth greys | ~0.23 s | Everything: scrolling, browsing, typing, maps, video |
+| **Reading** | Full 16-level greys, no ghosting | ~0.5 s, one flash per page | Books, comics, long articles |
 
-| Mode | Look | Speed | Best for | Trade-off |
-|---|---|---|---|---|
-| **Default** | Sharp black text, dithered greys | ~0.3 s | Everyday use | Photos look dotted |
-| **Clear** | Full 16-level greyscale | ~0.5 s | E-books, comics, photos | Flashes black on every update |
-| **Balanced** | Smooth 16-level greyscale, no flash | ~0.75 s | Illustrated reading | Slowest; can leave faint ghosts |
-| **Fast** | Dithered black and white | ~0.23 s | Scrolling, typing, maps, video | No true greys by default; more ghosting |
+*Tap to screen update at room temperature; e-ink is slower in the cold.*
 
-*Measured from tap to screen update at room temperature; e-ink is slower in the cold.*
+Switch with the **Reading mode** Quick Settings tile, a remapped **side key**, or in **Settings → E-ink & front light**. E-reader apps (Kindle, KOReader, Kobo, Google Play Books, Libby, Moon+ Reader, ReadEra) use **Reading** automatically. Under **Profile per app** you can pick a profile for any app, or **Default, colours inverted** for apps that are always dark.
 
 <details>
 <summary><strong>E-ink FAQ</strong></summary>
 
-- **Why does the screen flash black?** That's **Clear** mode clearing residual charge for zero ghosting. Use **Default** or **Balanced** if you don't want flashing.
-- **How do I clear faint leftovers (ghosting)?** Tap the **Refresh screen** tile (or bind a side key to it) for a full refresh, and keep **Automatic clean refresh** on.
-- **How do page turns work in Clear mode?** Page-turn animations are collapsed into a single clean refresh ~0.5 s after tapping.
-- **What do Smooth scrolling & Fast typing do?** They temporarily drop into **Fast** mode while scrolling or typing, then redraw cleanly in your chosen mode when motion stops. Small spinners don't trigger it.
-- **Can Fast mode show real greys?** Yes. Turn on **Greys in Fast mode** (beta, off by default) in **Settings → E-ink & front light** for smooth greys at Fast speeds. Tones may shift slightly with temperature.
-- **Why isn't there one mode that's both fast and greyscale?** E-ink moves charged pigment with timed voltage pulses; clean 16-level greys need longer pulse sequences than black-and-white transitions.
+- **Why does the screen flash in Reading?** Each page is drawn with a full clean refresh, which leaves no trace of the previous page. A page turn's animation is collapsed into that one refresh.
+- **Does Reading scroll slowly?** No. While anything moves, or while the keyboard is open, both profiles draw fast; Reading redraws the page cleanly once it stops.
+- **How do I clear faint leftovers (ghosting)?** The phone does a full refresh after unlocking and every few app switches. For one now, tap the **Refresh screen** tile (or bind a side key to it).
+- **Why not use Reading all the time?** E-ink moves charged pigment with timed voltage pulses. Default's short pulses reach about 12 reliable greys in ~35 ms; Reading's long ones reach all 16 but take ~0.4 s and flash.
 
 </details>
 

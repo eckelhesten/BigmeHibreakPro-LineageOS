@@ -10,7 +10,7 @@ read -r -a TARGETS <<<"${*:-bacon}"
 cd "$SRC" || { echo "BUILD_RESULT=no-src-dir"; exit 1; }
 
 # By content, without the senders' file times: a changed file gets the time of this copy, so the
-# build sees it as newer than its outputs. With -a, a file edited on the Mac while an earlier
+# build sees it as newer than its outputs. With -a, a file edited locally while an earlier
 # build ran kept a time older than that build's outputs and was never rebuilt.
 mkdir -p device/bigme vendor/bigme
 rsync -rlpD --checksum --delete /srv/hibreak-src/device/bigme/ device/bigme/ \
@@ -42,7 +42,7 @@ if [ "$HIBREAK_FLAVOR" = gapps ]; then
       || { echo "BUILD_RESULT=mindthegapps-lfs-missing"; exit 1; }
   fi
 fi
-# Release keys (vendor/lineage-priv/keys) are installed from the Mac with
+# Release keys (vendor/lineage-priv/keys) are installed locally with
 # scripts/ci/install-keys.sh; without them the build would silently use the test keys.
 [ -f vendor/lineage-priv/keys/keys.mk ] || { echo "BUILD_RESULT=no-release-keys"; exit 1; }
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install our release keys on the build server as vendor/lineage-priv/keys, so every build (also
 # the quick incremental ones) is signed with them instead of AOSP's public test keys.
-# The keys live only on the Mac (KEYS_DIR, default ~/.hibreak-release-keys, see docs/signing.md)
+# The keys live only locally (KEYS_DIR, default ~/.hibreak-release-keys, see docs/signing.md)
 # and on the build server's tree; never in git.
 #
 # What the build does with them (LineageOS 23):
@@ -28,7 +28,7 @@ STAGE_DIR=/srv/release-keys.stage
 [ -f "$KEYS_DIR/releasekey.pk8" ] || { echo "no releasekey.pk8 in $KEYS_DIR" >&2; exit 1; }
 [ -f "$KEYS_DIR/avb2048.pem" ] || { echo "no avb2048.pem in $KEYS_DIR" >&2; exit 1; }
 
-# APKs inside APEXes that sign-release.sh would otherwise re-sign with releasekey.
+# APKs inside APEXes that use explicit certificate overrides instead of releasekey.
 APEX_APKS="AdServicesApk HalfSheetUX OsuLogin SafetyCenterResources ServiceConnectivityResources
 ServiceUwbResources ServiceWifiResources WifiDialog"
 

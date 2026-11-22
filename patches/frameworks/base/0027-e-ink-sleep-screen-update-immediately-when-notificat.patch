@@ -1,0 +1,575 @@
+From a1425bb444a8de05c4ae25c212f14a309bc531c1 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Sun, 22 Nov 2026 20:28:05 +0100
+Subject: [PATCH] e-ink: sleep screen: update notification icons immediately
+ without a full refresh
+
+Previously, EinkSleepScreen only refreshed notification icons on the
+once-a-minute doze time tick and on onPulsingChanged(). Any notification
+that did not trigger an ambient pulse (hidden sensitive content on lock
+screen, pulse disabled, grouped/updated/dismissed notifications, prox
+near, or a second notification during a pulse) waited up to a full
+minute to show up, and EinkDozeScreenOff kept the display off between
+minute ticks. Even when a notification did pulse, DozeTriggers ran a
+proximity check and kept the display ON for several seconds behind the
+opaque sleep screen.
+
+- Hook NotifPipeline in EinkSleepScreen (via
+  NotificationStackScrollLayoutController): listen to
+  OnAfterRenderListListener (already filtered by KeyguardCoordinator for
+  lock-screen visibility) and detect changes to the displayed icon row
+  (package + small Icon, covering standalone, grouped, and bundled
+  notifications) without reloading drawables or waking the display when
+  nothing changed.
+- When the icon row changes while dozing, call
+  EinkDozeScreenOff.requestUpdate() and invalidate(). Because the device
+  stays asleep (vendor.xrz.hibreak_sleep stays 1), SurfaceFlinger keeps
+  the sleep screen's Normal (DU) mode so only the changed icon pixels
+  update with no full panel refresh, and the display turns back off
+  after tick_ms (without shortening a longer pending window such as the
+  initial sleep hold).
+- Hold a brief CPU-only wakelock (debug.sysui.eink_sleep.notif_hold_ms,
+  default 1000 ms, display still off) on relevant NotifCollection events
+  while asleep so NotifPipelineChoreographer's 100 ms timeout and async
+  row inflation finish before the SoC suspends.
+- In DozeTriggers.onNotification(), suppress ambient notification pulses
+  while EinkSleepScreen is covering AOD (mInAod), avoiding the 500 ms
+  prox delay, redundant redraws, and 6+ seconds of display-on time.
+---
+ .../android/systemui/doze/DozeTriggers.java   |   7 +
+ .../systemui/doze/EinkDozeScreenOff.java      |  79 +++++-
+ .../systemui/shade/EinkSleepScreen.java       | 251 +++++++++++++++---
+ ...tificationStackScrollLayoutController.java |   2 +
+ 4 files changed, 296 insertions(+), 43 deletions(-)
+
+diff --git a/packages/SystemUI/src/com/android/systemui/doze/DozeTriggers.java b/packages/SystemUI/src/com/android/systemui/doze/DozeTriggers.java
+index 58b2b23..7a9bad4 100644
+--- a/packages/SystemUI/src/com/android/systemui/doze/DozeTriggers.java
++++ b/packages/SystemUI/src/com/android/systemui/doze/DozeTriggers.java
+@@ -249,6 +249,13 @@ public class DozeTriggers implements DozeMachine.Part {
+         if (DozeMachine.DEBUG) {
+             Log.d(TAG, "requestNotificationPulse");
+         }
++        if (com.android.systemui.shade.EinkSleepScreen.ENABLED && mInAod) {
++            // E-ink sleep screen covers AOD and updates its notification icons directly;
++            // pulsing would keep the display ON for seconds behind the opaque sleep screen.
++            runIfNotNull(onPulseSuppressedListener);
++            mDozeLog.tracePulseDropped("einkSleepScreen");
++            return;
++        }
+         if (!sWakeDisplaySensorState) {
+             Log.d(TAG, "Wake display false. Pulse denied.");
+             runIfNotNull(onPulseSuppressedListener);
+diff --git a/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java b/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
+index 72274e7..a2d9940 100644
+--- a/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
++++ b/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
+@@ -6,6 +6,8 @@
+ package com.android.systemui.doze;
+ 
+ import android.os.Handler;
++import android.os.Looper;
++import android.os.SystemClock;
+ import android.os.SystemProperties;
+ import android.util.Log;
+ import android.view.Display;
+@@ -15,21 +17,23 @@ import com.android.systemui.util.wakelock.SettableWakeLock;
+ import com.android.systemui.util.wakelock.WakeLock;
+ 
+ /**
+- * E-ink sleep screen (HiBreak Pro): the display is off between the minute updates.
++ * E-ink sleep screen (HiBreak Pro): the display is off between sleep-screen updates.
+  *
+  * The composer of this phone has no doze mode, so SurfaceFlinger runs the always-on display
+  * (DOZE and DOZE_SUSPEND) with the display fully on. The display driver then holds a wakelock
+  * (cmdq_wake_lock) and the SoC never suspends: about 40 mAh an hour with nothing to do. An e-ink
+  * panel keeps its picture with the display off, so the always-on display does not need it on:
+- * once the sleep screen is on the panel the display goes off, the minute tick turns it on for
+- * the new minute and off again after that update.
++ * once the sleep screen is on the panel the display goes off, and each minute tick or
++ * notification icon change turns it on briefly (in the always-on Normal DU mode, without a full
++ * panel refresh) and off again after that update.
+  *
+  * Tuning without a build (read when dozing starts), debug.sysui.eink_sleep.*:
+  * screen_off (0 keeps the display on, as before), off_ms (on after going to sleep, 3000: the
+- * SurfaceFlinger hold of up to 1.5 s and the GC16), tick_ms (on for a minute update, 1500).
++ * SurfaceFlinger hold of up to 1.5 s and the GC16), tick_ms (on for an update, 1500),
++ * notif_hold_ms (CPU-only wakelock while a notification runs through the pipeline, 1000).
+  * The kernel waits for a running panel update before it turns the display off.
+  */
+-final class EinkDozeScreenOff {
++public final class EinkDozeScreenOff {
+     private static final String TAG = "EinkDozeScreenOff";
+     static final boolean ENABLED = EinkSleepScreen.ENABLED
+             && SystemProperties.getBoolean("debug.sysui.eink_sleep.screen_off", true);
+@@ -40,14 +44,18 @@ final class EinkDozeScreenOff {
+     private final Handler mHandler;
+     private final WakeLock mRawWakeLock;
+     private final SettableWakeLock mWakeLock;
++    private final SettableWakeLock mPipelineWakeLock;
+     private final Runnable mTurnOff = this::turnOff;
++    private final Runnable mReleasePipeline = this::releasePipeline;
+ 
+     /** The always-on state the doze machine asked for, or STATE_UNKNOWN when it wants another. */
+     private int mAlwaysOnState = Display.STATE_UNKNOWN;
+-    /** Generation counter isolating posted time-tick updates from prior doze sessions. */
++    /** Generation counter isolating posted updates from prior doze sessions. */
+     private volatile int mSessionGen;
+     /** The display is off on our account while the doze machine wants it always on. */
+     private boolean mOff;
++    /** Uptime deadline for the scheduled {@link #mTurnOff}, or 0 when none is pending. */
++    private long mOffAt;
+     private int mSleepDelay = 3000;
+     private int mTickDelay = 1500;
+ 
+@@ -56,6 +64,7 @@ final class EinkDozeScreenOff {
+         mHandler = handler;
+         mRawWakeLock = wakeLock;
+         mWakeLock = new SettableWakeLock(wakeLock, TAG);
++        mPipelineWakeLock = new SettableWakeLock(wakeLock, TAG + ":notif");
+         sInstance = this;
+     }
+ 
+@@ -72,6 +81,7 @@ final class EinkDozeScreenOff {
+                 mAlwaysOnState = state;
+                 return;
+             }
++            releasePipeline();
+             mHandler.removeCallbacks(mTurnOff);
+             mOff = false;
+             mService.setDozeScreenState(state);
+@@ -79,7 +89,9 @@ final class EinkDozeScreenOff {
+             scheduleOff(mSleepDelay);
+         } else {
+             mSessionGen++;
++            releasePipeline();
+             mHandler.removeCallbacks(mTurnOff);
++            mOffAt = 0;
+             mOff = false;
+             mService.setDozeScreenState(state);
+             mAlwaysOnState = Display.STATE_UNKNOWN;
+@@ -90,7 +102,9 @@ final class EinkDozeScreenOff {
+     /** Dozing ends; main thread. */
+     void cancel() {
+         mSessionGen++;
++        releasePipeline();
+         mHandler.removeCallbacks(mTurnOff);
++        mOffAt = 0;
+         mAlwaysOnState = Display.STATE_UNKNOWN;
+         mOff = false;
+         mWakeLock.setAcquired(false);
+@@ -106,38 +120,85 @@ final class EinkDozeScreenOff {
+      * the new minute (the window redraws when it does) and goes off again after the update.
+      */
+     static void onTimeTick() {
++        requestUpdate();
++    }
++
++    /**
++     * A sleep-screen update (minute tick or notification icon change) while dozing; any thread.
++     * Brings the display back to its always-on state briefly so the panel gets the non-flashing
++     * Normal (DU) update, then turns it off again after {@code tick_ms}.
++     */
++    public static void requestUpdate() {
+         EinkDozeScreenOff instance = sInstance;
+-        if (instance != null) {
+-            final int gen = instance.mSessionGen;
++        if (instance == null) return;
++        final int gen = instance.mSessionGen;
++        if (Looper.myLooper() == instance.mHandler.getLooper()) {
++            instance.showUpdate(gen);
++        } else {
+             // Hold a refcounted WakeLock wrapper across post() so mWakeLock stays main-thread only.
+             instance.mHandler.post(instance.mRawWakeLock.wrap(() -> instance.showUpdate(gen)));
+         }
+     }
+ 
++    /**
++     * Keeps the CPU awake briefly (without turning the display on) while the notification
++     * pipeline inflates and filters a newly arrived or removed notification, so the
++     * choreographer timeout can run while the display is off. Main thread.
++     */
++    public static void holdForNotification() {
++        EinkDozeScreenOff instance = sInstance;
++        if (instance != null && Looper.myLooper() == instance.mHandler.getLooper()) {
++            instance.holdPipeline();
++        }
++    }
++
++    private void holdPipeline() {
++        if (mAlwaysOnState == Display.STATE_UNKNOWN || !mOff) return;
++        final int holdMs = SystemProperties.getInt("debug.sysui.eink_sleep.notif_hold_ms", 1000);
++        if (holdMs <= 0) return;
++        mHandler.removeCallbacks(mReleasePipeline);
++        mPipelineWakeLock.setAcquired(true);
++        mHandler.postDelayed(mReleasePipeline, holdMs);
++    }
++
++    private void releasePipeline() {
++        mHandler.removeCallbacks(mReleasePipeline);
++        mPipelineWakeLock.setAcquired(false);
++    }
++
+     private void showUpdate(int gen) {
+         if (gen != mSessionGen || mAlwaysOnState == Display.STATE_UNKNOWN) {
+             return;
+         }
++        releasePipeline();
+         mHandler.removeCallbacks(mTurnOff);
++        int delay = mTickDelay;
+         if (mOff) {
+             mOff = false;
+             mService.setDozeScreenState(mAlwaysOnState);
++        } else if (mOffAt > 0 && delay >= 0) {
++            // Do not shorten a longer pending window (e.g. the initial sleep hold).
++            long remaining = mOffAt - SystemClock.uptimeMillis();
++            if (remaining > delay) delay = (int) remaining;
+         }
+-        scheduleOff(mTickDelay);
++        scheduleOff(delay);
+     }
+ 
+     private void scheduleOff(int delay) {
+         if (delay < 0) {
+             // Negative: the display stays on (the behaviour before this class).
++            mOffAt = 0;
+             mWakeLock.setAcquired(false);
+             return;
+         }
+         // Awake until the display is off: the handler's clock stops while the CPU sleeps.
++        mOffAt = SystemClock.uptimeMillis() + delay;
+         mWakeLock.setAcquired(true);
+         mHandler.postDelayed(mTurnOff, delay);
+     }
+ 
+     private void turnOff() {
++        mOffAt = 0;
+         if (mAlwaysOnState != Display.STATE_UNKNOWN && !mOff) {
+             if (DozeService.DEBUG) Log.d(TAG, "display off until the next update");
+             mOff = true;
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+index a00ea7a..5b7a5d0 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+@@ -32,9 +32,16 @@ import android.util.Log;
+ import android.view.View;
+ import android.view.ViewGroup;
+ 
++import com.android.systemui.doze.EinkDozeScreenOff;
+ import com.android.systemui.plugins.statusbar.StatusBarStateController;
++import com.android.systemui.statusbar.notification.collection.BundleEntry;
+ import com.android.systemui.statusbar.notification.collection.EntryAdapter;
++import com.android.systemui.statusbar.notification.collection.GroupEntry;
++import com.android.systemui.statusbar.notification.collection.ListEntry;
++import com.android.systemui.statusbar.notification.collection.NotifPipeline;
+ import com.android.systemui.statusbar.notification.collection.NotificationEntry;
++import com.android.systemui.statusbar.notification.collection.PipelineEntry;
++import com.android.systemui.statusbar.notification.collection.notifcollection.NotifCollectionListener;
+ import com.android.systemui.statusbar.notification.row.ExpandableNotificationRow;
+ import com.android.systemui.statusbar.notification.shared.NotificationBundleUi;
+ import com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayoutController;
+@@ -102,6 +109,22 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+     private static final long WEATHER_MAX_AGE = 12 * DateUtils.HOUR_IN_MILLIS;
+ 
+     private static EinkSleepScreen sInstance;
++    private static boolean sPipelineAttached;
++    private static List<PipelineEntry> sLastEntries;
++
++    private static final class IconSpec {
++        final String pkg;
++        final Icon icon;
++
++        IconSpec(String pkg, Icon icon) {
++            this.pkg = pkg;
++            this.icon = icon;
++        }
++
++        boolean sameAs(IconSpec other) {
++            return pkg.equals(other.pkg) && icon.sameAs(other.icon);
++        }
++    }
+ 
+     private final StatusBarStateController mStateController;
+     private final NotificationStackScrollLayoutController mNotifications;
+@@ -109,6 +132,7 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+     private final Paint mTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+     private final Rect mBounds = new Rect();
+     private final List<Drawable> mIcons = new ArrayList<>();
++    private final List<IconSpec> mIconSpecs = new ArrayList<>();
+     private Typeface mTimeTypeface;
+     private boolean mTimeTypefaceIsFlex;
+     private int mTimeTypefaceWeight = -1;
+@@ -155,6 +179,57 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         if (sInstance != null) sInstance.refresh();
+     }
+ 
++    /**
++     * Hooks the notification pipeline once so arriving, updated or dismissed notifications update
++     * the sleep screen's icon row immediately (without waiting for the next minute tick).
++     */
++    public static void attachPipeline(NotifPipeline pipeline) {
++        if (!ENABLED || sPipelineAttached) return;
++        sPipelineAttached = true;
++        pipeline.addCollectionListener(new NotifCollectionListener() {
++            @Override
++            public void onEntryAdded(NotificationEntry entry) {
++                onCollectionEvent(entry, false);
++            }
++
++            @Override
++            public void onEntryUpdated(NotificationEntry entry) {
++                onCollectionEvent(entry, true);
++            }
++
++            @Override
++            public void onEntryRemoved(NotificationEntry entry, int reason) {
++                onCollectionEvent(entry, true);
++            }
++        });
++        pipeline.addOnAfterRenderListListener(entries -> {
++            sLastEntries = new ArrayList<>(entries);
++            EinkSleepScreen view = sInstance;
++            if (view != null) view.onNotificationsChanged();
++        });
++    }
++
++    private static void onCollectionEvent(NotificationEntry entry, boolean checkDisplayed) {
++        EinkSleepScreen view = sInstance;
++        if (view == null || view.getVisibility() != VISIBLE || !view.mShowIcons) return;
++        boolean relevant = isAlerting(entry);
++        if (!relevant && checkDisplayed) {
++            StatusBarNotification sbn = entry.getSbn();
++            if (sbn != null) {
++                String pkg = sbn.getPackageName();
++                for (IconSpec spec : view.mIconSpecs) {
++                    if (spec.pkg.equals(pkg)) {
++                        relevant = true;
++                        break;
++                    }
++                }
++            }
++        }
++        if (relevant) {
++            EinkDozeScreenOff.holdForNotification();
++        }
++    }
++
+     private EinkSleepScreen(Context context, StatusBarStateController stateController,
+             NotificationStackScrollLayoutController notifs) {
+         super(context);
+@@ -204,13 +279,25 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         } else {
+             setVisibility(GONE);
+             mIcons.clear();
++            mIconSpecs.clear();
+         }
+     }
+ 
+     @Override
+     public void onPulsingChanged(boolean pulsing) {
+-        // A notification arrived (or left) while asleep: its icon joins the row.
+-        refresh();
++        // Notifications update directly from the pipeline; keep this as a fallback only if icons
++        // actually changed, avoiding redundant panel updates.
++        if (getVisibility() != VISIBLE) return;
++        if (loadIcons()) invalidate();
++    }
++
++    private void onNotificationsChanged() {
++        if (getVisibility() != VISIBLE) return;
++        if (!loadIcons()) return;
++        // Bring the display back to its always-on state briefly for a non-flashing Normal (DU)
++        // update so only the changed icon pixels move, then turn it off again after tick_ms.
++        EinkDozeScreenOff.requestUpdate();
++        invalidate();
+     }
+ 
+     private void refresh() {
+@@ -221,43 +308,139 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         invalidate();
+     }
+ 
+-    /** Small icons of the notifications that would make a sound, one per app. */
+-    private void loadIcons() {
+-        mIcons.clear();
+-        if (!mShowIcons) return;
+-        try {
+-            ViewGroup stack = mNotifications.getView();
+-            Set<String> seen = new HashSet<>();
+-            for (int i = 0; i < stack.getChildCount() && mIcons.size() < MAX_ICONS; i++) {
+-                if (!(stack.getChildAt(i) instanceof ExpandableNotificationRow row)) continue;
+-                if (row.getVisibility() != View.VISIBLE || row.isRemoved()) continue;
+-                // The two notification pipelines (bundle UI flag) hand out the entry differently.
+-                StatusBarNotification sbn;
+-                NotificationListenerService.Ranking ranking;
+-                if (NotificationBundleUi.isEnabled()) {
+-                    EntryAdapter adapter = row.getEntryAdapter();
+-                    if (adapter == null || adapter.isBundle()) continue;
+-                    sbn = adapter.getSbn();
+-                    ranking = adapter.getRanking();
++    /**
++     * Small icons of the notifications that would make a sound, one per app.
++     * Returns true if the displayed icons changed.
++     */
++    private boolean loadIcons() {
++        List<IconSpec> nextSpecs = new ArrayList<>();
++        List<StatusBarNotification> nextSbns = new ArrayList<>();
++        if (mShowIcons) {
++            try {
++                Set<String> seen = new HashSet<>();
++                List<PipelineEntry> entries = sLastEntries;
++                if (entries != null) {
++                    for (PipelineEntry entry : entries) {
++                        if (nextSpecs.size() >= MAX_ICONS) break;
++                        collectFromPipelineEntry(entry, seen, nextSpecs, nextSbns);
++                    }
+                 } else {
+-                    NotificationEntry entry = row.getEntryLegacy();
+-                    if (entry == null) continue;
+-                    sbn = entry.getSbn();
+-                    ranking = entry.getRanking();
++                    collectFromStack(seen, nextSpecs, nextSbns);
+                 }
+-                if (sbn == null || ranking == null
+-                        || ranking.getImportance() < NotificationManager.IMPORTANCE_DEFAULT) {
+-                    continue;
++            } catch (RuntimeException e) {
++                Log.w(TAG, "notification icons", e);
++            }
++        }
++        if (sameIconSpecs(mIconSpecs, nextSpecs)) return false;
++
++        List<IconSpec> loadedSpecs = new ArrayList<>(nextSpecs.size());
++        List<Drawable> loadedIcons = new ArrayList<>(nextSpecs.size());
++        for (int i = 0; i < nextSpecs.size(); i++) {
++            IconSpec spec = nextSpecs.get(i);
++            StatusBarNotification sbn = nextSbns.get(i);
++            try {
++                Drawable d = spec.icon.loadDrawable(sbn.getPackageContext(mContext));
++                if (d != null) {
++                    loadedSpecs.add(spec);
++                    loadedIcons.add(d.mutate());
+                 }
+-                if (!seen.add(sbn.getPackageName())) continue;
+-                Icon icon = sbn.getNotification().getSmallIcon();
+-                Drawable d = icon != null ? icon.loadDrawable(sbn.getPackageContext(mContext))
+-                        : null;
+-                if (d != null) mIcons.add(d.mutate());
++            } catch (RuntimeException e) {
++                Log.w(TAG, "notification icon for " + spec.pkg, e);
+             }
+-        } catch (RuntimeException e) {
+-            Log.w(TAG, "notification icons", e);
+         }
++        boolean changed = !sameIconSpecs(mIconSpecs, loadedSpecs);
++        mIconSpecs.clear();
++        mIconSpecs.addAll(loadedSpecs);
++        mIcons.clear();
++        mIcons.addAll(loadedIcons);
++        return changed;
++    }
++
++    private static boolean isAlerting(NotificationEntry entry) {
++        StatusBarNotification sbn = entry.getSbn();
++        NotificationListenerService.Ranking ranking = entry.getRanking();
++        return sbn != null && ranking != null
++                && ranking.getImportance() >= NotificationManager.IMPORTANCE_DEFAULT;
++    }
++
++    private static void collectFromPipelineEntry(PipelineEntry entry, Set<String> seen,
++            List<IconSpec> specs, List<StatusBarNotification> sbns) {
++        if (entry instanceof NotificationEntry ne) {
++            addNotificationSpec(ne, seen, specs, sbns);
++        } else if (entry instanceof GroupEntry group) {
++            NotificationEntry summary = group.getSummary();
++            if (summary != null && isAlerting(summary)
++                    && addNotificationSpec(summary, seen, specs, sbns)) {
++                return;
++            }
++            for (NotificationEntry child : group.getChildren()) {
++                if (specs.size() >= MAX_ICONS) break;
++                if (isAlerting(child) && addNotificationSpec(child, seen, specs, sbns)) {
++                    break;
++                }
++            }
++        } else if (entry instanceof BundleEntry bundle) {
++            for (ListEntry child : bundle.getChildren()) {
++                if (specs.size() >= MAX_ICONS) break;
++                collectFromPipelineEntry(child, seen, specs, sbns);
++            }
++        }
++    }
++
++    private static boolean addNotificationSpec(NotificationEntry entry, Set<String> seen,
++            List<IconSpec> specs, List<StatusBarNotification> sbns) {
++        if (!isAlerting(entry)) return false;
++        StatusBarNotification sbn = entry.getSbn();
++        String pkg = sbn.getPackageName();
++        if (seen.contains(pkg)) return false;
++        Icon icon = sbn.getNotification().getSmallIcon();
++        if (icon == null) return false;
++        seen.add(pkg);
++        specs.add(new IconSpec(pkg, icon));
++        sbns.add(sbn);
++        return true;
++    }
++
++    private void collectFromStack(Set<String> seen, List<IconSpec> specs,
++            List<StatusBarNotification> sbns) {
++        ViewGroup stack = mNotifications.getView();
++        for (int i = 0; i < stack.getChildCount() && specs.size() < MAX_ICONS; i++) {
++            if (!(stack.getChildAt(i) instanceof ExpandableNotificationRow row)) continue;
++            if (row.getVisibility() != View.VISIBLE || row.isRemoved()) continue;
++            // The two notification pipelines (bundle UI flag) hand out the entry differently.
++            StatusBarNotification sbn;
++            NotificationListenerService.Ranking ranking;
++            if (NotificationBundleUi.isEnabled()) {
++                EntryAdapter adapter = row.getEntryAdapter();
++                if (adapter == null || adapter.isBundle()) continue;
++                sbn = adapter.getSbn();
++                ranking = adapter.getRanking();
++            } else {
++                NotificationEntry entry = row.getEntryLegacy();
++                if (entry == null) continue;
++                sbn = entry.getSbn();
++                ranking = entry.getRanking();
++            }
++            if (sbn == null || ranking == null
++                    || ranking.getImportance() < NotificationManager.IMPORTANCE_DEFAULT) {
++                continue;
++            }
++            String pkg = sbn.getPackageName();
++            if (seen.contains(pkg)) continue;
++            Icon icon = sbn.getNotification().getSmallIcon();
++            if (icon == null) continue;
++            seen.add(pkg);
++            specs.add(new IconSpec(pkg, icon));
++            sbns.add(sbn);
++        }
++    }
++
++    private static boolean sameIconSpecs(List<IconSpec> a, List<IconSpec> b) {
++        if (a.size() != b.size()) return false;
++        for (int i = 0; i < a.size(); i++) {
++            if (!a.get(i).sameAs(b.get(i))) return false;
++        }
++        return true;
+     }
+ 
+     /** Weather and next event from HiBreakParts; nothing if absent, stale or unreadable. */
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayoutController.java b/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayoutController.java
+index ff5ad1d..e3fa2a1 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayoutController.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/notification/stack/NotificationStackScrollLayoutController.java
+@@ -974,6 +974,8 @@ public class NotificationStackScrollLayoutController implements Dumpable {
+                 mView.onEntryUpdated(entry);
+             }
+         });
++        // E-ink: update the sleep screen's notification icons as soon as the pipeline renders.
++        com.android.systemui.shade.EinkSleepScreen.attachPipeline(mNotifPipeline);
+ 
+         mView.initView(mView.getContext(), mSwipeHelper, mNotificationStackSizeCalculator);
+         mView.setKeyguardBypassEnabled(mKeyguardBypassController.getBypassEnabled());
+-- 
+2.50.1 (Apple Git-155)
+

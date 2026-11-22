@@ -39,9 +39,9 @@ quiet_ms,min_ms,max_ms,wake_mode,wake_min_ms,wake_max_ms} tune it.
 
 Change-Id: I563b265acf3f5104cb498d567142cc8051652cf5
 ---
- .../DisplayHardware/EinkMotion.cpp            | 110 ++++++++++++++++++
+ .../DisplayHardware/EinkMotion.cpp            | 108 ++++++++++++++++++
  .../DisplayHardware/EinkMotion.h              |  35 ++++++
- 2 files changed, 145 insertions(+)
+ 2 files changed, 143 insertions(+)
 
 diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
 index 63aa5d1..77f2609 100644
@@ -58,24 +58,22 @@ index 63aa5d1..77f2609 100644
  
  uint32_t readUint(const prop_info* pi, uint32_t fallback) {
      if (!pi) return fallback;
-@@ -63,6 +67,11 @@ void EinkMotion::setRepaint(std::function<void()> repaint) {
+@@ -63,6 +67,10 @@ void EinkMotion::setRepaint(std::function<void()> repaint) {
      mRepaint = std::move(repaint);
      if (!mStarted) {
          mStarted = true;
 +        // A SurfaceFlinger that died while holding the panel must not leave it frozen.
-+        if (base::GetBoolProperty("debug.sf.eink_sleep", true) &&
-+            !base::GetBoolProperty("debug.sf.eink_engine", false)) {
++        if (base::GetBoolProperty("debug.sf.eink_sleep", true)) {
 +            base::SetProperty(kDisableCommitProperty, "0");
 +        }
          std::thread([this] { threadLoop(); }).detach(); // lives as long as SurfaceFlinger
      }
  }
-@@ -85,6 +94,21 @@ void EinkMotion::reloadConfigIfChanged() {
+@@ -85,6 +93,20 @@ void EinkMotion::reloadConfigIfChanged() {
      // The kernel cleans up after the last FAST frame in passes that take ~600 ms; a mode change
      // before they finish cancels them and leaves ghosts.
      c.end = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.end_ms", 700));
-+    c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true) &&
-+            !base::GetBoolProperty("debug.sf.eink_engine", false);
++    c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true);
 +    c.asleep = base::GetBoolProperty("vendor.xrz.hibreak_sleep", false);
 +    c.sleepMode = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.mode", 0xb2);
 +    c.sleepClean = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.clean", 4);

@@ -5,7 +5,7 @@
 #   | "done <failure>"
 # HIBREAK_FLAVORS (pipeline.env, default "microg") lists the flavours to build one after the other
 # on the same tree (device.mk). A full build (bacon) of each is checked and its zip and images are
-# copied to /srv/dist/<flavour>/ before the next one starts (scripts/fetch-artifacts.sh).
+# copied to /srv/dist/<flavour>/ before the next one starts (scripts/build/fetch-artifacts.sh).
 # SKIP_SYNC=1 (a kept server whose tree is synced and patched): no init, sync or waits; the
 # projects in REPATCH (e.g. "frameworks/base frameworks/opt/telephony") are reset to the manifest
 # and their patches re-applied from /srv/hibreak-src, then the flavours are built.
@@ -113,4 +113,9 @@ for f in $HIBREAK_FLAVORS; do
   done
   cp /srv/sync3.log "$d/" 2>/dev/null || true
 done
+if [ -f /srv/hibreak-src/scripts/ci/check-flavours.sh ]; then
+  state "check flavours"
+  bash /srv/hibreak-src/scripts/ci/check-flavours.sh /srv/dist > /srv/flavours-check.log 2>&1 \
+    || fail flavours-check-failed
+fi
 state "done ok"

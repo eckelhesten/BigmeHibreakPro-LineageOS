@@ -2,7 +2,7 @@ name: upstream-watch
 
 # Weekly: if LineageOS (or our own trees) moved since the last build, rebuild all flavours to
 # see that they still build. Never publishes: releases are versioned and tested by hand first
-# (build.yml with publish and a version, docs/building.md "Releases").
+# (build.yml with publish and a version, docs/building.md).
 on:
   schedule: [{ cron: "0 3 * * 1" }]
   workflow_dispatch:
@@ -33,10 +33,11 @@ jobs:
             android_frameworks_base \
             android_frameworks_libs_systemui \
             android_frameworks_native \
+            android_frameworks_opt_telephony \
             android_packages_apps_Trebuchet \
+            android_packages_apps_Twelve \
             android_packages_modules_Connectivity \
             android_packages_overlays_Lineage \
-            android_system_core \
             android_vendor_lineage; do
             line=$(git ls-remote "https://github.com/LineageOS/$r" "refs/heads/$BRANCH")
             sha=${line%%$'\t'*}

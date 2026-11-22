@@ -2,7 +2,7 @@
 # Ephemeral Hetzner Cloud build: create a server, sync + build there, fetch the artifacts,
 # delete the server. The server only exists (and only bills) while this script runs.
 #
-# Works from the Mac (active `hcloud` context) and from GitHub Actions (HCLOUD_TOKEN env).
+# Works locally (active `hcloud` context) and from GitHub Actions (HCLOUD_TOKEN env).
 # Needs device/bigme/hibreakpro and vendor/bigme/hibreakpro checked out next to this script.
 #
 # Env (all optional):
@@ -127,7 +127,7 @@ LABEL="hibreak=ci"
 labels=(--label "$LABEL" --label "created=$(date -u +%s)")
 [[ -n "${CI_RUN_ID:-}" ]] && labels+=(--label "run=$CI_RUN_ID")
 hcloud server create --name "$NAME" --type "$SERVER_TYPE" --image ubuntu-24.04 --location "$LOCATION" \
-  --ssh-key "$KEY" --user-data-from-file scripts/buildserver-cloud-init.yaml "${labels[@]}" >/dev/null
+  --ssh-key "$KEY" --user-data-from-file scripts/build/buildserver-cloud-init.yaml "${labels[@]}" >/dev/null
 IP=$(hcloud server ip "$NAME")
 H="root@$IP"
 s() { ssh "${SSH_OPTS_ARR[@]}" "$H" "$@"; }
@@ -141,7 +141,7 @@ s 'cloud-init status --wait >/dev/null; test -f /var/lib/cloud/instance/hibreak-
 log "uploading device/vendor trees and scripts"
 dirs=(device/bigme vendor/bigme scripts manifests); [[ -d patches ]] && dirs+=(patches)
 COPYFILE_DISABLE=1 tar --no-xattrs -cf - "${dirs[@]}" | zstd -3 -T0 -q | \
-  s 'set -euo pipefail; mkdir -p /srv/hibreak-src && zstd -dq | tar -C /srv/hibreak-src -xf - && cp /srv/hibreak-src/scripts/buildserver-*.sh /srv/ && chmod +x /srv/*.sh'
+  s 'set -euo pipefail; mkdir -p /srv/hibreak-src && zstd -dq | tar -C /srv/hibreak-src -xf - && cp /srv/hibreak-src/scripts/build/buildserver-*.sh /srv/ && chmod +x /srv/*.sh'
 
 if [[ -n "${CCACHE_STORE:-}" ]]; then
   # The pipeline waits at the build step while /srv/ccache.restoring exists.
@@ -181,7 +181,7 @@ while :; do
   if [[ "$st" == *NO_TMUX* ]]; then st="${st%%$'\n'*}"; [[ "$st" == done* ]] || st="done killed-in-${st:-unknown}"; fi
   [[ "$st" != "$last" ]] && { log "state: $st"; last="$st"; }
   case "$st" in
-    build*|check*|"done ok"|"done build-failed"*|"done sepolicy"*|"done release-check-failed"*|"done no-zip"*|"done dist-failed"*|"done killed-in-build"*|"done killed-in-check"*)
+    build*|check*|"done ok"|"done build-failed"*|"done sepolicy"*|"done release-check-failed"*|"done flavours-check-failed"*|"done no-zip"*|"done dist-failed"*|"done killed-in-build"*|"done killed-in-check"*)
       build_started=1 ;;
   esac
   [[ "$st" == done* ]] && break
@@ -194,7 +194,7 @@ while :; do
   fi
 done
 
-s 'tail -5 /srv/build.log 2>/dev/null; cat /srv/sepolicy-check-*.log 2>/dev/null; cat /srv/release-check-*.log 2>/dev/null' || true
+s 'tail -5 /srv/build.log 2>/dev/null; cat /srv/sepolicy-check-*.log 2>/dev/null; cat /srv/release-check-*.log 2>/dev/null; cat /srv/flavours-check.log 2>/dev/null' || true
 if [[ -n "$CCACHE_PID" ]]; then wait "$CCACHE_PID" || true; CCACHE_PID=""; cat "$TMP/ccache-restore.log"; fi
 # Save the cache only if the build stage actually ran and restore didn't fail/corrupt it (or build succeeded).
 if [[ -n "${CCACHE_STORE:-}" && $build_started -eq 1 ]] && { [[ -f "$TMP/ccache-restore.ok" || "$st" == "done ok" ]]; }; then
@@ -211,6 +211,7 @@ if ! grep -q '^done ok$' <<<"$st"; then
     *patches-failed*) s 'tail -60 /srv/patches.log' || true ;;
     *sepolicy*) s "cat /srv/sepolicy-check-${st##*-}.log" || true ;;
     *release-check*) s "cat /srv/release-check-${st##*-}.log" || true ;;
+    *flavours-check*) s 'cat /srv/flavours-check.log' || true ;;
     *) s 'tail -60 /srv/build.log' || true ;;
   esac
   exit 1
@@ -218,6 +219,6 @@ fi
 
 if [[ "$BUILD_TARGET" == bacon && "${SYNC_ONLY:-0}" != 1 ]]; then
   log "fetching artifacts"
-  OUT_DIR="$OUT_DIR" scripts/fetch-artifacts.sh "$IP"
+  OUT_DIR="$OUT_DIR" scripts/build/fetch-artifacts.sh "$IP"
 fi
 log "build finished"

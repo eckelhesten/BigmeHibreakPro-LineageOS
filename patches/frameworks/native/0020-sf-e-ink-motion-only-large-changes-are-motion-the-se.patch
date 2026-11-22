@@ -4,7 +4,7 @@ Date: Sun, 22 Nov 2026 11:47:39 +0100
 Subject: [PATCH] sf: e-ink motion: only large changes are motion; the settle
  repaint reaches the panel
 
-Two owner reports (docs/bug-queue.md 0h, 0i):
+Two owner reports:
 
 - Any animation kept the whole panel in FAST: three composites within
   150 ms started FAST whatever their size, so a playing video, GIF,
@@ -34,7 +34,7 @@ diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/s
 index 3c870d0..ad0a376 100644
 --- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
 +++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
-@@ -99,6 +99,11 @@ void EinkMotion::reloadConfigIfChanged() {
+@@ -97,5 +97,10 @@ void EinkMotion::reloadConfigIfChanged() {
      // The kernel cleans up after the last FAST frame in passes that take ~600 ms; a mode change
      // before they finish cancels them and leaves ghosts.
      c.end = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.end_ms", 700));
@@ -43,8 +43,7 @@ index 3c870d0..ad0a376 100644
 +    c.touchRecent =
 +            ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.touch_recent_ms", 2000));
 +    c.settleForce = base::GetBoolProperty("debug.sf.eink_motion.settle_force", true);
-     c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true) &&
-             !base::GetBoolProperty("debug.sf.eink_engine", false);
+     c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true);
      c.asleep = base::GetBoolProperty("vendor.xrz.hibreak_sleep", false);
 @@ -193,7 +198,7 @@ void EinkMotion::applySleepMode() {
      mSleepModeSet = true;
@@ -99,7 +98,7 @@ index 3c870d0..ad0a376 100644
 +        // The screen is still: back to the user's mode, and one repaint in it. The composer
 +        // skips a composite without new buffers, so the repaint goes out with its one-shot in
 +        // that mode (otherwise the panel keeps the last FAST frame until the composer's own idle
-+        // refresh ~0.6 s later; docs/bug-queue.md 0i).
++        // refresh ~0.6 s later).
 +        if (readMode() == mWritten && modeSerial() == mWrittenSerial) {
 +            writeMode(mBase);
 +            if (mConfig.settleForce) {

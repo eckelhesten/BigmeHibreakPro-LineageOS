@@ -1,5 +1,4 @@
-# MediaTek's IMS service (com.mediatek.ims, shares android.uid.phone, so it runs as radio):
-# docs/volte.md.
+# MediaTek's IMS service (com.mediatek.ims, shares android.uid.phone, so it runs as radio).
 #
 # The vendor side needs nothing new: the stock vendor policy already lets radio find and call
 # the MediaTek RIL's IMtkRadioEx/imsSlotN (hal_telephony_client) and read the IMS feature

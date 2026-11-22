@@ -10,10 +10,8 @@ import android.provider.Settings;
 import android.service.quicksettings.Tile;
 import android.service.quicksettings.TileService;
 
-/** Cycles the global e-ink refresh mode: Default, Clear (GC16), Balanced (GL16), Fast (A2). */
+/** Reading on or off: switches the global e-ink profile between Default and Reading. */
 public class EinkModeTile extends TileService {
-    static final int[] MODE_LABELS = {
-            R.string.mode_default, R.string.mode_clear, R.string.mode_balanced, R.string.mode_fast};
 
     private boolean mListening;
     private final ContentObserver mObserver = new ContentObserver(
@@ -28,7 +26,7 @@ public class EinkModeTile extends TileService {
     public void onStartListening() {
         if (!mListening) {
             getContentResolver().registerContentObserver(
-                    Settings.System.getUriFor(Keys.EINK_MODE), false, mObserver);
+                    Settings.System.getUriFor(Keys.EINK_PROFILE), false, mObserver);
             mListening = true;
         }
         refresh();
@@ -54,17 +52,18 @@ public class EinkModeTile extends TileService {
 
     @Override
     public void onClick() {
-        int next = (Eink.getGlobalMode(getContentResolver()) + 1) % Eink.MODE_VALUES.length;
-        Eink.setGlobalMode(getContentResolver(), next);
+        Eink.setProfile(getContentResolver(),
+                Eink.getProfile(getContentResolver()) == Eink.PROFILE_READING
+                        ? Eink.PROFILE_DEFAULT : Eink.PROFILE_READING);
         refresh();
     }
 
     private void refresh() {
         Tile tile = getQsTile();
         if (tile == null) return;
-        int i = Eink.getGlobalMode(getContentResolver());
-        tile.setState(i == 0 ? Tile.STATE_INACTIVE : Tile.STATE_ACTIVE);
-        tile.setSubtitle(getString(MODE_LABELS[i]));
+        boolean reading = Eink.getProfile(getContentResolver()) == Eink.PROFILE_READING;
+        tile.setState(reading ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
+        tile.setSubtitle(null);
         tile.updateTile();
     }
 }

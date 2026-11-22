@@ -1,9 +1,11 @@
 # Never commit device dumps: they contain IMEI/calibration (nvram, nvdata, proinfo),
 # per-panel e-ink calibration (waveform, vcom) and proprietary firmware.
 /backup/
-# Raw device info contains serial numbers and device IDs. Scrubbed findings live in docs/.
+# Raw device info contains serial numbers and device IDs.
 /device-info/
 /.venv/
+/.claude/
+__pycache__/
 /tools/mtkclient/
 /out/
 *.img

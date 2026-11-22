@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- MediaTek's IMS service (docs/volte.md): the same list as stock Bigme's
+<!-- MediaTek's IMS service: the same list as stock Bigme's
      system-ext-permissions-mediatek.xml. These are all of its requested permissions whose
      Android 16 protection level includes "privileged"; user builds refuse to boot when one is
      missing. -->

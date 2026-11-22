@@ -44,7 +44,7 @@
     <bool name="config_dreamsSupported">false</bool>
     <bool name="config_dreamsEnabledByDefault">false</bool>
 
-    <!-- VoLTE through MediaTek's IMS service (docs/volte.md). Carriers still have to allow it
+    <!-- VoLTE through MediaTek's IMS service. Carriers still have to allow it
          (carrier_volte_available_bool; CarrierConfigHiBreakPro adds the ones AOSP lacks).
          Video calling and Wi-Fi calling stay off: ViLTE needs MediaTek's vtservice and media
          libraries on system, which we don't carry, and Wi-Fi calling is untested. -->

@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # Copy the build outputs from the build server into $OUT_DIR/<build-name>/ and verify checksums.
-# Usage: scripts/fetch-artifacts.sh [server-ip]     (SSH_OPTS / OUT_DIR env are honoured)
+# Usage: scripts/build/fetch-artifacts.sh [server-ip]     (SSH_OPTS / OUT_DIR env are honoured)
 #
 # The pipeline leaves each flavour's zip, images and logs in /srv/dist/<flavour>/
-# (scripts/buildserver-pipeline.sh); each becomes $OUT_DIR/lineage-<version>-<flavour>-hibreakpro/.
-# Without /srv/dist (a build from before flavours, or rebuild.sh) the newest zip in the product
-# out directory is fetched as before.
+# (scripts/build/buildserver-pipeline.sh); each becomes $OUT_DIR/lineage-<version>-<flavour>-hibreakpro/.
+# Without /srv/dist (a partial build) the newest zip in the product out directory is fetched.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 H="root@${1:-$(hcloud server ip hibreak-build)}"
 read -r -a SSH_ARR <<<"${SSH_OPTS:--o BatchMode=yes}"
 P=/srv/lineage/out/target/product/hibreakpro

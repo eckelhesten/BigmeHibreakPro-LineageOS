@@ -14,12 +14,12 @@ import android.text.TextUtils;
 import android.util.Log;
 
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 
 /**
- * Control of the stock XRZ e-ink composer through its vendor properties
- * (see docs/eink-interface.md, "Live test: controlling the HWC"). Used by the app and by
- * KeyHandler inside system_server, so no resource references.
+ * Control of the stock XRZ e-ink composer through its vendor properties.
+ * Used by the app and by KeyHandler inside system_server, so no resource references.
  */
 final class Eink {
     private static final String TAG = "HiBreakEink";
@@ -28,11 +28,12 @@ final class Eink {
     static final String PROP_AUTO_CLEAN = "vendor.xrz.auto_clean_enabled";
     static final String PROP_ANTI_FLICKER = "vendor.xrz.anti_flicker_enabled";
     /** Read by SurfaceFlinger (frameworks/native patch 0006): the fast mode while the screen
-     *  moves, and while the keyboard is up. */
+     *  moves, and while the keyboard is up. Always on (Reading scrolls and types in FAST). */
     static final String PROP_MOTION_FAST = "vendor.xrz.hibreak_motion_fast";
     static final String PROP_IME_FAST = "vendor.xrz.hibreak_ime_fast";
-    /** Read by SurfaceFlinger's render pass (frameworks/native 0019): Fast mode (A2) draws
-     *  16 greys instead of black and white dots; the panel drives them in 35 ms passes. */
+    /** Read by SurfaceFlinger's render pass (frameworks/native 0019 + 0022): FAST (A2) draws
+     *  16 greys instead of black and white dots (including while typing); the panel drives them
+     *  in 35 ms passes. Always on: it is what makes Default look good. */
     static final String PROP_FAST_GREYS = "vendor.xrz.hibreak_fast_greys";
     /** The current temperature band's level map and tone curve for greys in Fast mode. */
     static final String PROP_FAST_LEVELS = "vendor.xrz.hibreak_fast_levels";
@@ -57,76 +58,103 @@ final class Eink {
         }
         return last; // warmer than every band: the warmest
     }
-    /** Read by SurfaceFlinger's e-ink pass: the grey levels that become black and white. */
+    /** Read by SurfaceFlinger's e-ink passes: the grey levels that become black and white in the
+     *  1-bit passes (typing in FAST; legacy enhancement pass). Fixed at the former "Strong": with
+     *  no crush the dither punched white dots into dark-grey web text. The grey passes (Default's
+     *  greys, Reading) ignore them. */
     private static final String PROP_CONTRAST_BLACK = "vendor.xrz.hibreak_contrast_black";
     private static final String PROP_CONTRAST_WHITE = "vendor.xrz.hibreak_contrast_white";
-    /** Read by SurfaceFlinger's render pass (frameworks/native 0013): light greys from the
-     *  bleach level up become white (keeping an outline), greys below the crush level black. */
     private static final String PROP_BLEACH = "vendor.xrz.hibreak_eink_bleach";
     private static final String PROP_CRUSH = "vendor.xrz.hibreak_eink_crush";
+    private static final int CONTRAST_BLACK = 48;
+    private static final int CONTRAST_WHITE = 208;
+    private static final int BLEACH = 194;
+    private static final int CRUSH = 92;
 
-    /** XRZ policy mode per mode index, as the stock firmware sets them: Default (0 = the
-     *  composer's NORMAL, DU with the kernel's cleanup), Clear (0xB0 CLEAN, GC16), Balanced
-     *  (0xB1 HD, grey 0x21), Fast (0xB3 FAST, A2 with cleanup). Policy modes, not raw waveform
-     *  numbers: only with them the composer keeps whole-panel updates, which is the kernel's
-     *  fast, self-cleaning path (docs/eink-stock-policy.md). Never write -1 (garbage waveform). */
-    static final int[] MODE_VALUES = {0, 0xB0, 0xB1, 0xB3};
-    /** Per-app only: Default, with the frame's lightness inverted by SurfaceFlinger's render
-     *  pass (frameworks/native 0013), for apps that are always dark. */
-    static final int MODE_INVERTED = 4;
+    /** The two profiles, and the per-app extra for dark-only apps. */
+    static final int PROFILE_DEFAULT = 0;
+    static final int PROFILE_READING = 1;
+    static final int APP_INVERTED = 2;
+    /** XRZ policy mode per profile, as the stock firmware sets them. Default: FAST (0xB3, A2 with
+     *  the kernel's cleanup) with SurfaceFlinger's greys, ~0.23 s. Reading: CLEAN (0xB0, GC16),
+     *  page turns held into one clean refresh (frameworks/native 0021), ~0.5 s. Policy modes, not
+     *  raw waveform numbers: only with them the composer keeps whole-panel updates, the kernel's
+     *  fast, self-cleaning path. Never write -1 (garbage waveform). */
+    private static final int[] PROFILE_MODE = {0xB3, 0xB0};
+    /** The bench's raw mode indexes (Keys.EINK_BENCH_MODE): Normal (DU), Clean, HD, Fast. */
+    private static final int[] BENCH_MODE = {0, 0xB0, 0xB1, 0xB3};
+    /** E-readers that use Reading unless the user picked something else for them. */
+    static final Set<String> READING_APPS = Set.of(
+            "com.amazon.kindle",
+            "com.google.android.apps.books",
+            "com.kobobooks.android",
+            "org.koreader.launcher",
+            "com.overdrive.mobile.android.libby",
+            "com.flyersoft.moonreader",
+            "org.readera");
     static final String PROP_INVERT = "vendor.xrz.hibreak_eink_invert";
     private static final int WAVEFORM_GC16 = 4;
     private static final int SF_TRANSACTION_REPAINT = 1004;
-    /** Grey levels that become black and white per contrast level: off, medium, strong.
-     *  Strong is what SurfaceFlinger's former e-ink engine used. */
-    private static final int[] CONTRAST_BLACK = {0, 24, 48};
-    private static final int[] CONTRAST_WHITE = {255, 232, 208};
-    /** The same levels for the render pass: off, medium, strong (scored offline in
-     *  scripts/eink-bench: strong keeps 71 % of faint structure that the old stretch erased). */
-    private static final int[] BLEACH = {255, 214, 194};
-    private static final int[] CRUSH = {0, 56, 92};
 
     private Eink() {}
 
-    static int clampMode(int index) {
-        return (index >= 0 && index < MODE_VALUES.length) ? index : 0;
+    static int clampProfile(int profile) {
+        return profile == PROFILE_READING ? PROFILE_READING : PROFILE_DEFAULT;
     }
 
-    static int getGlobalMode(ContentResolver cr) {
-        return clampMode(Settings.System.getInt(cr, Keys.EINK_MODE, 0));
+    static int getProfile(ContentResolver cr) {
+        return clampProfile(Settings.System.getInt(cr, Keys.EINK_PROFILE, PROFILE_DEFAULT));
     }
 
-    static void setGlobalMode(ContentResolver cr, int index) {
-        Settings.System.putInt(cr, Keys.EINK_MODE, clampMode(index));
+    static void setProfile(ContentResolver cr, int profile) {
+        Settings.System.putInt(cr, Keys.EINK_PROFILE, clampProfile(profile));
     }
 
-    static Map<String, Integer> getAppModes(ContentResolver cr) {
-        return parseAppModes(Settings.System.getString(cr, Keys.EINK_APP_MODES));
+    /** The composer mode for a profile (or APP_INVERTED, which is Default with inverted colours). */
+    static int modeFor(int profile) {
+        return PROFILE_MODE[profile == PROFILE_READING ? PROFILE_READING : PROFILE_DEFAULT];
     }
 
-    static Map<String, Integer> parseAppModes(String s) {
-        Map<String, Integer> modes = new TreeMap<>();
-        if (TextUtils.isEmpty(s)) return modes;
+    /** The bench's raw mode for an index, or -1 for none (back to the profiles). */
+    static int benchMode(int index) {
+        return (index >= 0 && index < BENCH_MODE.length) ? BENCH_MODE[index] : -1;
+    }
+
+    /** What an app runs in: its own choice, Reading for known e-readers, else the global one. */
+    static int profileFor(Map<String, Integer> appProfiles, String pkg, int global) {
+        if (pkg == null) return global;
+        Integer own = appProfiles.get(pkg);
+        if (own != null) return own;
+        return READING_APPS.contains(pkg) ? PROFILE_READING : global;
+    }
+
+    static Map<String, Integer> getAppProfiles(ContentResolver cr) {
+        return parseAppProfiles(Settings.System.getString(cr, Keys.EINK_APP_PROFILES));
+    }
+
+    static Map<String, Integer> parseAppProfiles(String s) {
+        Map<String, Integer> profiles = new TreeMap<>();
+        if (TextUtils.isEmpty(s)) return profiles;
         for (String entry : s.split(";")) {
             int eq = entry.indexOf('=');
             if (eq <= 0) continue;
             try {
-                int mode = Integer.parseInt(entry.substring(eq + 1));
-                modes.put(entry.substring(0, eq), mode == MODE_INVERTED ? mode : clampMode(mode));
+                int p = Integer.parseInt(entry.substring(eq + 1));
+                if (p >= PROFILE_DEFAULT && p <= APP_INVERTED) profiles.put(entry.substring(0, eq), p);
             } catch (NumberFormatException e) {
                 // skip
             }
         }
-        return modes;
+        return profiles;
     }
 
-    static void putAppModes(ContentResolver cr, Map<String, Integer> modes) {
+    static void putAppProfiles(ContentResolver cr, Map<String, Integer> profiles) {
         StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, Integer> e : modes.entrySet()) {
+        for (Map.Entry<String, Integer> e : profiles.entrySet()) {
             if (sb.length() > 0) sb.append(';');
             sb.append(e.getKey()).append('=').append(e.getValue());
         }
-        Settings.System.putString(cr, Keys.EINK_APP_MODES, sb.toString());
+        Settings.System.putString(cr, Keys.EINK_APP_PROFILES, sb.toString());
     }
 
     /** One full GC16 refresh of whatever is on screen now (clears ghosting). */
@@ -135,22 +163,22 @@ final class Eink {
         requestRepaint();
     }
 
-    static void setAntiFlicker(boolean enabled) {
-        SystemProperties.set(PROP_ANTI_FLICKER, enabled ? "1" : "0");
-    }
-
     /**
-     * Text contrast: SurfaceFlinger's e-ink render pass uses the bleach/crush properties (and the
-     * legacy enhancement pass uses contrast_black/white), applied on the GPU after stroke
-     * sharpening. Level 0 turns it off. Does not touch SurfaceFlinger's colour matrix, so
-     * Android's own colour transforms (colour correction, inversion) stay intact.
+     * Everything that used to be a switch, set the one way that works: the kernel's cleanup and
+     * anti-flicker on, FAST while the screen moves and while the keyboard is up, greys in FAST,
+     * and the 1-bit passes' black and white levels. Doesn't touch SurfaceFlinger's colour
+     * matrix, so Android's own colour transforms (colour correction, inversion) stay intact.
      */
-    static void setContrast(int level) {
-        if (level < 0 || level >= CONTRAST_BLACK.length) level = 0;
-        SystemProperties.set(PROP_CONTRAST_BLACK, Integer.toString(CONTRAST_BLACK[level]));
-        SystemProperties.set(PROP_CONTRAST_WHITE, Integer.toString(CONTRAST_WHITE[level]));
-        SystemProperties.set(PROP_BLEACH, Integer.toString(BLEACH[level]));
-        SystemProperties.set(PROP_CRUSH, Integer.toString(CRUSH[level]));
+    static void applyFixedSettings() {
+        SystemProperties.set(PROP_AUTO_CLEAN, "1");
+        SystemProperties.set(PROP_ANTI_FLICKER, "1");
+        SystemProperties.set(PROP_MOTION_FAST, "1");
+        SystemProperties.set(PROP_IME_FAST, "1");
+        SystemProperties.set(PROP_FAST_GREYS, "1");
+        SystemProperties.set(PROP_CONTRAST_BLACK, Integer.toString(CONTRAST_BLACK));
+        SystemProperties.set(PROP_CONTRAST_WHITE, Integer.toString(CONTRAST_WHITE));
+        SystemProperties.set(PROP_BLEACH, Integer.toString(BLEACH));
+        SystemProperties.set(PROP_CRUSH, Integer.toString(CRUSH));
     }
 
     /** SurfaceFlinger's repaint transaction, so the composer commits even on a static screen. */

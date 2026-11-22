@@ -1,4 +1,4 @@
-# VoLTE through MediaTek's IMS service (docs/volte.md).
+# VoLTE through MediaTek's IMS service.
 #
 # The stock vendor declares video calling over LTE and Wi-Fi as supported. Its IMS service then
 # sets up video call providers through MediaTek's vtservice and media libraries, which live on

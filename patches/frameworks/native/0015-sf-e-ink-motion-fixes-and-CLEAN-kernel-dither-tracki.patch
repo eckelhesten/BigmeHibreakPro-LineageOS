@@ -36,7 +36,7 @@ index d1368b0..1111111 100644
      static std::mutex sMutex;
      static uint32_t sSerial = 0xffffffffu;
      static EinkEnhance sConfig;
-+    // Mirror the kernel's g_last_dither_type (docs/wip/kernel-dither.md): 3 (1-bit Atkinson Y1)
++    // Mirror the kernel's g_last_dither_type (docs/lessons-learned.md): 3 (1-bit Atkinson Y1)
 +    // after NORMAL/FAST/HYPER, 4 (16-level Atkinson Y4) after HD/GL16. CLEAN/GC16 (0xb0/0x04)
 +    // inherits g_last_dither_type when kernel dither is on.
 +    static uint32_t sLastKernelDither = 3u;

@@ -20,6 +20,7 @@ chmod +x "$stage/flash.sh"
 (cd "$stage" && sha boot.img dtbo.img vbmeta.img vbmeta_system.img system.img system_ext.img product.img > SHA256SUMS)
 rm -f "$OUT/$name.zip"
 (cd "$OUT/stage" && zip -q -6 -r "$OUT/$name.zip" "$name")
-size=$(stat -f %z "$OUT/$name.zip" 2>/dev/null || stat -c %s "$OUT/$name.zip")
+# wc -c, not stat: GNU `stat -f` is filesystem status (exit 0, no size), BSD has no `stat -c`.
+size=$(wc -c < "$OUT/$name.zip" | tr -d ' ')
 [ "$size" -lt 2147483648 ] || { echo "$name.zip is $size bytes: over GitHub's 2 GiB limit"; exit 1; }
 (cd "$OUT" && sha "$name.zip")

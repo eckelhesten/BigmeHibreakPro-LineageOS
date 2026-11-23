@@ -4,7 +4,7 @@
 
 Clean Android without Bigme's bloatware and questionable software, with a custom e-ink stack made for this screen:
 
-- Google Play (MindTheGapps), microG, or vanilla (no Google).
+- Google Play, microG, or vanilla (no Google).
 - Two e-ink profiles: **Default** for everyday use and **Reading** for books. E-reader apps switch to Reading automatically.
 - Front light with warmth and auto-brightness, sleep screen (clock, optional weather, next calendar event), Quick Settings tiles, and remappable side keys.
 
@@ -12,7 +12,7 @@ Clean Android without Bigme's bloatware and questionable software, with a custom
 
 ## Flavours
 
-- **gapps** (recommended for most users): MindTheGapps (Google Play Store and Google apps).
+- **gapps** (recommended for most users): Google Play Store and Google apps and services.
 - **microG**: Official microG Services & Companion. Most apps work without a Google account.
 - **vanilla**: No Google services at all.
 

@@ -124,10 +124,15 @@ PRODUCT_COPY_FILES += \
     $(DEVICE_PATH)/configs/sysconfig/com.mediatek.ims.config.xml:$(TARGET_COPY_OUT_SYSTEM_EXT)/etc/sysconfig/com.mediatek.ims.config.xml \
     $(DEVICE_PATH)/rootdir/etc/init.hibreakpro.ims.rc:$(TARGET_COPY_OUT_SYSTEM_EXT)/etc/init/init.hibreakpro.ims.rc
 
-# Fastbootd (userspace fastboot for flashing logical partitions)
+# Fastbootd (userspace fastboot for flashing logical partitions) and recovery boot-control HAL
 PRODUCT_PACKAGES += \
     fastbootd \
-    android.hardware.fastboot@1.1-impl-mock
+    android.hardware.fastboot@1.1-impl-mock \
+    android.hardware.boot@1.2-impl.recovery
+
+# Offline charging (on charger / KPOC): AOSP charger handles Power-key boot while plugged in
+PRODUCT_COPY_FILES += \
+    $(DEVICE_PATH)/rootdir/etc/init.hibreakpro.charger.rc:$(TARGET_COPY_OUT_SYSTEM_EXT)/etc/init/init.hibreakpro.charger.rc
 
 # fstab: first-stage mount. With recovery-as-boot (boot v2) boot.img carries the RECOVERY ramdisk,
 # and first-stage init reads /first_stage_ramdisk/fstab.<hw> when androidboot.force_normal_boot=1.

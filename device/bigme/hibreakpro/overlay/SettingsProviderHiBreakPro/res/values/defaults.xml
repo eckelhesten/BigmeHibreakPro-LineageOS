@@ -4,4 +4,8 @@
     <!-- Auto front light on: HiBreakParts' FrontLightController gives more light the darker the
          room and none in daylight, around the level the slider sets. -->
     <bool name="def_screen_brightness_automatic_mode">true</bool>
+
+    <!-- E-ink: 1.3x font scale at native 300 dpi is the most readable default on the 6.13" panel.
+         Users can still adjust it in Display size and text; "Reset settings" returns here. -->
+    <item name="def_device_font_scale" format="float" type="dimen">1.3</item>
 </resources>

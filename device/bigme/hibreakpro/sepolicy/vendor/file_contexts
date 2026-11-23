@@ -1,0 +1,12 @@
+# Block device labels for recovery and fastbootd (normal Android boot uses
+# the prebuilt stock vendor.img's /vendor/etc/selinux/vendor_file_contexts).
+/dev/block/by-name/boot(_[ab])?         u:object_r:boot_block_device:s0
+/dev/block/by-name/dtbo(_[ab])?         u:object_r:dtbo_block_device:s0
+/dev/block/by-name/system(_[ab])?       u:object_r:system_block_device:s0
+/dev/block/by-name/super                u:object_r:super_block_device:s0
+/dev/block/by-name/misc                 u:object_r:misc_block_device:s0
+/dev/block/by-name/metadata             u:object_r:metadata_block_device:s0
+/dev/block/by-name/userdata             u:object_r:userdata_block_device:s0
+/dev/block/by-name/cache                u:object_r:cache_block_device:s0
+/dev/block/by-name/recovery             u:object_r:recovery_block_device:s0
+/dev/block/by-name/frp                  u:object_r:frp_block_device:s0

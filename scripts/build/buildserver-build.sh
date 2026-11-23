@@ -69,6 +69,8 @@ if [ -d "$OUT" ] && [ "$last" != "$HIBREAK_FLAVOR" ]; then
   m installclean || { echo "BUILD_RESULT=installclean-failed"; exit 1; }
 fi
 mkdir -p "$OUT" && echo "$HIBREAK_FLAVOR" > "$stamp"
+# Drop stale dated OTA zip hardlinks from earlier days so ls -t picks today's filename.
+rm -f "$OUT"/lineage-*-UNOFFICIAL-"$HIBREAK_FLAVOR"-hibreakpro.zip
 start=$(date +%s)
 m -j"$(nproc)" "${TARGETS[@]}"
 rc=$?

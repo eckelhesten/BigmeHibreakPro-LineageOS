@@ -8,33 +8,43 @@ Before you start:
      Then run:   adb reboot bootloader
                  fastboot flashing unlock
      and confirm with Volume Up. This wipes the phone too.
-  2. Set Android up again (skip everything), turn on USB debugging, and connect the phone.
-  3. The phone must run stock firmware Bigme_HiBreak_EEA_V1.0_20260312 on slot A. Check with:
-                 adb shell getprop ro.boot.slot_suffix      (must print _a)
+  2. Set Android up again (skip everything), turn on USB debugging, and connect the phone
+     using a known-good USB cable directly to a rear port on your computer (avoid hubs/front ports).
+  3. The phone must be the black-and-white EEA HiBreak Pro running stock firmware
+     Bigme_HiBreak_EEA_V1.0_20260312 (either slot A or slot B works).
   4. Install the Android platform tools (adb, fastboot).
 
 Install, on macOS or Linux:
   bash flash.sh
 
-  The script checks the images and the phone, asks you to type YES, flashes, wipes and reboots.
-  If a step fails, it stops and leaves the phone in fastboot. Run it again, or do the steps by
-  hand.
+Install, on Windows (PowerShell):
+  powershell -ExecutionPolicy Bypass -File .\flash.ps1
 
-Install by hand (Windows or anywhere), from this folder:
-  adb reboot fastboot
-  fastboot flash system system.img
-  fastboot flash system_ext system_ext.img
-  fastboot flash product product.img
+  Both scripts verify checksums, device/vendor version, and unlocked state, ask you to type YES,
+  flash LineageOS recovery + all partitions onto your active slot, wipe data/metadata, and reboot.
+  If a step fails, DO NOT REBOOT - fix the cable/port and re-run the script to resume safely from
+  fastboot.
+
+Install by hand (if you prefer not to use the scripts; replace <slot> with a or b from
+`adb shell getprop ro.boot.slot_suffix`, and NEVER run `fastboot --set-active`):
+  adb reboot bootloader
+  fastboot flash boot_<slot> boot.img
+  fastboot reboot fastboot
+  fastboot snapshot-update cancel           # ignore error if no update is in progress
+  fastboot flash system_<slot> system.img
+  fastboot flash system_ext_<slot> system_ext.img
+  fastboot flash product_<slot> product.img
   fastboot reboot bootloader
-  fastboot flash boot_a boot.img
-  fastboot flash dtbo_a dtbo.img
-  fastboot flash vbmeta_a vbmeta.img
-  fastboot flash vbmeta_system_a vbmeta_system.img
+  fastboot flash boot_<slot> boot.img
+  fastboot flash dtbo_<slot> dtbo.img
+  fastboot flash vbmeta_<slot> vbmeta.img
+  fastboot flash vbmeta_system_<slot> vbmeta_system.img
+  fastboot flash vbmeta_vendor_<slot> vbmeta_vendor.img
   fastboot -w
   fastboot format:ext4 metadata
   fastboot reboot
 
 The first boot takes a few minutes.
 
-More, including the e-ink modes FAQ:
+More, including the e-ink profiles FAQ:
   https://github.com/eckelhesten/BigmeHibreakPro-LineageOS

@@ -131,6 +131,10 @@ DEVICE_FRAMEWORK_COMPATIBILITY_MATRIX_FILE += $(DEVICE_PATH)/configs/vintf/frame
 
 # SELinux: XRZ e-ink types the stock vendor policy expects (sepolicy/private/xrz.te)
 SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy/private
+# Recovery block-device file_contexts (normal Android boot uses prebuilt stock vendor.img's own
+# vendor_file_contexts; without this, recovery/root/vendor_file_contexts lacks /dev/block/by-name/*
+# labels and enforcing SELinux blocks fastbootd from seeing super/misc/boot/metadata/userdata).
+BOARD_VENDOR_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy/vendor
 # Debug builds only: bring-up log collector policy (never on user builds)
 ifneq (,$(filter eng userdebug,$(TARGET_BUILD_VARIANT)))
 SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy/debug

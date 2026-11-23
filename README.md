@@ -4,7 +4,7 @@
 
 Clean Android without Bigme's bloatware and questionable software, with a custom e-ink stack made for this screen:
 
-- microG, vanilla (no Google), or Google Play (MindTheGapps).
+- Google Play (MindTheGapps), microG, or vanilla (no Google).
 - Two e-ink profiles: **Default** for everyday use and **Reading** for books. E-reader apps switch to Reading automatically.
 - Front light with warmth and auto-brightness, sleep screen (clock, optional weather, next calendar event), Quick Settings tiles, and remappable side keys.
 
@@ -12,9 +12,9 @@ Clean Android without Bigme's bloatware and questionable software, with a custom
 
 ## Flavours
 
-- **microG** (recommended): Official microG Services & Companion. Most apps work without a Google account.
+- **gapps** (recommended for most users): MindTheGapps (Google Play Store and Google apps).
+- **microG**: Official microG Services & Companion. Most apps work without a Google account.
 - **vanilla**: No Google services at all.
-- **gapps**: MindTheGapps (Google Play Store and Google apps).
 
 Switching flavours later requires a wipe.
 
@@ -74,9 +74,9 @@ E-reader apps switch to Reading automatically. You can also toggle it from Quick
 
 ## Keep in Mind
 
-- Banking and ID apps may not work if they block custom ROMs or unlocked bootloaders.
+- Banking and ID apps may not work if they block unofficial Android builds or unlocked bootloaders.
 - VoLTE has only been tested on one carrier so far. If it does not work on yours, [open an issue](https://github.com/eckelhesten/BigmeHibreakPro-LineageOS/issues) with your carrier's name.
-- The bootloader stays unlocked, so you will see an orange warning on every boot.
+- The bootloader stays unlocked.
 
 ## Building from Source
 

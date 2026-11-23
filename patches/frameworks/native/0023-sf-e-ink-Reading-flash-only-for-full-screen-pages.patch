@@ -1,0 +1,289 @@
+From 9fb42bbf736b7b926a5dbbcb9f3782082ed7f796 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Mon, 23 Nov 2026 21:21:47 +0000
+Subject: [PATCH] sf: e-ink Reading: flash only for full-screen pages
+
+Reading (CLEAN, GC16) flashed the panel for every change in an
+e-reader's menus, library and settings: a tap highlight, a dialog, a
+spinner, the settle after a scroll. Readers show their pages full
+screen with the status bar hidden, and everything else with it.
+
+- While the status bar or the notification shade is on screen and the
+  mode is a flashing one, the property holds
+  debug.sf.eink_motion.reading_bars_mode (0xb3, Default) in its place:
+  no flash per change.
+- When the bar goes away again (the menu closes), the flashing mode
+  comes back and the page is shown as one clean refresh (the held page
+  turn of 0021).
+- The bar coming up during a held page turn (a tap that opens the
+  menu) releases the hold at once in that mode, without the flash.
+- A FAST settle puts back the mode the bar asks for at that moment.
+- Full-screen page turns are unchanged.
+
+debug.sf.eink_motion.reading_bars=0 turns it off (the old behaviour).
+
+Change-Id: I8ea9c616357b8238484ab45a223a8f977cc2c8a1
+---
+ .../DisplayHardware/EinkMotion.cpp            | 98 ++++++++++++++++++-
+ .../DisplayHardware/EinkMotion.h              | 18 +++-
+ services/surfaceflinger/SurfaceFlinger.cpp    |  9 +-
+ 3 files changed, 119 insertions(+), 6 deletions(-)
+
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index 2d9ddd6..1b1a89d 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -109,6 +109,9 @@ void EinkMotion::reloadConfigIfChanged() {
+             ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.clean_hold_ms", 600));
+     c.cleanQuiet =
+             ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.clean_quiet_ms", 100));
++    c.readingBars = base::GetBoolProperty("debug.sf.eink_motion.reading_bars", true);
++    c.barsMode = base::GetUintProperty<uint32_t>("debug.sf.eink_motion.reading_bars_mode", 0xb3);
++    if (isFlashing(c.barsMode)) c.readingBars = false;
+     c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true);
+     c.asleep = base::GetBoolProperty("vendor.xrz.hibreak_sleep", false);
+     c.sleepMode = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.mode", 0xb2);
+@@ -161,9 +164,38 @@ bool EinkMotion::isFlashing(uint32_t mode) {
+     return m == 0xb0 || m == 0x04;
+ }
+ 
++void EinkMotion::startBars(uint32_t base) {
++    // An e-reader's menu, library or settings (the status bar is on screen): drawn like any other
++    // app, without a flash per change. The flashing mode comes back with the next full-screen page.
++    mBarsBase = base;
++    mBarsActive = true;
++    writeMode(mConfig.barsMode);
++}
++
++void EinkMotion::endBars() {
++    // Put the flashing mode back, unless someone else changed the mode meanwhile.
++    if (mBarsActive && readMode() == mConfig.barsMode && modeSerial() == mWrittenSerial) {
++        writeMode(mBarsBase);
++    }
++    mBarsActive = false;
++}
++
++void EinkMotion::settleBars() {
++    // The motion ended (mBase is about to be put back): in the mode the status bar asks for now.
++    if (mBarsActive && mBase == mConfig.barsMode && !(mConfig.readingBars && mBarsVisible)) {
++        mBase = mBarsBase; // back to a full-screen page: it settles clean
++        mBarsActive = false;
++    } else if (!mBarsActive && mConfig.readingBars && mBarsVisible && isFlashing(mBase)) {
++        mBarsBase = mBase;
++        mBarsActive = true;
++        mBase = mConfig.barsMode;
++    }
++}
++
+ void EinkMotion::beginTurnHold(uint32_t turnBase, nsecs_t now) {
+     // The composer presents the frames but leaves the panel alone until the thread lets it go.
+     mTurnBase = turnBase;
++    mTurnToBars = false;
+     mFrozen = true;
+     mFreezeForTurn = true;
+     mFreezeForSleep = false;
+@@ -220,10 +252,11 @@ void EinkMotion::applySleepMode() {
+     mSleepModeSet = true;
+ }
+ 
+-void EinkMotion::onComposite(bool imeVisible, float damage) {
++void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+     std::lock_guard lock(mMutex);
+     reloadConfigIfChanged();
+     const nsecs_t now = systemTime();
++    mBarsVisible = barsVisible;
+     if (!mConfig.sleep && mAsleep) {
+         if (mFrozen) {
+             base::SetProperty(kDisableCommitProperty, "0");
+@@ -235,7 +268,17 @@ void EinkMotion::onComposite(bool imeVisible, float damage) {
+         mSleepModeSet = false;
+         mAsleep = false;
+     }
+-    if (mConfig.sleep && mConfig.asleep != mAsleep) beginSleepTransition(mConfig.asleep, now);
++    if (mConfig.sleep && mConfig.asleep != mAsleep) {
++        // The mode to come back to is the flashing one, not ours for the status bar (the lock
++        // screen shows it too).
++        if (mFast && mBarsActive && mBase == mConfig.barsMode) {
++            mBase = mBarsBase;
++            mBarsActive = false;
++        } else if (!mFrozen && !mFast) {
++            endBars();
++        }
++        beginSleepTransition(mConfig.asleep, now);
++    }
+     if (mSettleArmed != 0 && now - mSettleArmed > ms2ns(500)) {
+         // The settle one-shot has gone out with the repaint; nothing else may inherit it.
+         base::SetProperty(kForceModeProperty, "-1");
+@@ -267,6 +310,9 @@ void EinkMotion::onComposite(bool imeVisible, float damage) {
+         if (mFreezeForTurn && (mConfig.touchDown || (mConfig.ime && imeVisible))) {
+             mFreezeStart = now - mConfig.cleanHold;
+         }
++        // The status bar came up during the hold (a tap that opens the reader's menu, not a page
++        // turn): show it at once, without the flash.
++        if (mFreezeForTurn && mConfig.readingBars && barsVisible) mTurnToBars = true;
+         // The thread lets the panel go once the frames stop.
+         mCondition.notify_one();
+         return;
+@@ -286,7 +332,7 @@ void EinkMotion::onComposite(bool imeVisible, float damage) {
+             (mConfig.ime && imeVisible);
+     const bool touchFast = mConfig.touchDown && !mTouchHoldExpired;
+     const bool wantFast = motionFast || touchFast;
+-    const uint32_t current = readMode();
++    uint32_t current = readMode();
+     // Occasional frames under a resting finger (a cursor blink) don't extend the fast mode;
+     // the touch hold in the thread does that, for a bounded time.
+     if (motionFast || (mFast && inCadence && counts) || (touchFast && touchCadence)) {
+@@ -297,6 +343,30 @@ void EinkMotion::onComposite(bool imeVisible, float damage) {
+         // the mode to go back to.
+         mBase = current;
+         mFast = false;
++        mBarsActive = false;
++    }
++    if (!mFast && mBarsActive &&
++        (current != mConfig.barsMode || modeSerial() != mWrittenSerial)) {
++        mBarsActive = false; // someone else changed the mode (another app came to the front)
++    }
++    // Clear (Reading) shows pages: readers hide the status bar for them. With the status bar on
++    // screen (the reader's menu, library or settings, the notification shade) every change used
++    // to flash the panel; it is drawn in barsMode instead. When the status bar goes away again
++    // (the menu closes), the page comes back in one clean refresh.
++    if (!mFast) {
++        const bool wantBars = mConfig.readingBars && barsVisible;
++        if (mBarsActive && !wantBars) {
++            endBars();
++            current = readMode();
++            if (isFlashing(current) && !touchFast && !(mConfig.ime && imeVisible) &&
++                mConfig.cleanHold > 0 && mConfig.sleep) {
++                beginTurnHold(current, now);
++                return;
++            }
++        } else if (!mBarsActive && wantBars && isFlashing(current)) {
++            startBars(current);
++            current = mConfig.barsMode;
++        }
+     }
+     // Clear: new content is held from its first frame on and shown in one clean refresh once
+     // its frames stop (a page turn: one GC16 of the new page). From the first frame: the composer
+@@ -328,6 +398,27 @@ void EinkMotion::threadLoop() {
+             const nsecs_t now = systemTime();
+             const nsecs_t quietAt = mLastFrame + mConfig.cleanQuiet;
+             const nsecs_t due = std::min(quietAt, mFreezeStart + mConfig.cleanHold);
++            if (mTurnToBars) {
++                // Not a page turn: the reader's menu. Shown at once in barsMode, no flash.
++                mTurnToBars = false;
++                mFrozen = false;
++                mFreezeForTurn = false;
++                startBars(mTurnBase);
++                base::SetProperty(kForceModeProperty, std::to_string(mConfig.barsMode));
++                mStreak = 0;
++                mLastMotionFrame = 0;
++                mSettleArmed = now;
++                mTurnReleased = now;
++                base::SetProperty(kDisableCommitProperty, "0");
++                ALOGI("page turn held %d ms: status bar, shown without a flash",
++                      static_cast<int>(ns2ms(now - mFreezeStart)));
++                mLastFrame = 0; // the repaint must not count as motion
++                const auto repaint = mRepaint;
++                lock.unlock();
++                if (repaint) repaint();
++                lock.lock();
++                continue;
++            }
+             if (now < due) {
+                 mCondition.wait_for(lock, std::chrono::nanoseconds(due - now));
+                 continue;
+@@ -445,6 +536,7 @@ void EinkMotion::threadLoop() {
+         // that mode (otherwise the panel keeps the last FAST frame until the composer's own idle
+         // refresh ~0.6 s later).
+         if (readMode() == mWritten && modeSerial() == mWrittenSerial) {
++            settleBars();
+             writeMode(mBase);
+             if (mConfig.settleForce) {
+                 base::SetProperty(kForceModeProperty, std::to_string(mBase != 0 ? mBase : 0xb2));
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index b411a56..5146d02 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -52,8 +52,9 @@ public:
+     void setRepaint(std::function<void()> repaint);
+ 
+     // Called on the main thread for every composite, before it is presented. damage: the share
+-    // of the screen that layers with a new buffer cover in this frame (0..1).
+-    void onComposite(bool imeVisible, float damage = 1.f);
++    // of the screen that layers with a new buffer cover in this frame (0..1). barsVisible: the
++    // status bar is on screen (an app showing a page full screen hides it).
++    void onComposite(bool imeVisible, float damage = 1.f, bool barsVisible = false);
+ 
+ private:
+     EinkMotion() = default;
+@@ -93,6 +94,11 @@ private:
+         // on for longer than the hold goes FAST.
+         nsecs_t cleanHold = 0;
+         nsecs_t cleanQuiet = 0;  // debug.sf.eink_motion.clean_quiet_ms
++        // Clear only for pages: while the status bar is on screen (an e-reader's menu, library or
++        // settings, the notification shade), barsMode instead, which doesn't flash; readers show
++        // their pages full screen (debug.sf.eink_motion.reading_bars, .reading_bars_mode).
++        bool readingBars = true;
++        uint32_t barsMode = 0xb3;
+ 
+         // Sleep screen (see the class comment). vendor.xrz.hibreak_sleep is set by
+         // system_server; the rest are debug.sf.eink_sleep.* for tuning without a build.
+@@ -120,6 +126,9 @@ private:
+     void threadLoop();
+     void beginSleepTransition(bool asleep, nsecs_t now);
+     void applySleepMode();
++    void startBars(uint32_t base);
++    void endBars();
++    void settleBars();
+ 
+     std::mutex mMutex;
+     std::condition_variable mCondition;
+@@ -159,6 +168,11 @@ private:
+     uint32_t mSleepWritten = 0;
+     uint32_t mSleepWrittenSerial = 0;
+     bool mForceArmed = false;     // the one-shot for the first picture after the hold is set
++
++    bool mBarsVisible = false;    // the status bar was on screen in the last composite
++    bool mBarsActive = false;     // the property holds barsMode in place of the flashing mode
++    uint32_t mBarsBase = 0;       // the flashing mode it stands in for
++    bool mTurnToBars = false;     // the status bar came up during a held page turn
+ };
+ 
+ } // namespace android
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 6bb34cb..2e4cad1 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3258,13 +3258,20 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         // And how much of the screen changed: the screen area of the damage of layers with a new
+         // buffer (their whole bounds when the damage is unknown), against the largest visible
+         // layer (the screen, for the app or wallpaper behind).
++        // And whether the status bar or the notification shade is on screen (an e-reader shows
++        // its pages full screen, its menus, library and settings with the status bar).
+         bool imeVisible = false;
++        bool barsVisible = false;
+         float changed = 0.f;
+         float screen = 1.f;
+         for (const auto& [layer, layerFE] : layers) {
+             const auto& snapshot = layerFE->mSnapshot;
+             if (!snapshot || !snapshot->isVisible) continue;
+             if (snapshot->name.find("InputMethod#") != std::string::npos) imeVisible = true;
++            if (snapshot->name.find("StatusBar#") != std::string::npos ||
++                snapshot->name.find("NotificationShade#") != std::string::npos) {
++                barsVisible = true;
++            }
+             const FloatRect bounds = snapshot->transformedBounds;
+             if (bounds.isEmpty()) continue;
+             screen = std::max(screen, bounds.getWidth() * bounds.getHeight());
+@@ -3277,7 +3284,7 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+             }
+             if (area.isValid()) changed += area.getWidth() * area.getHeight();
+         }
+-        EinkMotion::get().onComposite(imeVisible, std::min(1.f, changed / screen));
++        EinkMotion::get().onComposite(imeVisible, std::min(1.f, changed / screen), barsVisible);
+     }
+ 
+     mCompositionEngine->present(mainThreadRefreshArgs);
+-- 
+2.43.0
+

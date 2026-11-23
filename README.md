@@ -7,7 +7,6 @@ Clean Android without Bigme's bloatware and questionable software, with a custom
 - microG, vanilla (no Google), or Google Play (MindTheGapps).
 - Two e-ink profiles: **Default** for everyday use and **Reading** for books. E-reader apps switch to Reading automatically.
 - Front light with warmth and auto-brightness, sleep screen (clock, optional weather, next calendar event), Quick Settings tiles, and remappable side keys.
-- A/B updates in Settings, with automatic rollback if an update fails to boot.
 
 *Disclaimer: Flash at your own risk. Installing this wipes your phone. I am not responsible if you brick your device or if it causes thermonuclear war.*
 
@@ -71,7 +70,7 @@ There are two profiles:
 - **Default**: Fast refresh for everyday use (scrolling, browsing, typing, maps, video).
 - **Reading**: Cleaner, sharper pages for books, comics, and long articles.
 
-E-reader apps switch to Reading automatically. You can also toggle it from Quick Settings, a side key, or **Settings > E-ink & front light** (where you can set per-app profiles or invert colours for dark apps). If you see ghosting, hit the **Refresh screen** Quick Settings tile or bind it to a side key.
+E-reader apps switch to Reading automatically. You can also toggle it from Quick Settings, a side key, or **Settings > E-ink & front light** (where you can set per-app profiles or invert colours for dark apps).
 
 ## Keep in Mind
 

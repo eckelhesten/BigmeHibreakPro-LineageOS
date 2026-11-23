@@ -17,7 +17,6 @@ public class EinkRefreshTile extends TileService {
     private final Runnable mRefresh = () -> {
         PowerManager pm = getSystemService(PowerManager.class);
         if (pm != null && !pm.isInteractive()) return;
-        EinkPolicy.onManualRefresh();
         Eink.fullRefresh();
     };
 

@@ -31,10 +31,6 @@ final class Keys {
     // 1 Clear, 2 Balanced, 3 Fast) and per-app modes (same, 4 = inverted).
     static final String LEGACY_EINK_MODE = PREFIX + "eink_mode";
     static final String LEGACY_EINK_APP_MODES = PREFIX + "eink_app_modes";
-    // Automatic full (GC16) refresh against ghosting: -1 only when asked, 0 after unlocking,
-    // N > 0 after unlocking and after every Nth app switch. Default DEFAULT_CLEAN. Not in the UI
-    // (the bench turns it off with -1).
-    static final String EINK_CLEAN = PREFIX + "eink_clean";
     // Written by the shell or the bench (any new value): one full refresh now.
     static final String EINK_REFRESH_REQUEST = PREFIX + "eink_refresh";
     static final String KEY_F1 = PREFIX + "key_f1";                         // action, see KeyHandler
@@ -56,7 +52,6 @@ final class Keys {
     // surfaces like WhatsApp's #EFEAE2 chat background and cards clearly separated from white,
     // without crushing dark tones), for every temperature until a warm band is measured.
     static final String DEFAULT_FAST_MAPS = "100:0,2,3,5,6,6,7,8,9,9,10,10,11,11,12,15:135";
-    static final int DEFAULT_CLEAN = 4;
     static final String DEFAULT_KEY_F1 = "eink_refresh";
     static final String DEFAULT_KEY_F2 = "eink_mode";
 

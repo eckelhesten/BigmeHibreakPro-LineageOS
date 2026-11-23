@@ -27,14 +27,12 @@ import java.util.Objects;
 /**
  * Applies the e-ink profile to the composer: the global profile (Default or Reading), overridden
  * per app while that app's task is in front, and the fixed settings (Eink.applyFixedSettings)
- * that used to be switches. Also clears
- * ghosting with a full refresh after unlocking and every Nth app switch (Keys.EINK_CLEAN):
- * measured on camera (scripts/eink-bench/ghost.py, 2026-11-20), white areas got 70 % darker
- * over seven app switches without one, and a full refresh brought them back to clean.
+ * that used to be switches. Full refreshes happen only when asked (Refresh tile, side key,
+ * Keys.EINK_REFRESH_REQUEST), never automatically: the owner wants no unasked flashes (2026-11-23),
+ * although white areas get darker over app switches without one (scripts/eink-bench/ghost.py).
  */
 class EinkPolicy {
     private static final String TAG = "HiBreakEinkPolicy";
-    private static volatile EinkPolicy sInstance;
 
     private final Context mContext;
     private final ContentResolver mResolver;
@@ -50,35 +48,14 @@ class EinkPolicy {
     private String mAppliedFastBand;
     private String mCachedAppProfilesRaw;
     private Map<String, Integer> mAppProfiles = Collections.emptyMap();
-    private int mSwitches;
-    /** After a switch the new app draws for a while; refresh once it has settled. */
-    private static final long CLEAN_AFTER_SWITCH_MS = 900;
-    private static final long CLEAN_AFTER_UNLOCK_MS = 900;
     private final Runnable mUpdateTop = this::updateTopPackage;
-    private final Runnable mClean = () -> {
-        if (mPowerManager != null && !mPowerManager.isInteractive()) return;
-        mSwitches = 0;
-        Eink.fullRefresh();
-    };
 
     EinkPolicy(Context context) {
         mContext = context;
         mResolver = context.getContentResolver();
     }
 
-    /** Cancels any pending scheduled clean and resets the app-switch counter after a manual flash. */
-    static void onManualRefresh() {
-        EinkPolicy p = sInstance;
-        if (p != null) {
-            p.mHandler.post(() -> {
-                p.mHandler.removeCallbacks(p.mClean);
-                p.mSwitches = 0;
-            });
-        }
-    }
-
     void start() {
-        sInstance = this;
         mPowerManager = mContext.getSystemService(PowerManager.class);
         mKeyguardManager = mContext.getSystemService(KeyguardManager.class);
         ContentObserver observer = new ContentObserver(mHandler) {
@@ -106,17 +83,12 @@ class EinkPolicy {
                 false, new ContentObserver(mHandler) {
                     @Override
                     public void onChange(boolean selfChange) {
-                        mSwitches = 0;
-                        scheduleClean(0);
+                        if (mPowerManager != null && !mPowerManager.isInteractive()) return;
+                        Eink.fullRefresh();
                     }
                 });
-        // Sleep/wake and unlock:
-        // - Cancel any pending clean timer on sleep so it doesn't flash the sleep screen, and
-        //   re-evaluate per-app inversion so an inverted foreground app (e.g. Clock) never
-        //   inverts the sleep screen or lock screen.
-        // - After waking up, the sleep screen's big clock (and the lock screen) are still in the
-        //   ink. With a lock screen that is after "user present"; without one (no keyguard at all,
-        //   sleep screen to the app and no "user present" is sent, so the screen coming on counts then.
+        // Sleep/wake and unlock: re-evaluate per-app inversion so an inverted foreground app
+        // (e.g. Clock) never inverts the sleep screen or lock screen.
         // Default's greys drift with the panel's temperature (the kernel's synthesised A2 table
         // is the same from 12 deg C up, the panel isn't): follow the battery temperature, which
         // is one of the two the kernel picks its waveform by.
@@ -136,35 +108,12 @@ class EinkPolicy {
         mContext.registerReceiver(new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                String action = intent.getAction();
-                if (Intent.ACTION_SCREEN_OFF.equals(action)) {
-                    mHandler.removeCallbacks(mClean);
-                    applyMode();
-                    return;
-                }
                 applyMode();
-                if (cleanEvery() < 0) return;
-                if (Intent.ACTION_SCREEN_ON.equals(action)) {
-                    if (mKeyguardManager == null || mKeyguardManager.isKeyguardLocked()) {
-                        return; // wait for user present
-                    }
-                }
-                mSwitches = 0;
-                scheduleClean(CLEAN_AFTER_UNLOCK_MS);
             }
         }, power, Context.RECEIVER_NOT_EXPORTED);
         Eink.applyFixedSettings();
         updateTopPackage();
         applyAll();
-    }
-
-    private int cleanEvery() {
-        return Settings.System.getInt(mResolver, Keys.EINK_CLEAN, Keys.DEFAULT_CLEAN);
-    }
-
-    private void scheduleClean(long delayMs) {
-        mHandler.removeCallbacks(mClean);
-        mHandler.postDelayed(mClean, delayMs);
     }
 
     private void updateTopPackage() {
@@ -179,15 +128,8 @@ class EinkPolicy {
             return;
         }
         if (!Objects.equals(pkg, mTopPackage)) {
-            boolean switched = mTopPackage != null && pkg != null;
             mTopPackage = pkg;
             applyMode();
-            int every = cleanEvery();
-            boolean interactive = mPowerManager == null || mPowerManager.isInteractive();
-            if (switched && interactive && every > 0 && ++mSwitches >= every) {
-                mSwitches = 0;
-                scheduleClean(CLEAN_AFTER_SWITCH_MS);
-            }
         }
     }
 

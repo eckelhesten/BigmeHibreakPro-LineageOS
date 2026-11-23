@@ -87,7 +87,7 @@ final class Defaults {
                 Settings.Global.putFloat(cr, Settings.Global.ANIMATOR_DURATION_SCALE, 1f);
                 Settings.Global.putFloat(cr, Settings.Global.WINDOW_ANIMATION_SCALE, 1f);
                 Settings.Global.putFloat(cr, Settings.Global.TRANSITION_ANIMATION_SCALE, 1f);
-                Settings.System.putFloat(cr, Settings.System.FONT_SCALE, 1.15f);
+                // Font scale: SettingsProviderHiBreakPro's def_device_font_scale (1.3) applies.
                 Settings.Secure.putFloat(cr, CONTRAST_SETTING, 1f);
                 Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE,
                         Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC);

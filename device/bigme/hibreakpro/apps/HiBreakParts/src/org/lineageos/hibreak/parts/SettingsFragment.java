@@ -50,7 +50,6 @@ public class SettingsFragment extends PreferenceFragmentCompat {
         Preference refresh = findPreference("eink_refresh_now");
         if (refresh != null) {
             refresh.setOnPreferenceClickListener(p -> {
-                EinkPolicy.onManualRefresh();
                 Eink.fullRefresh();
                 return true;
             });

@@ -13,8 +13,12 @@ final class Keys {
 
     static final String FRONTLIGHT_ENABLED = PREFIX + "frontlight_enabled"; // 1/0, default 1
     static final String FRONTLIGHT_WARMTH = PREFIX + "frontlight_warmth";   // 0..100, default 70
-    // E-ink profile: 0 Default (fast, everyday), 1 Reading (clean refreshes). Default 0.
+    // E-ink profile: 0 Default (fast, everyday), 1 Reading (a clean GC16 per page). Default 0.
     static final String EINK_PROFILE = PREFIX + "eink_profile";
+    // Tuning only: Reading's composer mode while unset or invalid is Eink.READING_MODE (HD,
+    // 0xB1, pages in GC16 by SurfaceFlinger). 176 (0xB0, CLEAN) makes every update a GC16 again
+    // (up to 1.0.3); delete it afterwards.
+    static final String EINK_READING_MODE = PREFIX + "eink_reading_mode";
     // Per-app profiles "pkg=idx;..." with idx 0 Default, 1 Reading, 2 Default with colours
     // inverted (dark-only apps). Apps without an entry: Reading for known e-readers
     // (Eink.READING_APPS), otherwise the global profile.

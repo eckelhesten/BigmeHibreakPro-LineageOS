@@ -65,7 +65,7 @@ class EinkPolicy {
             }
         };
         for (String key : new String[] {Keys.EINK_PROFILE, Keys.EINK_APP_PROFILES,
-                Keys.EINK_BENCH_MODE, Keys.EINK_FAST_MAPS}) {
+                Keys.EINK_BENCH_MODE, Keys.EINK_FAST_MAPS, Keys.EINK_READING_MODE}) {
             mResolver.registerContentObserver(Settings.System.getUriFor(key), false, observer);
         }
         try {
@@ -173,7 +173,7 @@ class EinkPolicy {
             // happens to be in the foreground.
             invert = false;
         }
-        int value = Eink.modeFor(profile);
+        int value = Eink.modeFor(profile, mResolver);
         int bench = Eink.benchMode(Settings.System.getInt(mResolver, Keys.EINK_BENCH_MODE, -1));
         if (bench >= 0) {
             value = bench;

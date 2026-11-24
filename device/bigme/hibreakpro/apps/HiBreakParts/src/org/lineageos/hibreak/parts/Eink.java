@@ -76,11 +76,19 @@ final class Eink {
     static final int PROFILE_READING = 1;
     static final int APP_INVERTED = 2;
     /** XRZ policy mode per profile, as the stock firmware sets them. Default: FAST (0xB3, A2 with
-     *  the kernel's cleanup) with SurfaceFlinger's greys, ~0.23 s. Reading: CLEAN (0xB0, GC16),
-     *  page turns held into one clean refresh (frameworks/native 0021), ~0.5 s. Policy modes, not
-     *  raw waveform numbers: only with them the composer keeps whole-panel updates, the kernel's
-     *  fast, self-cleaning path. Never write -1 (garbage waveform). */
-    private static final int[] PROFILE_MODE = {0xB3, 0xB0};
+     *  the kernel's cleanup) with SurfaceFlinger's greys, ~0.23 s. Reading: HD (0xB1, 16 greys,
+     *  no flash) for everything on screen, while every page (a held page turn, the page back
+     *  after a menu, the end of a scroll) is shown as one GC16 by SurfaceFlinger
+     *  (frameworks/native 0021, 0024): zero ghosting on pages, ~0.55 s. Until 1.0.3 Reading was
+     *  CLEAN (0xB0) as the mode itself, so everything else flashed too: the composer's idle
+     *  refresh 0.6 s after FAST frames gave a second GC16 of a still page after a menu. Pages in
+     *  HD alone (tried 2026-11-24) left visible ghosts. Policy modes, not raw waveform numbers:
+     *  only with them the composer keeps whole-panel updates, the kernel's fast, self-cleaning
+     *  path. Never write -1 (garbage waveform). */
+    static final int READING_MODE = 0xB1;
+    private static final int[] PROFILE_MODE = {0xB3, READING_MODE};
+    /** Modes Keys.EINK_READING_MODE may choose for Reading: HD or CLEAN. */
+    private static final Set<Integer> READING_MODES = Set.of(0xB1, 0xB0);
     /** The bench's raw mode indexes (Keys.EINK_BENCH_MODE): Normal (DU), Clean, HD, Fast. */
     private static final int[] BENCH_MODE = {0, 0xB0, 0xB1, 0xB3};
     /** E-readers that use Reading unless the user picked something else for them. */
@@ -89,6 +97,7 @@ final class Eink {
             "com.google.android.apps.books",
             "com.kobobooks.android",
             "org.koreader.launcher",
+            "org.koreader.launcher.fdroid",
             "com.overdrive.mobile.android.libby",
             "com.flyersoft.moonreader",
             "org.readera");
@@ -113,6 +122,13 @@ final class Eink {
     /** The composer mode for a profile (or APP_INVERTED, which is Default with inverted colours). */
     static int modeFor(int profile) {
         return PROFILE_MODE[profile == PROFILE_READING ? PROFILE_READING : PROFILE_DEFAULT];
+    }
+
+    /** modeFor, with Reading's mode from Keys.EINK_READING_MODE when that holds a valid one. */
+    static int modeFor(int profile, ContentResolver cr) {
+        if (profile != PROFILE_READING) return modeFor(profile);
+        int mode = Settings.System.getInt(cr, Keys.EINK_READING_MODE, READING_MODE);
+        return READING_MODES.contains(mode) ? mode : READING_MODE;
     }
 
     /** The bench's raw mode for an index, or -1 for none (back to the profiles). */

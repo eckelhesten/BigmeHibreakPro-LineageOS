@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 24 Nov 2026 12:27:15 +0100
+Subject: [PATCH] sf: e-ink Reading: GC16 only for pages, HD for everything
+ else
+
+Reading was CLEAN (0xb0, GC16) as the global mode, and every update
+that wasn't a held page turn went out in it, each a flash (measured
+2026-11-24 with perfetto and the webcam):
+
+- The composer's own idle refresh (onRefresh, ~0.6 s after FAST
+  frames) commits once more in the global mode: closing Kindle's menu
+  was the page's GC16 and then a second one 0.3-0.45 s later.
+- Anything else that isn't a held page turn (a small change, a clock)
+  is a whole-panel flash too.
+
+HiBreakParts now sets HD (0xb1, 16 greys, no flash) as Reading's mode,
+and pages are shown with the one-shot in GC16
+(debug.sf.eink_motion.page_flash, default 0xb0; 0 = in HD): a held page
+turn, the page coming back when the status bar goes away, the end of a
+scroll. Pages keep GC16's zero ghosting (HD pages left ghosts the owner
+saw on the first try); the idle refresh and other leftovers go out in
+HD and don't flash. The page-turn hold (0021) and the status bar's FAST
+(0023) apply to every page mode (isFlashing -> isPageMode).
+
+Change-Id: I5d1c8e7a3b2f4a6c9e0d1b2c3a4f5e6d7c8b9a0e
+---
+ .../DisplayHardware/EinkMotion.cpp            | 79 ++++++++++++-------
+ .../DisplayHardware/EinkMotion.h              | 24 +++---
+ 2 files changed, 63 insertions(+), 40 deletions(-)
+
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index 1b1a89d..caa7e0a 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -103,15 +103,18 @@ void EinkMotion::reloadConfigIfChanged() {
+     c.touchRecent =
+             ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.touch_recent_ms", 2000));
+     c.settleForce = base::GetBoolProperty("debug.sf.eink_motion.settle_force", true);
+-    // Kindle's page turn: ~8 frames in 150-250 ms after the tap. Held, it is one GC16 of the new
+-    // page ~0.4 s after the tap; in FAST it was A2 dots, then the GC16 1.5-2 s after the tap.
++    // Kindle's page turn: ~8 frames in 150-250 ms after the tap. Held, it is one update of the new
++    // page ~0.4 s after the tap; in FAST it was A2 dots, then the page mode 1.5-2 s after the tap.
+     c.cleanHold =
+             ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.clean_hold_ms", 600));
+     c.cleanQuiet =
+             ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.clean_quiet_ms", 100));
++    // The waveform a page is shown in when the page mode itself doesn't clear ghosts (HD): GC16
++    // (CLEAN), so every page of a book starts from a clean panel. 0 = in the page mode.
++    c.pageFlash = base::GetUintProperty<uint32_t>("debug.sf.eink_motion.page_flash", 0xb0);
+     c.readingBars = base::GetBoolProperty("debug.sf.eink_motion.reading_bars", true);
+     c.barsMode = base::GetUintProperty<uint32_t>("debug.sf.eink_motion.reading_bars_mode", 0xb3);
+-    if (isFlashing(c.barsMode)) c.readingBars = false;
++    if (isPageMode(c.barsMode)) c.readingBars = false;
+     c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true);
+     c.asleep = base::GetBoolProperty("vendor.xrz.hibreak_sleep", false);
+     c.sleepMode = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.mode", 0xb2);
+@@ -158,22 +161,35 @@ bool EinkMotion::isFast(uint32_t mode) const {
+     return m == (mConfig.fastMode & 0xff) || m == 0xb3 || m == 0x10 || m == 0x11;
+ }
+ 
+-bool EinkMotion::isFlashing(uint32_t mode) {
+-    // Clear: CLEAN as a policy mode, or GC16 as a raw waveform. Every update flashes the panel.
++bool EinkMotion::isPageMode(uint32_t mode) {
++    // A mode for pages (Reading): HD (0xb1, 16 greys, no flash; Reading since 2026-11-24) or
++    // CLEAN (0xb0, GC16, flashes), as policy modes or raw waveforms (0x21, 0x04). An update takes
++    // ~0.45 s plus the composer's 120 ms window, so a page turn's frames are held and shown as one
++    // update, and menus with the status bar go FAST.
+     const uint32_t m = mode & 0xff;
+-    return m == 0xb0 || m == 0x04;
++    return m == 0xb1 || m == 0x21 || m == 0xb0 || m == 0x04;
++}
++
++uint32_t EinkMotion::pageWaveform(uint32_t mode) const {
++    // A page (a held page turn, the page back after a menu, the end of a scroll) in a page mode:
++    // one GC16, so no ghost of the last page stays. CLEAN is GC16 itself; HD is the mode for
++    // everything else on a page (the composer's idle refresh, a clock, a progress line), which
++    // must not flash.
++    const uint32_t m = mode & 0xff;
++    if (m == 0xb0 || m == 0x04 || mConfig.pageFlash == 0) return mode;
++    return isPageMode(mode) ? mConfig.pageFlash : mode;
+ }
+ 
+ void EinkMotion::startBars(uint32_t base) {
+     // An e-reader's menu, library or settings (the status bar is on screen): drawn like any other
+-    // app, without a flash per change. The flashing mode comes back with the next full-screen page.
++    // app, FAST. The page mode comes back with the next full-screen page.
+     mBarsBase = base;
+     mBarsActive = true;
+     writeMode(mConfig.barsMode);
+ }
+ 
+ void EinkMotion::endBars() {
+-    // Put the flashing mode back, unless someone else changed the mode meanwhile.
++    // Put the page mode back, unless someone else changed the mode meanwhile.
+     if (mBarsActive && readMode() == mConfig.barsMode && modeSerial() == mWrittenSerial) {
+         writeMode(mBarsBase);
+     }
+@@ -185,7 +201,7 @@ void EinkMotion::settleBars() {
+     if (mBarsActive && mBase == mConfig.barsMode && !(mConfig.readingBars && mBarsVisible)) {
+         mBase = mBarsBase; // back to a full-screen page: it settles clean
+         mBarsActive = false;
+-    } else if (!mBarsActive && mConfig.readingBars && mBarsVisible && isFlashing(mBase)) {
++    } else if (!mBarsActive && mConfig.readingBars && mBarsVisible && isPageMode(mBase)) {
+         mBarsBase = mBase;
+         mBarsActive = true;
+         mBase = mConfig.barsMode;
+@@ -269,7 +285,7 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+         mAsleep = false;
+     }
+     if (mConfig.sleep && mConfig.asleep != mAsleep) {
+-        // The mode to come back to is the flashing one, not ours for the status bar (the lock
++        // The mode to come back to is the page mode, not ours for the status bar (the lock
+         // screen shows it too).
+         if (mFast && mBarsActive && mBase == mConfig.barsMode) {
+             mBase = mBarsBase;
+@@ -311,7 +327,7 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+             mFreezeStart = now - mConfig.cleanHold;
+         }
+         // The status bar came up during the hold (a tap that opens the reader's menu, not a page
+-        // turn): show it at once, without the flash.
++        // turn): show it at once, FAST.
+         if (mFreezeForTurn && mConfig.readingBars && barsVisible) mTurnToBars = true;
+         // The thread lets the panel go once the frames stop.
+         mCondition.notify_one();
+@@ -327,7 +343,7 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+     if (mTouchHoldExpired && touchSerial() != mExpiredTouchSerial) mTouchHoldExpired = false;
+     // Only a frame that counts continues a streak: a composite without new content (the
+     // composer's own idle refresh ~0.65 s after the last frame) used to inherit the streak of the
+-    // last motion and held FAST for another end_ms, so Clear's clean refresh came ~1.4 s late.
++    // last motion and held FAST for another end_ms, so Reading's page update came ~1.4 s late.
+     const bool motionFast = (mConfig.motion && counts && mStreak >= mConfig.frames) ||
+             (mConfig.ime && imeVisible);
+     const bool touchFast = mConfig.touchDown && !mTouchHoldExpired;
+@@ -349,32 +365,32 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+         (current != mConfig.barsMode || modeSerial() != mWrittenSerial)) {
+         mBarsActive = false; // someone else changed the mode (another app came to the front)
+     }
+-    // Clear (Reading) shows pages: readers hide the status bar for them. With the status bar on
+-    // screen (the reader's menu, library or settings, the notification shade) every change used
+-    // to flash the panel; it is drawn in barsMode instead. When the status bar goes away again
+-    // (the menu closes), the page comes back in one clean refresh.
++    // Reading shows pages: readers hide the status bar for them. With the status bar on screen
++    // (the reader's menu, library or settings, the notification shade) each change took a page
++    // update (a flash in CLEAN); it is drawn in barsMode instead. When the status bar goes away
++    // again (the menu closes), the page comes back in one update.
+     if (!mFast) {
+         const bool wantBars = mConfig.readingBars && barsVisible;
+         if (mBarsActive && !wantBars) {
+             endBars();
+             current = readMode();
+-            if (isFlashing(current) && !touchFast && !(mConfig.ime && imeVisible) &&
++            if (isPageMode(current) && !touchFast && !(mConfig.ime && imeVisible) &&
+                 mConfig.cleanHold > 0 && mConfig.sleep) {
+                 beginTurnHold(current, now);
+                 return;
+             }
+-        } else if (!mBarsActive && wantBars && isFlashing(current)) {
++        } else if (!mBarsActive && wantBars && isPageMode(current)) {
+             startBars(current);
+             current = mConfig.barsMode;
+         }
+     }
+-    // Clear: new content is held from its first frame on and shown in one clean refresh once
+-    // its frames stop (a page turn: one GC16 of the new page). From the first frame: the composer
+-    // decides about a frame when it arrives, so a hold that began with the third frame still let
+-    // the first go out as a GC16 of its own. Not with a finger down (a drag follows the finger),
++    // Reading: new content is held from its first frame on and shown in one update once its
++    // frames stop (a page turn: one update of the new page in the page mode). From the first
++    // frame: the composer decides about a frame when it arrives, so a hold that began with the
++    // third frame still let the first go out as an update of its own. Not with a finger down (a drag follows the finger),
+     // with the keyboard up, or for the repaint that shows a hold (no new content).
+     if (!mFast && damage > 0.f && counts && !touchFast && !(mConfig.ime && imeVisible) &&
+-        mConfig.cleanHold > 0 && mConfig.sleep && isFlashing(current) &&
++        mConfig.cleanHold > 0 && mConfig.sleep && isPageMode(current) &&
+         now - mTurnReleased > ms2ns(150)) {
+         beginTurnHold(current, now);
+         return;
+@@ -399,7 +415,7 @@ void EinkMotion::threadLoop() {
+             const nsecs_t quietAt = mLastFrame + mConfig.cleanQuiet;
+             const nsecs_t due = std::min(quietAt, mFreezeStart + mConfig.cleanHold);
+             if (mTurnToBars) {
+-                // Not a page turn: the reader's menu. Shown at once in barsMode, no flash.
++                // Not a page turn: the reader's menu. Shown at once in barsMode.
+                 mTurnToBars = false;
+                 mFrozen = false;
+                 mFreezeForTurn = false;
+@@ -410,7 +426,7 @@ void EinkMotion::threadLoop() {
+                 mSettleArmed = now;
+                 mTurnReleased = now;
+                 base::SetProperty(kDisableCommitProperty, "0");
+-                ALOGI("page turn held %d ms: status bar, shown without a flash",
++                ALOGI("page turn held %d ms: status bar, shown fast",
+                       static_cast<int>(ns2ms(now - mFreezeStart)));
+                 mLastFrame = 0; // the repaint must not count as motion
+                 const auto repaint = mRepaint;
+@@ -430,7 +446,7 @@ void EinkMotion::threadLoop() {
+             // the hold goes out with the one-shot, in the mode it is meant for.
+             if (moving) {
+                 // Longer motion (an animated scroll, a finger): FAST from here, then the usual
+-                // settle into Clear.
++                // settle into the page mode.
+                 mBase = mTurnBase;
+                 mWritten = mConfig.fastMode;
+                 writeMode(mWritten);
+@@ -439,15 +455,16 @@ void EinkMotion::threadLoop() {
+                 mTouchHoldSince = 0;
+                 base::SetProperty(kForceModeProperty, std::to_string(mConfig.fastMode));
+             } else {
+-                base::SetProperty(kForceModeProperty, std::to_string(mTurnBase));
++                base::SetProperty(kForceModeProperty, std::to_string(pageWaveform(mTurnBase)));
+                 mStreak = 0;
+                 mLastMotionFrame = 0;
+             }
+             mSettleArmed = now;
+             mTurnReleased = now;
+             base::SetProperty(kDisableCommitProperty, "0");
+-            ALOGI("page turn held %d ms: %s", static_cast<int>(ns2ms(now - mFreezeStart)),
+-                  moving ? "still moving, fast" : "shown clean");
++            ALOGI("page turn held %d ms: %s 0x%x", static_cast<int>(ns2ms(now - mFreezeStart)),
++                  moving ? "still moving, fast, then" : "shown in",
++                  moving ? mTurnBase : pageWaveform(mTurnBase));
+             mLastFrame = 0; // the repaint must not count as motion
+             const auto repaint = mRepaint;
+             lock.unlock();
+@@ -539,7 +556,9 @@ void EinkMotion::threadLoop() {
+             settleBars();
+             writeMode(mBase);
+             if (mConfig.settleForce) {
+-                base::SetProperty(kForceModeProperty, std::to_string(mBase != 0 ? mBase : 0xb2));
++                // A page mode's settle (the end of a scroll in a reader) is a page.
++                base::SetProperty(kForceModeProperty,
++                                  std::to_string(mBase != 0 ? pageWaveform(mBase) : 0xb2));
+                 mSettleArmed = now;
+             }
+         }
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index 5146d02..9ee4325 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -87,18 +87,21 @@ private:
+         // (debug.sf.eink_motion.settle_force): the composer skips a repaint without new buffers,
+         // so without it the panel kept the last FAST frame until its own idle refresh.
+         bool settleForce = true;
+-        // Clear (GC16, flashing): new content without a finger on the screen (a page turn) is
+-        // held back from its first frame and shown as one clean refresh once its frames stop for
+-        // cleanQuiet, instead of FAST frames and a clean refresh 0.7 s later
++        // A page mode (Reading: HD; CLEAN): new content without a finger on the screen (a page
++        // turn) is held back from its first frame and shown as one update once its frames stop
++        // for cleanQuiet, instead of FAST frames and a page update 0.7 s later
+         // (debug.sf.eink_motion.clean_hold_ms, 0 = FAST as in the other modes). Motion that goes
+         // on for longer than the hold goes FAST.
+         nsecs_t cleanHold = 0;
+         nsecs_t cleanQuiet = 0;  // debug.sf.eink_motion.clean_quiet_ms
+-        // Clear only for pages: while the status bar is on screen (an e-reader's menu, library or
+-        // settings, the notification shade), barsMode instead, which doesn't flash; readers show
++        // The page mode only for pages: while the status bar is on screen (an e-reader's menu,
++        // library or settings, the notification shade), barsMode (FAST) instead; readers show
+         // their pages full screen (debug.sf.eink_motion.reading_bars, .reading_bars_mode).
+         bool readingBars = true;
+         uint32_t barsMode = 0xb3;
++        // A page in HD is shown in this waveform (debug.sf.eink_motion.page_flash, default
++        // 0xb0 GC16; 0 = in HD): no ghosting on pages, no flash for anything else.
++        uint32_t pageFlash = 0xb0;
+ 
+         // Sleep screen (see the class comment). vendor.xrz.hibreak_sleep is set by
+         // system_server; the rest are debug.sf.eink_sleep.* for tuning without a build.
+@@ -121,7 +124,8 @@ private:
+     uint32_t touchSerial();
+     void writeMode(uint32_t mode);
+     bool isFast(uint32_t mode) const;
+-    static bool isFlashing(uint32_t mode);
++    static bool isPageMode(uint32_t mode);
++    uint32_t pageWaveform(uint32_t mode) const;
+     void beginTurnHold(uint32_t turnBase, nsecs_t now);
+     void threadLoop();
+     void beginSleepTransition(bool asleep, nsecs_t now);
+@@ -159,8 +163,8 @@ private:
+     bool mAsleep = false;         // the last vendor.xrz.hibreak_sleep acted on
+     bool mFrozen = false;         // the composer's panel updates are held back
+     bool mFreezeForSleep = false; // the freeze is for going to sleep (not for waking up)
+-    bool mFreezeForTurn = false;  // the freeze holds a short animation in Clear (a page turn)
+-    uint32_t mTurnBase = 0;       // the flashing mode the held animation is shown in
++    bool mFreezeForTurn = false;  // the freeze holds a short animation in a page mode (a page turn)
++    uint32_t mTurnBase = 0;       // the page mode the held animation is shown in
+     nsecs_t mTurnReleased = 0;    // when the last hold was let go
+     nsecs_t mFreezeStart = 0;
+     bool mSleepModeSet = false;   // the property holds our sleep mode
+@@ -170,8 +174,8 @@ private:
+     bool mForceArmed = false;     // the one-shot for the first picture after the hold is set
+ 
+     bool mBarsVisible = false;    // the status bar was on screen in the last composite
+-    bool mBarsActive = false;     // the property holds barsMode in place of the flashing mode
+-    uint32_t mBarsBase = 0;       // the flashing mode it stands in for
++    bool mBarsActive = false;     // the property holds barsMode in place of the page mode
++    uint32_t mBarsBase = 0;       // the page mode it stands in for
+     bool mTurnToBars = false;     // the status bar came up during a held page turn
+ };
+ 

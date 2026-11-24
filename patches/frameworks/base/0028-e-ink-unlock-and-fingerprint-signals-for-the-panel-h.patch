@@ -1,0 +1,357 @@
+From 8e659ffc132e539dc3fe3b73543dafb734d8791d Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 24 Nov 2026 13:09:51 +0000
+Subject: [PATCH] e-ink: unlock and fingerprint signals for the panel hold, no
+ SystemUI animations
+
+With debug.sf.eink_motion (and debug.sf.eink_sleep, default on), system_server
+tells SurfaceFlinger (frameworks/native EinkMotion) about two more steps that
+rearrange the whole screen, as PhoneWindowManager already does for sleep and
+wake-up (vendor.xrz.hibreak_sleep):
+- KeyguardController writes vendor.xrz.hibreak_unlock (uptime ms) when the
+  keyguard goes away on the default display, or is hidden without going away
+  first (a fingerprint match that woke the phone: SystemUI hides it at once,
+  seen 2026-11-24): the lock screen then goes to home or the app in one panel
+  update.
+- The keyguard's fingerprint authentication writes vendor.xrz.hibreak_finger:
+  the time of the last acquire with a finger on the sensor, 0 once the sensor
+  answered without a match (rejected, lifted, error, cancelled); a match
+  leaves the time for the unlock that follows. The side sensor is the power
+  button, so a press with an enrolled finger is a wake-up and then an unlock;
+  SurfaceFlinger keeps the wake-up picture until the sensor has answered.
+  The MICROARRAY HAL's vendor acquires (2026-11-24): 1 capture armed with no
+  finger, 2 finger down, 3 lifted (debug.sf.eink_finger.idle_code,
+  .lifted_code).
+
+- The power manager's Notifier writes vendor.xrz.hibreak_sleep itself when
+  the default display group starts waking up or going to sleep, before it
+  posts the policy calls to the main thread. A fingerprint wake-up kept that
+  thread busy for ~470 ms, and the lock screen reached the panel before
+  PhoneWindowManager's write (which stays).
+
+With debug.sysui.eink_palette and debug.sysui.eink_animations=0 (opt-in; the
+default 1 keeps animations on, owner's decision), SystemUI runs with the
+animator duration scale at 0 (this process only; put back to 0 when the global setting changes).
+The lock screen's animations (clock doze animators 4 x 819 ms, status bar
+fade-in, navigation bar insets, scrims, 217-732 ms animators) kept the shade
+redrawing at ~50 fps for ~1 s after every wake-up: the wake hold never saw a
+still screen, let the panel go at its 450 ms limit with the lock screen
+half-drawn and sent the rest as FAST updates. A fingerprint unlock from the
+sleep screen showed the lock screen clock for a moment on its way to home.
+AndroidX's animators (androidx.core.animation: the light-reveal scrim, the
+notifications' wake-up, the keyguard status bar, 500 ms each) have a scale of
+their own, which the framework's doesn't reach: it is set to 0 by reflection,
+and proguard.flags keeps the setter and the field from R8. With only the
+framework's scale they still held every wake-up to the limit.
+With animations on, a power-button wake runs to wake_max_ms with the lock
+screen still animating, as before.
+
+Change-Id: Id957a993d73781e3fdf3a6684d212ae6689648ea
+---
+ packages/SystemUI/proguard.flags              |   7 ++
+ .../impl/SystemUIApplicationImpl.java         |  39 +++++++
+ .../aidl/FingerprintAuthenticationClient.java |  17 +++
+ .../server/policy/EinkPanelSignals.java       | 104 ++++++++++++++++++
+ .../com/android/server/power/Notifier.java    |   6 +
+ .../android/server/wm/KeyguardController.java |  13 +++
+ 6 files changed, 186 insertions(+)
+ create mode 100644 services/core/java/com/android/server/policy/EinkPanelSignals.java
+
+diff --git a/packages/SystemUI/proguard.flags b/packages/SystemUI/proguard.flags
+index 42b592346..be9b17b98 100644
+--- a/packages/SystemUI/proguard.flags
++++ b/packages/SystemUI/proguard.flags
+@@ -5,3 +5,10 @@
+ }
+ 
+ -keep,allowoptimization,allowaccessmodification class com.android.systemui.dagger.DaggerReferenceGlobalRootComponent** { !synthetic *; }
++
++# E-ink (debug.sysui.eink_palette): SystemUIApplicationImpl sets AndroidX's animator duration
++# scale to 0 by reflection. Without this, R8 removes the setter and folds the scale to 1.
++-keep class androidx.core.animation.ValueAnimator {
++    static void setDurationScale(float);
++    static float sDurationScale;
++}
+diff --git a/packages/SystemUI/src/com/android/systemui/application/impl/SystemUIApplicationImpl.java b/packages/SystemUI/src/com/android/systemui/application/impl/SystemUIApplicationImpl.java
+index 00887f7b4..dfb3e5d4c 100644
+--- a/packages/SystemUI/src/com/android/systemui/application/impl/SystemUIApplicationImpl.java
++++ b/packages/SystemUI/src/com/android/systemui/application/impl/SystemUIApplicationImpl.java
+@@ -17,6 +17,7 @@
+ package com.android.systemui.application.impl;
+ 
+ import android.animation.Animator;
++import android.animation.ValueAnimator;
+ import android.annotation.SuppressLint;
+ import android.app.ActivityThread;
+ import android.content.BroadcastReceiver;
+@@ -25,6 +26,7 @@ import android.content.Intent;
+ import android.content.IntentFilter;
+ import android.content.res.Configuration;
+ import android.os.Process;
++import android.os.SystemProperties;
+ import android.os.Trace;
+ import android.tracing.perfetto.InitArguments;
+ import android.util.Log;
+@@ -85,6 +87,42 @@ public class SystemUIApplicationImpl extends SystemUIApplication implements
+     private SystemUIInitializer mInitializer;
+     private ProcessWrapper mProcessWrapper;
+ 
++    /**
++     * E-ink (debug.sysui.eink_palette), opt-in only: with debug.sysui.eink_animations=0 SystemUI
++     * draws without animations, as with the animator duration scale at 0 for this process only.
++     * Off by default (owner, 2026-11-24: animations stay on). Each animation frame is a panel refresh, and
++     * the lock screen's (clock, status bar, navigation bar, scrims) ran for ~1 s after every
++     * wake-up: SurfaceFlinger's wake hold (frameworks/native EinkMotion) never saw a still screen,
++     * let the panel go mid-animation at its limit and sent the rest as FAST updates. The scale
++     * the window manager sets (the global setting) is put back to 0 whenever it changes.
++     * AndroidX's animators (androidx.core.animation: the light-reveal scrim, the notifications'
++     * wake-up, the keyguard status bar, 500 ms each after a wake-up) have a scale of their own
++     * that nothing else sets; it is set to 0 by reflection (kept by proguard.flags).
++     * Read when SystemUI starts; default 1 (animations on).
++     */
++    private static ValueAnimator.DurationScaleChangeListener sEinkNoAnimations;
++
++    private static void disableAnimationsOnEink() {
++        if (!SystemProperties.getBoolean("debug.sysui.eink_palette", false)
++                || SystemProperties.getBoolean("debug.sysui.eink_animations", true)) {
++            return;
++        }
++        // Held here: ValueAnimator keeps its listeners as weak references.
++        sEinkNoAnimations = scale -> {
++            if (scale != 0f) ValueAnimator.setDurationScale(0f);
++        };
++        ValueAnimator.registerDurationScaleChangeListener(sEinkNoAnimations);
++        ValueAnimator.setDurationScale(0f);
++        try {
++            final java.lang.reflect.Method setScale = androidx.core.animation.ValueAnimator.class
++                    .getDeclaredMethod("setDurationScale", float.class);
++            setScale.setAccessible(true);
++            setScale.invoke(null, 0f);
++        } catch (ReflectiveOperationException | RuntimeException e) {
++            Log.w(TAG, "e-ink: AndroidX animators keep their durations", e);
++        }
++    }
++
+     public SystemUIApplicationImpl() {
+         super();
+         if (!isSubprocess()) {
+@@ -118,6 +156,7 @@ public class SystemUIApplicationImpl extends SystemUIApplication implements
+     public void onCreate() {
+         super.onCreate();
+         Log.v(TAG, "SystemUIApplication created.");
++        disableAnimationsOnEink();
+         // This line is used to setup Dagger's dependency injection and should be kept at the
+         // top of this method.
+         TimingsTraceLog log = new TimingsTraceLog("SystemUIBootTiming",
+diff --git a/services/core/java/com/android/server/biometrics/sensors/fingerprint/aidl/FingerprintAuthenticationClient.java b/services/core/java/com/android/server/biometrics/sensors/fingerprint/aidl/FingerprintAuthenticationClient.java
+index cd864eb43..e354607c0 100644
+--- a/services/core/java/com/android/server/biometrics/sensors/fingerprint/aidl/FingerprintAuthenticationClient.java
++++ b/services/core/java/com/android/server/biometrics/sensors/fingerprint/aidl/FingerprintAuthenticationClient.java
+@@ -66,6 +66,7 @@ import com.android.server.biometrics.sensors.PerformanceTracker;
+ import com.android.server.biometrics.sensors.SensorOverlays;
+ import com.android.server.biometrics.sensors.fingerprint.PowerPressHandler;
+ import com.android.server.biometrics.sensors.fingerprint.Udfps;
++import com.android.server.policy.EinkPanelSignals;
+ 
+ import java.util.ArrayList;
+ import java.util.function.Supplier;
+@@ -176,6 +177,14 @@ public class FingerprintAuthenticationClient
+             BiometricAuthenticator.Identifier identifier,
+             boolean authenticated,
+             ArrayList<Byte> token) {
++        // E-ink: SurfaceFlinger holds the wake-up picture while the keyguard's sensor reads.
++        if (isKeyguard()) {
++            if (authenticated) {
++                EinkPanelSignals.fingerMatched();
++            } else {
++                EinkPanelSignals.fingerDone();
++            }
++        }
+         super.onAuthenticated(identifier, authenticated, token);
+         handleLockout(authenticated);
+         if (authenticated) {
+@@ -231,6 +240,7 @@ public class FingerprintAuthenticationClient
+ 
+     @Override
+     public void onAcquired(@FingerprintAcquired int acquiredInfo, int vendorCode) {
++        if (isKeyguard()) EinkPanelSignals.fingerAcquired(acquiredInfo, vendorCode);
+         mAuthenticationStateListeners.onAuthenticationAcquired(
+                 new AuthenticationAcquiredInfo.Builder(BiometricSourceType.FINGERPRINT,
+                         getRequestReason(), acquiredInfo).build()
+@@ -254,8 +264,15 @@ public class FingerprintAuthenticationClient
+         pt.incrementAcquireForUser(getTargetUserId(), isCryptoOperation());
+     }
+ 
++    @Override
++    public void cancel() {
++        if (isKeyguard()) EinkPanelSignals.fingerDone();
++        super.cancel();
++    }
++
+     @Override
+     public void onError(int errorCode, int vendorCode) {
++        if (isKeyguard()) EinkPanelSignals.fingerDone();
+         mAuthenticationStateListeners.onAuthenticationError(
+                 new AuthenticationErrorInfo.Builder(BiometricSourceType.FINGERPRINT,
+                         getRequestReason(), getErrorString(getContext(), errorCode, vendorCode),
+diff --git a/services/core/java/com/android/server/policy/EinkPanelSignals.java b/services/core/java/com/android/server/policy/EinkPanelSignals.java
+new file mode 100644
+index 000000000..d2e9860c6
+--- /dev/null
++++ b/services/core/java/com/android/server/policy/EinkPanelSignals.java
+@@ -0,0 +1,104 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package com.android.server.policy;
++
++import static android.hardware.biometrics.BiometricFingerprintConstants.FINGERPRINT_ACQUIRED_VENDOR;
++
++import android.os.SystemClock;
++import android.os.SystemProperties;
++import android.util.Slog;
++
++/**
++ * E-ink (HiBreak Pro): tells SurfaceFlinger (frameworks/native EinkMotion) about an unlock and a
++ * finger on the fingerprint sensor, so that it can hold the panel until the screen behind them
++ * has settled, as it does when the phone goes to sleep or wakes up (vendor.xrz.hibreak_sleep,
++ * PhoneWindowManager).
++ *
++ * vendor.xrz.hibreak_sleep: written here too, by the power manager at the change itself;
++ * PhoneWindowManager's write comes from the main thread, which a fingerprint wake-up can keep
++ * busy for ~0.5 s.
++ *
++ * vendor.xrz.hibreak_unlock: the uptime in ms of the last keyguard going away. The lock screen
++ * then goes to home (or the app) in one panel update.
++ *
++ * vendor.xrz.hibreak_finger: the uptime in ms of the last acquire of the keyguard's fingerprint
++ * authentication, 0 once the sensor has answered without a match (rejected, lifted, error or
++ * cancelled). A match leaves the time, refreshed: the unlock follows within a few ms, and the
++ * wake hold must not let the lock screen out in between. SurfaceFlinger only acts on it during
++ * the hold of a wake-up: the side sensor is the power button, so a press with an enrolled finger
++ * is a wake-up followed by an unlock, and the lock screen waits for the sensor's answer.
++ *
++ * The HAL (MICROARRAY, fingerprint@2.1) reports vendor acquires (seen 2026-11-24): 1 when a
++ * capture is armed with no finger (each session's start, after a lift), 2 when a finger lands,
++ * 3 when it lifts. 1 is no finger; 3 ends the read. Both are runtime properties
++ * (debug.sf.eink_finger.idle_code, .lifted_code; -1 = none) in case another firmware differs.
++ */
++public final class EinkPanelSignals {
++    private static final String TAG = "EinkPanelSignals";
++    private static final boolean ENABLED =
++            SystemProperties.getBoolean("debug.sf.eink_motion", false)
++                    && SystemProperties.getBoolean("debug.sf.eink_sleep", true);
++    private static final String UNLOCK = "vendor.xrz.hibreak_unlock";
++    private static final String FINGER = "vendor.xrz.hibreak_finger";
++
++    private static boolean sFinger;  // FINGER holds a time
++    private static boolean sMatched; // the last read matched: leave FINGER for the unlock
++
++    private EinkPanelSignals() {}
++
++    /**
++     * The default display group starts going to sleep or waking up (vendor.xrz.hibreak_sleep,
++     * also written by PhoneWindowManager): called by the power manager's Notifier at once.
++     */
++    public static void setAsleep(boolean asleep) {
++        if (!ENABLED) return;
++        set("vendor.xrz.hibreak_sleep", asleep ? "1" : "0");
++    }
++
++    /** The keyguard is going away on the default display. */
++    public static void keyguardGoingAway() {
++        if (!ENABLED) return;
++        set(UNLOCK, Long.toString(SystemClock.uptimeMillis()));
++    }
++
++    /** An acquire of the keyguard's fingerprint authentication. */
++    public static synchronized void fingerAcquired(int acquiredInfo, int vendorCode) {
++        if (!ENABLED) return;
++        if (acquiredInfo == FINGERPRINT_ACQUIRED_VENDOR) {
++            if (vendorCode == SystemProperties.getInt("debug.sf.eink_finger.idle_code", 1)) return;
++            if (vendorCode == SystemProperties.getInt("debug.sf.eink_finger.lifted_code", 3)) {
++                fingerDone();
++                return;
++            }
++        }
++        sMatched = false;
++        sFinger = true;
++        set(FINGER, Long.toString(SystemClock.uptimeMillis()));
++    }
++
++    /** The keyguard's fingerprint authentication matched: the unlock follows. */
++    public static synchronized void fingerMatched() {
++        if (!ENABLED) return;
++        sMatched = true;
++        sFinger = true;
++        set(FINGER, Long.toString(SystemClock.uptimeMillis()));
++    }
++
++    /** The sensor answered without a match, or the authentication ended. */
++    public static synchronized void fingerDone() {
++        if (!ENABLED || !sFinger || sMatched) return;
++        sFinger = false;
++        set(FINGER, "0");
++    }
++
++    private static void set(String key, String value) {
++        try {
++            SystemProperties.set(key, value);
++        } catch (RuntimeException e) {
++            Slog.w(TAG, "Could not set " + key, e);
++        }
++    }
++}
+diff --git a/services/core/java/com/android/server/power/Notifier.java b/services/core/java/com/android/server/power/Notifier.java
+index 44b438bfc..7cf6d5449 100644
+--- a/services/core/java/com/android/server/power/Notifier.java
++++ b/services/core/java/com/android/server/power/Notifier.java
+@@ -654,6 +654,12 @@ public class Notifier {
+                 return;
+             }
+             final int changeReason = interactivity.changeReason;
++            // E-ink: SurfaceFlinger hears of it now, not when the main thread gets to the policy
++            // (a fingerprint wake-up kept it busy for ~470 ms, and the lock screen reached the
++            // panel meanwhile, 2026-11-24). PhoneWindowManager writes the same value again.
++            if (groupId == android.view.Display.DEFAULT_DISPLAY_GROUP) {
++                com.android.server.policy.EinkPanelSignals.setAsleep(!interactivity.isInteractive);
++            }
+             if (interactivity.isInteractive) {
+                 mHandler.post(() -> mPolicy.startedWakingUp(groupId, changeReason));
+             } else {
+diff --git a/services/core/java/com/android/server/wm/KeyguardController.java b/services/core/java/com/android/server/wm/KeyguardController.java
+index 01e141ed7..1902d98d0 100644
+--- a/services/core/java/com/android/server/wm/KeyguardController.java
++++ b/services/core/java/com/android/server/wm/KeyguardController.java
+@@ -240,6 +240,12 @@ class KeyguardController {
+             mWindowManager.mTaskSnapshotController.snapshotForSleeping(DEFAULT_DISPLAY);
+         }
+ 
++        // E-ink: the keyguard hidden without going away first (a fingerprint match that woke the
++        // phone: SystemUI hides it at once) is an unlock too, for SurfaceFlinger's panel hold.
++        if (displayId == DEFAULT_DISPLAY && !keyguardShowing && state.mKeyguardShowing
++                && !state.mKeyguardGoingAway) {
++            com.android.server.policy.EinkPanelSignals.keyguardGoingAway();
++        }
+         state.mKeyguardShowing = keyguardShowing;
+         state.mAodShowing = aodShowing;
+         state.writeEventLog("setKeyguardShown");
+@@ -321,6 +327,13 @@ class KeyguardController {
+             Trace.traceEnd(TRACE_TAG_WINDOW_MANAGER);
+             return;
+         }
++        // E-ink: SurfaceFlinger holds the panel until the screen behind the keyguard has settled.
++        for (int i = changedDisplays.size() - 1; i >= 0; i--) {
++            if (changedDisplays.get(i).mDisplayId == DEFAULT_DISPLAY) {
++                com.android.server.policy.EinkPanelSignals.keyguardGoingAway();
++                break;
++            }
++        }
+ 
+         mService.deferWindowLayout();
+         final ActionChain chain = mService.mChainTracker.startTransit("kgGoAway");
+-- 
+2.43.0
+

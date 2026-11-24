@@ -1,0 +1,253 @@
+From 9bbd8187f683a7d8f3cc9c9e477264f25d5407e5 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 24 Nov 2026 13:09:51 +0000
+Subject: [PATCH] sf: e-ink hold the panel while unlocking, and for the
+ fingerprint on wake-up
+
+system_server (frameworks/base) writes vendor.xrz.hibreak_unlock when the
+keyguard goes away and vendor.xrz.hibreak_finger while the keyguard's
+fingerprint sensor reads a finger.
+
+- Unlocking: a new vendor.xrz.hibreak_unlock holds the panel like a wake-up
+  (a fast mode of ours from the lock screen ends first) until the screen
+  behind the keyguard has settled, then shows it in one update with the wake
+  one-shot. During a wake hold it restarts the hold, so a fingerprint unlock
+  from the sleep screen is one update from the sleep screen to home. An
+  unlock seen while still asleep (its signal came before the wake-up's) is
+  shown with the wake-up.
+  debug.sf.eink_sleep.unlock_min_ms (150) / .unlock_max_ms (700, 0 = off).
+- Fingerprint on wake-up: while a finger acquire is newer than
+  .finger_window_ms (600), the wake hold waits for the sensor's answer, up to
+  .finger_max_ms (800, 0 = never) after it began. A match ends it with the
+  unlock's hold; no match (another finger, a knuckle) shows the lock screen
+  once the sensor gives up. The property is read in the hold's thread every
+  40 ms: the answer writes no composite.
+
+Measured before (2026-11-24): every wake-up ran to wake_max_ms (450 ms) with
+the lock screen still animating, the unlock was not held at all, and a
+fingerprint unlock from the sleep screen showed the lock screen clock on its
+way to home whenever the match took longer than the hold.
+
+Change-Id: I8bcbd4e52177d34f21bea138bca57c5cf76c94b2
+---
+ .../DisplayHardware/EinkMotion.cpp            | 94 ++++++++++++++++++-
+ .../DisplayHardware/EinkMotion.h              | 23 +++++
+ 2 files changed, 113 insertions(+), 4 deletions(-)
+
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index caa7e0a..4c583c3 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -37,6 +37,11 @@ constexpr char kForceModeProperty[] = "vendor.xrz.force_global_refresh_mode";
+ constexpr char kDisableCommitProperty[] = "vendor.xrz.disable_commit";
+ // A finger is on the screen (system_server, DisplayPolicy).
+ constexpr char kTouchProperty[] = "vendor.xrz.hibreak_touch";
++// The keyguard went away: a new value (uptime ms) with every unlock (system_server).
++constexpr char kUnlockProperty[] = "vendor.xrz.hibreak_unlock";
++// A finger on the fingerprint sensor: uptime ms of its last acquire, 0 once the sensor has
++// answered (system_server, the keyguard's fingerprint authentication).
++constexpr char kFingerProperty[] = "vendor.xrz.hibreak_finger";
+ 
+ uint32_t readUint(const prop_info* pi, uint32_t fallback) {
+     if (!pi) return fallback;
+@@ -129,6 +134,14 @@ void EinkMotion::reloadConfigIfChanged() {
+     c.wakeMode = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.wake_mode", 0xb2);
+     c.wakeMin = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.wake_min_ms", 150));
+     c.wakeMax = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.wake_max_ms", 450));
++    c.unlock = base::GetUintProperty<uint64_t>(kUnlockProperty, 0);
++    c.unlockMin = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.unlock_min_ms", 150));
++    c.unlockMax = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.unlock_max_ms", 700));
++    // The sensor reports a finger down, then the match ~230 ms later (2026-11-24); a finger that
++    // stays without a result stops counting after the window.
++    c.fingerWindow =
++            ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.finger_window_ms", 600));
++    c.fingerMax = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.finger_max_ms", 800));
+     mConfig = c;
+ }
+ 
+@@ -215,6 +228,7 @@ void EinkMotion::beginTurnHold(uint32_t turnBase, nsecs_t now) {
+     mFrozen = true;
+     mFreezeForTurn = true;
+     mFreezeForSleep = false;
++    mFreezeForUnlock = false;
+     mFreezeStart = now;
+     base::SetProperty(kDisableCommitProperty, "1");
+     mCondition.notify_one();
+@@ -249,10 +263,42 @@ void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now) {
+     mFrozen = true;
+     mFreezeForTurn = false; // a held page turn is shown with the sleep or wake picture
+     mFreezeForSleep = asleep;
++    mFreezeForUnlock = false;
++    mFingerHeld = false;
+     mFreezeStart = now;
+     ALOGI("%s: panel held", asleep ? "going to sleep" : "waking up");
+ }
+ 
++void EinkMotion::beginUnlockHold(nsecs_t now) {
++    // Going to sleep wins (the sleep screen is what the panel has to show).
++    if (mFrozen && mFreezeForSleep) return;
++    // A fast mode of ours (a finger on the lock screen, the PIN keys) ends here: the screen
++    // behind the keyguard is shown in one update, not FAST and then a settle.
++    if (mFast) {
++        if (readMode() == mWritten && modeSerial() == mWrittenSerial) writeMode(mBase);
++        mFast = false;
++    }
++    const bool extended = mFrozen;
++    mStreak = 0;
++    mLastMotionFrame = 0;
++    base::SetProperty(kDisableCommitProperty, "1");
++    mForceArmed = false; // armed again during this hold, for the screen it ends with
++    mFrozen = true;
++    mFreezeForTurn = false;
++    mFreezeForSleep = false;
++    mFreezeForUnlock = true;
++    mFreezeStart = now;
++    ALOGI("unlocking: panel held%s", extended ? " (wake hold extended)" : "");
++    mCondition.notify_one();
++}
++
++bool EinkMotion::fingerReading(nsecs_t now) const {
++    // Read here, not from mConfig: the thread waits without composites coming in.
++    const uint64_t at = base::GetUintProperty<uint64_t>(kFingerProperty, 0);
++    const uint64_t nowMs = static_cast<uint64_t>(ns2ms(now));
++    return at != 0 && at <= nowMs && nowMs - at < static_cast<uint64_t>(ns2ms(mConfig.fingerWindow));
++}
++
+ void EinkMotion::applySleepMode() {
+     // Asleep: the sleep screen's own mode (Normal: one-bit, only the changed pixels move), not
+     // the mode the user chose for apps. With "Clear" (GC16) every minute update was a full
+@@ -294,6 +340,25 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+             endBars();
+         }
+         beginSleepTransition(mConfig.asleep, now);
++        // An unlock seen while still asleep (its signal came first: a fingerprint match that
++        // woke the phone hides the keyguard at once) is shown with this wake-up.
++        if (!mAsleep && mUnlockPending) beginUnlockHold(now);
++        mUnlockPending = false;
++    }
++    // The keyguard went away (after a wake in the same composite, if both came together).
++    if (!mUnlockKnown) {
++        mUnlockSeen = mConfig.unlock; // a value from before SurfaceFlinger started is no unlock
++        mUnlockKnown = true;
++    }
++    if (mConfig.unlock != mUnlockSeen) {
++        mUnlockSeen = mConfig.unlock;
++        if (mConfig.sleep && mConfig.unlockMax > 0) {
++            if (mAsleep) {
++                mUnlockPending = true;
++            } else {
++                beginUnlockHold(now);
++            }
++        }
+     }
+     if (mSettleArmed != 0 && now - mSettleArmed > ms2ns(500)) {
+         // The settle one-shot has gone out with the repaint; nothing else may inherit it.
+@@ -474,8 +539,12 @@ void EinkMotion::threadLoop() {
+         }
+         if (mFrozen) {
+             const nsecs_t now = systemTime();
+-            const nsecs_t minHold = mFreezeForSleep ? mConfig.sleepMin : mConfig.wakeMin;
+-            const nsecs_t maxHold = mFreezeForSleep ? mConfig.sleepMax : mConfig.wakeMax;
++            const nsecs_t minHold = mFreezeForSleep ? mConfig.sleepMin
++                    : mFreezeForUnlock              ? mConfig.unlockMin
++                                                    : mConfig.wakeMin;
++            const nsecs_t maxHold = mFreezeForSleep ? mConfig.sleepMax
++                    : mFreezeForUnlock              ? mConfig.unlockMax
++                                                    : mConfig.wakeMax;
+             // The first picture after the hold is a forced one-shot (going to sleep: the clean
+             // refresh; waking up: the normal mode). The composer skips a commit without new
+             // damage, and it lost the damage of the frames it skipped. The one-shot is armed
+@@ -492,6 +561,19 @@ void EinkMotion::threadLoop() {
+             nsecs_t due = std::min(mFreezeStart + maxHold,
+                                    std::max(mFreezeStart + minHold,
+                                             mLastFrame + mConfig.sleepQuiet));
++            // Waking up with a finger on the side fingerprint sensor (it is the power button):
++            // the unlock is likely to follow, so the lock screen waits for the sensor's answer,
++            // bounded by finger_max_ms. A match ends this hold with the unlock's own; no match
++            // (another finger, a knuckle) shows the lock screen once the sensor gives up.
++            if (!mFreezeForSleep && !mFreezeForUnlock && mConfig.fingerMax > 0 &&
++                fingerReading(now)) {
++                const nsecs_t until = mFreezeStart + mConfig.fingerMax;
++                if (now < until) {
++                    // Looked at again every 40 ms: the result writes no composite.
++                    due = std::max(due, std::min(until, now + ms2ns(40)));
++                    mFingerHeld = true;
++                }
++            }
+             if (!mForceArmed) due = std::min(due, armAt);
+             if (now < due) {
+                 mCondition.wait_for(lock, std::chrono::nanoseconds(due - now));
+@@ -504,9 +586,13 @@ void EinkMotion::threadLoop() {
+             }
+             // The screen has settled: show it in one update.
+             base::SetProperty(kDisableCommitProperty, "0");
+-            ALOGI("%s: panel released after %d ms", mFreezeForSleep ? "asleep" : "awake",
+-                  static_cast<int>(ns2ms(now - mFreezeStart)));
++            ALOGI("%s: panel released after %d ms%s",
++                  mFreezeForSleep ? "asleep" : mFreezeForUnlock ? "unlocked" : "awake",
++                  static_cast<int>(ns2ms(now - mFreezeStart)),
++                  mFingerHeld ? " (waited for the fingerprint sensor)" : "");
+             mFrozen = false;
++            mFreezeForUnlock = false;
++            mFingerHeld = false;
+             mStreak = 0;
+             mLastFrame = 0; // the repaint must not count as motion
+             const auto repaint = mRepaint;
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index 9ee4325..1b2ab7d 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -42,6 +42,13 @@ namespace android {
+ // out in the Normal mode (one-bit, only the changed pixels move, no flash), whatever mode the
+ // user chose for apps. Waking up shows the unlocked screen in one
+ // normal update.
++//
++// Unlocking: system_server writes vendor.xrz.hibreak_unlock when the keyguard goes away, and the
++// panel is held the same way until the screen behind it (home, the app) has settled, so the lock
++// screen goes to it in one update. A power-button wake while a finger is on the side fingerprint
++// sensor (vendor.xrz.hibreak_finger, the time of the last finger acquire, 0 after the result)
++// keeps the wake hold until the sensor has answered, so a fingerprint unlock from the sleep
++// screen goes straight to home instead of showing the lock screen for a moment.
+ class EinkMotion {
+ public:
+     // debug.sf.eink_motion, read once.
+@@ -116,6 +123,15 @@ private:
+         nsecs_t sleepMax = 0;
+         nsecs_t wakeMin = 0;         // .wake_min_ms / .wake_max_ms: the same when waking up
+         nsecs_t wakeMax = 0;
++        // Unlocking (see the class comment). vendor.xrz.hibreak_unlock changes with every
++        // keyguard going away; .unlock_min_ms / .unlock_max_ms bound that hold (max 0 = no hold).
++        uint64_t unlock = 0;
++        nsecs_t unlockMin = 0;
++        nsecs_t unlockMax = 0;
++        // A finger acquire within .finger_window_ms counts as a finger still being read; the
++        // wake hold waits for its result until .finger_max_ms after it began (0 = never waits).
++        nsecs_t fingerWindow = 0;
++        nsecs_t fingerMax = 0;
+     };
+ 
+     void reloadConfigIfChanged();
+@@ -129,6 +145,8 @@ private:
+     void beginTurnHold(uint32_t turnBase, nsecs_t now);
+     void threadLoop();
+     void beginSleepTransition(bool asleep, nsecs_t now);
++    void beginUnlockHold(nsecs_t now);
++    bool fingerReading(nsecs_t now) const;
+     void applySleepMode();
+     void startBars(uint32_t base);
+     void endBars();
+@@ -164,6 +182,11 @@ private:
+     bool mFrozen = false;         // the composer's panel updates are held back
+     bool mFreezeForSleep = false; // the freeze is for going to sleep (not for waking up)
+     bool mFreezeForTurn = false;  // the freeze holds a short animation in a page mode (a page turn)
++    bool mFreezeForUnlock = false; // the freeze holds the keyguard going away
++    bool mFingerHeld = false;     // the wake hold waited for the fingerprint sensor
++    bool mUnlockKnown = false;    // mUnlockSeen holds the value found at the first composite
++    uint64_t mUnlockSeen = 0;     // the last vendor.xrz.hibreak_unlock acted on
++    bool mUnlockPending = false;  // an unlock came while asleep: shown with the next wake-up
+     uint32_t mTurnBase = 0;       // the page mode the held animation is shown in
+     nsecs_t mTurnReleased = 0;    // when the last hold was let go
+     nsecs_t mFreezeStart = 0;
+-- 
+2.43.0
+

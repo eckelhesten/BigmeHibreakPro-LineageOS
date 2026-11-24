@@ -1,0 +1,19 @@
+# System-side Bluetooth audio (bta/Android.bp).
+
+# Audio policy reads the A2DP module from our copy of the vendor's file ("sysbta" in place of
+# the vendor's MediaTek-only "bluetooth" module). Before audioserver starts.
+on post-fs
+    mount none /system_ext/etc/hibreak_bta_audio_policy_configuration.xml /vendor/etc/bluetooth_audio_policy_configuration.xml bind
+
+# early_hal: registered before audioserver loads its modules (it opens "sysbta" once, at start)
+# and before the Bluetooth stack looks for the provider.
+service hibreak-bt-audio-hal /system_ext/bin/hw/android.hardware.audio.service.hibreak-bta
+    class early_hal
+    user audioserver
+    group audio net_bt net_bt_admin wakelock system
+    capabilities BLOCK_SUSPEND SYS_NICE
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh HighPerformance
+    # No "onrestart restart audioserver" (the vendor HAL has it): if this process ever failed in a
+    # loop, it would take all audio down with it. Without it, only Bluetooth media audio is lost
+    # until the next boot.

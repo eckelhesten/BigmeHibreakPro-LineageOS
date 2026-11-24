@@ -2,3 +2,5 @@
 /system/eink_key            u:object_r:xrz_system_file:s0
 /system/etc/g_c001          u:object_r:xrz_system_file:s0
 /system/etc/g_c002          u:object_r:xrz_system_file:s0
+# System-side Bluetooth audio HAL (bta/, hibreak_bta.te).
+/system_ext/bin/hw/android\.hardware\.audio\.service\.hibreak-bta  u:object_r:hibreak_bta_exec:s0

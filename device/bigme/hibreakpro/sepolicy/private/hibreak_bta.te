@@ -1,0 +1,22 @@
+# System-side Bluetooth audio HAL (bta/Android.bp): the AOSP Bluetooth audio provider and a HIDL
+# audio HAL factory for the AOSP A2DP module, in one process. A full audio HAL server: it registers
+# IDevicesFactory/sysbta (hal_audio_hwservice) and IBluetoothAudioProviderFactory/default
+# (hal_audio_service), and audioserver and the Bluetooth app (hal_audio clients) call it.
+# hal_audio reads /proc, which system domains may not: system/sepolicy patch 0001 exempts
+# system-side hal_audio_server from that rule.
+type hibreak_bta, domain, coredomain;
+type hibreak_bta_exec, system_file_type, exec_type, file_type;
+init_daemon_domain(hibreak_bta)
+hal_server_domain(hibreak_bta, hal_audio)
+hwbinder_use(hibreak_bta)
+binder_use(hibreak_bta)
+
+# Audio buffers and FMQs from audioserver and the Bluetooth stack.
+allow hibreak_bta audioserver:fd use;
+allow hibreak_bta bluetooth:fd use;
+wakelock_use(hibreak_bta)
+# dumpsys media.audio_flinger: audioserver hands the HAL a pipe to write its state into.
+allow hibreak_bta audioserver:fifo_file write;
+
+# Our copy of the vendor's Bluetooth audio policy file, bind mounted over it (the .rc).
+allow init vendor_configs_file:file mounton;

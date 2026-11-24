@@ -1,0 +1,58 @@
+From 70d9cfd61c76dc53a6588c1ae8eab68bf0e61566 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 24 Nov 2026 00:12:23 +0000
+Subject: [PATCH] Allow a system-side audio HAL server
+
+A device whose vendor A2DP module only works with a vendor-modified
+Bluetooth stack (MediaTek's session on the Bigme HiBreak Pro) runs the
+AOSP Bluetooth audio provider and A2DP module in a system-side audio
+HAL process. hal_attribute requires a hal_audio_server to be hal_audio
+too, and hal_audio reads /proc and uses VendorBinder, which coredomain
+may not. Exempt hal_audio_server from those three rules, the same way
+init, vold and shell are.
+
+Change-Id: I873d9240ec36547c08904a0ccc0117a968bbaac3
+---
+ private/coredomain.te | 3 +++
+ private/domain.te     | 4 ++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/private/coredomain.te b/private/coredomain.te
+index 2163c51..88b3ffd 100644
+--- a/private/coredomain.te
++++ b/private/coredomain.te
+@@ -145,6 +145,9 @@ full_treble_only(`
+     coredomain
+     -init
+     -vold
++    # A system-side audio HAL (e.g. Bluetooth audio for a vendor whose own module only works
++    # with a vendor-modified Bluetooth stack): hal_audio reads /proc.
++    -hal_audio_server
+   } proc:file no_rw_file_perms;
+ 
+   # /sys
+diff --git a/private/domain.te b/private/domain.te
+index bdc185c..7e5c1cf 100644
+--- a/private/domain.te
++++ b/private/domain.te
+@@ -970,6 +970,8 @@ full_treble_only(`
+     -shell
+     userdebug_or_eng(`-su')
+     -ueventd # uevent is granted create for this device, but we still neverallow I/O below
++    # A system-side audio HAL: hal_audio uses VendorBinder (coredomain.te has the same exemption).
++    -hal_audio_server
+   } vndbinder_device:chr_file rw_file_perms;
+ ')
+ full_treble_only(`
+@@ -987,6 +989,8 @@ full_treble_only(`
+     coredomain
+     -shell
+     userdebug_or_eng(`-su')
++    # A system-side audio HAL: hal_audio uses VendorBinder (coredomain.te has the same exemption).
++    -hal_audio_server
+   } vndservicemanager:binder *;
+ ')
+ 
+-- 
+2.43.0
+

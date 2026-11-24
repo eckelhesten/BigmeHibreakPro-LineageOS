@@ -1,0 +1,110 @@
+// Bluetooth audio on the system side.
+//
+// Bigme's vendor A2DP module (/vendor/lib64/hw/audio.bluetooth.default.so) is built on MediaTek's
+// own Bluetooth audio session (vendor.mediatek.hardware.bluetooth.audio@2.2), which only Bigme's
+// MediaTek-modified Bluetooth stack talks to. Our AOSP stack talks to the AOSP provider, which no
+// vendor audio module reads, so A2DP devices were rejected by audio policy and media stayed on the
+// speaker. This process hosts both AOSP halves in one place, as AOSP's own audio HAL does:
+// - the AOSP Bluetooth audio provider (IBluetoothAudioProviderFactory/default, AIDL), which the
+//   Bluetooth stack prefers over the vendor's HIDL one, and
+// - a HIDL 7.0 audio HAL factory (IDevicesFactory/sysbta, the vendor's HAL version) that serves
+//   the AOSP A2DP module as "sysbta" (/system/lib64/hw/audio.sysbta.default.so).
+// AudioFlinger asks every registered factory; the vendor's doesn't know "sysbta". Audio policy
+// gets the module from our copy of the vendor's bluetooth_audio_policy_configuration.xml, bind
+// mounted over it (the module renamed, nothing else changed).
+
+// The AOSP provider, compiled on its own: the audio core below needs a force-included version
+// header that the provider's sources don't expect.
+cc_library_static {
+    name: "libhibreak_bta_provider",
+    system_ext_specific: true,
+    defaults: [
+        "aconfig_lib_cc_static_link.defaults",
+        "latest_android_hardware_bluetooth_audio_ndk_shared",
+    ],
+    srcs: [":android.hardware.bluetooth.audio-impl_srcs"],
+    include_dirs: ["hardware/interfaces/bluetooth/audio/aidl/default"],
+    header_libs: ["libhardware_headers"],
+    shared_libs: [
+        "libbase",
+        "libbinder_ndk",
+        "libbluetooth_audio_session_aidl",
+        "libcutils",
+        "libfmq",
+        "liblog",
+        "server_configurable_flags",
+    ],
+    static_libs: ["btaudiohal_flags_c_lib"],
+}
+
+cc_binary {
+    name: "android.hardware.audio.service.hibreak-bta",
+    system_ext_specific: true,
+    relative_install_path: "hw",
+    init_rc: ["android.hardware.audio.service.hibreak-bta.rc"],
+    vintf_fragments: ["manifest_hibreak_bta.xml"],
+    defaults: [
+        "hidl_defaults",
+        "aconfig_lib_cc_static_link.defaults",
+        "latest_android_hardware_bluetooth_audio_ndk_shared",
+    ],
+    srcs: [
+        "service.cpp",
+        // AOSP HIDL audio core (hardware/interfaces/audio/core/all-versions/default)
+        ":android.hardware.audio-impl_srcs",
+    ],
+    include_dirs: [
+        "hardware/interfaces/audio/core/all-versions/default/include",
+        "hardware/interfaces/bluetooth/audio/aidl/default",
+    ],
+    cflags: [
+        "-DMAJOR_VERSION=7",
+        "-DMINOR_VERSION=0",
+        "-include common/all-versions/VersionMacro.h",
+    ],
+    static_libs: [
+        "libaudiofoundation",
+        "btaudiohal_flags_c_lib",
+    ],
+    // AOSP Bluetooth audio provider (hardware/interfaces/bluetooth/audio/aidl/default)
+    whole_static_libs: ["libhibreak_bta_provider"],
+    shared_libs: [
+        "android.hardware.audio.common-util",
+        "android.hardware.audio.common@7.0",
+        "android.hardware.audio.common@7.0-enums",
+        "android.hardware.audio.common@7.0-util",
+        "android.hardware.audio@7.0",
+        "android.hardware.audio@7.0-util",
+        "libbase",
+        "libbinder_ndk",
+        "libbluetooth_audio_session_aidl",
+        "libcutils",
+        "libfmq",
+        "libhardware",
+        "libhidlbase",
+        "liblog",
+        "libmedia_helper",
+        "libmediautils",
+        "libmemunreachable",
+        "libutils",
+        "server_configurable_flags",
+    ],
+    header_libs: [
+        "android.hardware.audio.common.util@all-versions",
+        "libaudio_system_headers",
+        "libaudioutils_headers",
+        "libhardware_headers",
+        "libmedia_headers",
+        "libmediautils_headers",
+    ],
+    required: [
+        "audio.sysbta.default",
+        "hibreak_bta_audio_policy_configuration.xml",
+    ],
+}
+
+prebuilt_etc {
+    name: "hibreak_bta_audio_policy_configuration.xml",
+    system_ext_specific: true,
+    src: "bluetooth_audio_policy_configuration.xml",
+}

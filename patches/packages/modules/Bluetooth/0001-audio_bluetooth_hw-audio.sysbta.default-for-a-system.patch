@@ -1,0 +1,66 @@
+From 1b7ad53658a7a1e435efdd271b3410d9b63fae51 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Mon, 23 Nov 2026 23:26:52 +0000
+Subject: [PATCH] audio_bluetooth_hw: audio.sysbta.default for a system-side
+ audio HAL
+
+The same A2DP / hearing aid audio module, built for the system
+partition under the module name "sysbta", for devices whose vendor
+audio.bluetooth.default only works with a vendor-modified Bluetooth
+stack (MediaTek's session on the Bigme HiBreak Pro). A system HAL
+process hosts it next to the AOSP Bluetooth audio provider.
+
+Change-Id: Ie0fa1952ac283a78f05beb515a89453e5feb821e
+---
+ system/audio_bluetooth_hw/Android.bp | 35 ++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/system/audio_bluetooth_hw/Android.bp b/system/audio_bluetooth_hw/Android.bp
+index 1b8e850..9420fe2 100644
+--- a/system/audio_bluetooth_hw/Android.bp
++++ b/system/audio_bluetooth_hw/Android.bp
+@@ -55,6 +55,41 @@ cc_library_shared {
+     ],
+ }
+ 
++// The same module for a Bluetooth audio HAL on the system side: devices whose vendor
++// audio.bluetooth.default only works with a vendor-modified Bluetooth stack (MediaTek's session)
++// load it as "sysbta" from a system HAL process that also hosts the AOSP provider.
++cc_library_shared {
++    name: "audio.sysbta.default",
++    defaults: [
++        "audio_bluetooth_hw_defaults",
++        "latest_android_hardware_audio_common_ndk_shared",
++        "latest_android_hardware_bluetooth_audio_ndk_shared",
++    ],
++    relative_install_path: "hw",
++    srcs: [
++        "audio_bluetooth_hw.cc",
++        "device_port_proxy.cc",
++        "device_port_proxy_hidl.cc",
++        "stream_apis.cc",
++        "utils.cc",
++    ],
++    header_libs: ["libhardware_headers"],
++    shared_libs: [
++        "libaudioutils",
++        "libbase",
++        "libbinder_ndk",
++        "libbluetooth_audio_session_aidl",
++        "libcutils",
++        "libfmq",
++        "liblog",
++        "libutils",
++        "android.hardware.bluetooth.audio@2.0",
++        "android.hardware.bluetooth.audio@2.1",
++        "libbluetooth_audio_session",
++        "libhidlbase",
++    ],
++}
++
+ cc_test {
+     name: "audio_bluetooth_hw_test",
+     test_suites: ["general-tests"],
+-- 
+2.43.0
+

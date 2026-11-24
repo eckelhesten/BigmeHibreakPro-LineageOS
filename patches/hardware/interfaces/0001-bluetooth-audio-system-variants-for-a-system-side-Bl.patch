@@ -1,0 +1,91 @@
+From f31b11eeb4cb7a4d6e7c2317c6be7dcf1a1ee800 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Mon, 23 Nov 2026 23:26:51 +0000
+Subject: [PATCH] bluetooth/audio: system variants for a system-side Bluetooth
+ audio HAL
+
+For devices whose vendor A2DP audio module only works with a
+vendor-modified Bluetooth stack (MediaTek's session on the Bigme
+HiBreak Pro), the AOSP provider and session run in a system-side audio
+HAL process instead:
+
+- libbluetooth_audio_session_aidl, libbluetooth_audio_session and
+  btaudiohal_flags_c_lib: vendor_available instead of vendor-only.
+- The provider's sources as a filegroup (without service.cpp), for a
+  process that hosts the provider next to the audio module.
+
+Change-Id: Ifae404ea543013b5fb2b8f6dc809a1b5f54339d3
+---
+ bluetooth/audio/aidl/default/Android.bp | 20 ++++++++++++++++++++
+ bluetooth/audio/flags/Android.bp        |  2 +-
+ bluetooth/audio/utils/Android.bp        |  4 ++--
+ 3 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/bluetooth/audio/aidl/default/Android.bp b/bluetooth/audio/aidl/default/Android.bp
+index c2cc681..54527e4 100644
+--- a/bluetooth/audio/aidl/default/Android.bp
++++ b/bluetooth/audio/aidl/default/Android.bp
+@@ -7,6 +7,26 @@ package {
+     default_applicable_licenses: ["hardware_interfaces_license"],
+ }
+ 
++// The provider's sources without service.cpp, for a provider hosted by a system-side audio HAL
++// process (it has to live in the same process as the audio module that reads its sessions).
++filegroup {
++    name: "android.hardware.bluetooth.audio-impl_srcs",
++    srcs: [
++        "BluetoothAudioProvider.cpp",
++        "BluetoothAudioProviderFactory.cpp",
++        "A2dpOffloadAudioProvider.cpp",
++        "A2dpOffloadCodecAac.cpp",
++        "A2dpOffloadCodecFactory.cpp",
++        "A2dpOffloadCodecSbc.cpp",
++        "A2dpSoftwareAudioProvider.cpp",
++        "HearingAidAudioProvider.cpp",
++        "HfpOffloadAudioProvider.cpp",
++        "HfpSoftwareAudioProvider.cpp",
++        "LeAudioOffloadAudioProvider.cpp",
++        "LeAudioSoftwareAudioProvider.cpp",
++    ],
++}
++
+ cc_library_shared {
+     name: "android.hardware.bluetooth.audio-impl",
+     vendor: true,
+diff --git a/bluetooth/audio/flags/Android.bp b/bluetooth/audio/flags/Android.bp
+index c3c8cf5..2e84fd0 100644
+--- a/bluetooth/audio/flags/Android.bp
++++ b/bluetooth/audio/flags/Android.bp
+@@ -8,6 +8,6 @@ aconfig_declarations {
+ cc_aconfig_library {
+     name: "btaudiohal_flags_c_lib",
+     aconfig_declarations: "btaudiohal_flags",
+-    vendor: true,
++    vendor_available: true,
+     host_supported: true,
+ }
+diff --git a/bluetooth/audio/utils/Android.bp b/bluetooth/audio/utils/Android.bp
+index 4e24760..9fe83d8 100644
+--- a/bluetooth/audio/utils/Android.bp
++++ b/bluetooth/audio/utils/Android.bp
+@@ -10,7 +10,7 @@ package {
+ cc_library_shared {
+     name: "libbluetooth_audio_session",
+     defaults: ["hidl_defaults"],
+-    vendor: true,
++    vendor_available: true,
+     srcs: [
+         "session/BluetoothAudioSession.cpp",
+         "session/BluetoothAudioSession_2_1.cpp",
+@@ -35,7 +35,7 @@ cc_library_shared {
+ 
+ cc_library_shared {
+     name: "libbluetooth_audio_session_aidl",
+-    vendor: true,
++    vendor_available: true,
+     host_supported: true,
+     srcs: [
+         "aidl_session/BluetoothAudioCodecs.cpp",
+-- 
+2.43.0
+

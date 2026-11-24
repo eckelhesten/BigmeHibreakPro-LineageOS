@@ -40,6 +40,10 @@ PRODUCT_PACKAGES += \
 # Device parts: front light (brightness -> LM3630A warm/cold) and e-ink quick settings tiles
 PRODUCT_PACKAGES += HiBreakParts
 
+# Bluetooth audio on the system side (bta/Android.bp): the vendor's A2DP module only works with
+# MediaTek's Bluetooth stack.
+PRODUCT_PACKAGES += android.hardware.audio.service.hibreak-bta
+
 # System font: Noto Sans 450 (the font configuration is patched in external/roboto-fonts,
 # frameworks/base and packages/overlays/Lineage)
 PRODUCT_PACKAGES += \

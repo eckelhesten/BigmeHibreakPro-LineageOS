@@ -19,8 +19,12 @@ err() { echo "  FAIL: $*"; bad=1; }
 ok() { echo "  ok: $*"; }
 work=$(mktemp -d /srv/check-flavours.XXXXXX)
 cleanup() {
-  for m in "$work"/*/*; do mountpoint -q "$m" && umount "$m"; done
-  rm -rf "$work"
+  local busy=0
+  for m in "$work"/*/*; do
+    if mountpoint -q "$m" && ! umount "$m"; then busy=1; fi
+  done
+  # Never rm -rf through a mount (read-only here, but a still-mounted image is no place for it).
+  if [ "$busy" = 0 ]; then rm -rf "$work"; else echo "  note: $work still has mounts, left in place"; fi
 }
 trap cleanup EXIT
 
@@ -113,7 +117,7 @@ for d in "$DIST"/*/; do
     for apk in "$base"/priv-app/*/*.apk; do
       pkg=$("$SRC"/prebuilts/sdk/tools/linux/bin/aapt2 dump packagename "$apk" 2>/dev/null)
       [ -n "$pkg" ] || continue
-      if ! grep -rqs "package=\"$pkg\"" "$S/etc/permissions" "$SE/etc/permissions" "$PR/etc/permissions"; then
+      if ! grep -rqsF "package=\"$pkg\"" "$S/etc/permissions" "$SE/etc/permissions" "$PR/etc/permissions"; then
         # Apps that ask for no privileged permission need no file
         if "$SRC"/prebuilts/sdk/tools/linux/bin/aapt2 dump permissions "$apk" 2>/dev/null | grep -q "uses-permission"; then
           echo "  note: no privapp-permissions entry for $pkg (${apk#"$m"/})"; missing=$((missing + 1))

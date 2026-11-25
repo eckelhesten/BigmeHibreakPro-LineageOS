@@ -136,6 +136,19 @@ final class Weather {
         return cities;
     }
 
+    /** When the stored weather was fetched (wall clock ms), or 0 for none. */
+    static long fetchedAt(ContentResolver cr) {
+        String data = Settings.System.getString(cr, Keys.SLEEP_WEATHER_DATA);
+        if (data == null) return 0;
+        String[] f = data.split(";", 9);
+        if (f.length < 7) return 0;
+        try {
+            return Long.parseLong(f[5]);  // the same field in versions 1 and 2
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
     static synchronized void clear(ContentResolver cr) {
         Settings.System.putString(cr, Keys.SLEEP_WEATHER_DATA, "");
     }
@@ -162,15 +175,17 @@ final class Weather {
             if (!Double.isFinite(celsius)) throw new JSONException("non-finite temperature");
             int code = current.getInt("weather_code");
             boolean day = current.optInt("is_day", 1) != 0;
-            String data = String.format(Locale.ROOT,
-                    "2;%s;%d;%.1f;%s;%d;%d;%s;%s", kind(code), day ? 1 : 0, celsius, unit(cr),
-                    System.currentTimeMillis(), code, condition(context, code), city.name);
             // The switch, city, or job cancellation may have changed while waiting for the network.
+            // The unit and the condition's language are read under the lock too: relabel() (a
+            // new unit or language) must not run between reading them and the write.
             synchronized (Weather.class) {
                 if ((cancelled != null && cancelled.get()) || !enabled(cr)
                         || !rawCity.equals(Settings.System.getString(cr, Keys.SLEEP_WEATHER_CITY))) {
                     return true;
                 }
+                String data = String.format(Locale.ROOT,
+                        "2;%s;%d;%.1f;%s;%d;%d;%s;%s", kind(code), day ? 1 : 0, celsius, unit(cr),
+                        System.currentTimeMillis(), code, condition(context, code), city.name);
                 Settings.System.putString(cr, Keys.SLEEP_WEATHER_DATA, data);
             }
             return true;
@@ -262,6 +277,7 @@ final class Weather {
                 byte[] buf = new byte[8192];
                 int total = 0;
                 for (int n; (n = in.read(buf)) != -1; ) {
+                    if (cancelled != null && cancelled.get()) throw new IOException("cancelled");
                     total += n;
                     if (total > MAX_RESPONSE_BYTES) {
                         throw new IOException("response too large");

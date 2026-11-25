@@ -166,7 +166,9 @@ final class Defaults {
                 ContentResolver cr = app.getContentResolver();
                 int ce = Settings.System.getInt(cr, APPLIED_CE, 0);
                 if (ce < 1) {
-                    applyWhiteWallpaper(app);
+                    // Done only once it worked: a failure (the wallpaper service not ready) is
+                    // tried again at the next start.
+                    if (!applyWhiteWallpaper(app)) return;
                     Settings.System.putInt(cr, APPLIED_CE, 1);
                     ce = 1;
                 }
@@ -224,16 +226,17 @@ final class Defaults {
         }
     }
 
-    private static void applyWhiteWallpaper(Context app) {
+    private static boolean applyWhiteWallpaper(Context app) {
         DisplayMetrics dm = app.getResources().getDisplayMetrics();
         Bitmap white = Bitmap.createBitmap(Math.max(1, dm.widthPixels),
                 Math.max(1, dm.heightPixels), Bitmap.Config.ARGB_8888);
         white.eraseColor(Color.WHITE);
         try {
-            WallpaperManager.getInstance(app).setBitmap(white, null, true,
-                    WallpaperManager.FLAG_SYSTEM | WallpaperManager.FLAG_LOCK);
+            return WallpaperManager.getInstance(app).setBitmap(white, null, true,
+                    WallpaperManager.FLAG_SYSTEM | WallpaperManager.FLAG_LOCK) != 0;
         } catch (IOException | RuntimeException e) {
             Log.w(TAG, "setting the white wallpaper failed", e);
+            return false;
         } finally {
             white.recycle();
         }

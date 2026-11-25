@@ -20,3 +20,6 @@ allow hibreak_bta audioserver:fifo_file write;
 
 # Our copy of the vendor's Bluetooth audio policy file, bind mounted over it (the .rc).
 allow init vendor_configs_file:file mounton;
+
+# The AOSP audio core reads vendor properties it doesn't need (the only denials, 2026-11-24).
+dontaudit hibreak_bta vendor_default_prop:file { getattr map open read };

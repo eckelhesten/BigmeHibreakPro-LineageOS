@@ -49,12 +49,15 @@ final class Eink {
         for (String band : maps.split(";")) {
             String[] f = band.split(":");
             if (f.length != 3) continue;
+            final float maxC;
             try {
-                last = new String[] {f[1].trim(), f[2].trim()};
-                if (tempC <= Float.parseFloat(f[0].trim())) return last;
+                maxC = Float.parseFloat(f[0].trim());
             } catch (NumberFormatException e) {
-                last = null;
+                continue; // a broken band is skipped; it doesn't drop the one before
             }
+            if (!Float.isFinite(maxC)) continue;
+            last = new String[] {f[1].trim(), f[2].trim()};
+            if (tempC <= maxC) return last;
         }
         return last; // warmer than every band: the warmest
     }

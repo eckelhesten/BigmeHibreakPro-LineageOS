@@ -1,0 +1,1223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 24 Nov 2026 20:47:41 +0100
+Subject: [PATCH] sf: e-ink: less work per frame and per property write
+
+Same output, less work on SurfaceFlinger's main thread and the GPU:
+
+- Render pass shaders (checked bit-exact against the previous ones with
+  skia-python on 15 corpus screens and synthetic frames, 14 uniform sets):
+  the 16-level version (Default's greys in FAST, Reading's HD) reads its
+  4 neighbours only where the 1-px contour can hold at all (not on paper,
+  l > 1 - c0, nor on text and dark fills, l <= clight - cmax, with margins
+  for half precision). All three skip pow() and the threshold map for pure
+  black and white (the threshold lies strictly inside (0, 1)), and the full
+  version skips the edge, stroke, contour and knockout tests on flat pixels
+  (spread below t1, c0 and ms * 0.6, where all of them are off). The
+  16-level output values per step are computed on the CPU (uniforms
+  pv0..pv3, (16 * level + 4) / 255) instead of per pixel.
+- Property caches: EinkMotion and the render pass settings reloaded ~60
+  properties whenever any property changed, i.e. on every finger down and
+  up, every mode change and every panel hold. EinkPropertyWatch tells the
+  writes of the frequently written properties apart (each update adds 1 to
+  the area serial and 2 to the property's serial): those are read directly
+  every frame, the tuning properties only when something else changed.
+  Checked: the new render pass settings equal the old ones over 300,000
+  random property sequences.
+- The keyboard state for debug.sf.eink.fast_full goes from EinkMotion to
+  the render pass in-process instead of through the property
+  vendor.xrz.hibreak_ime_visible (an IPC per keyboard change).
+- Going to sleep from a reader's menu writes the sleep mode once instead of
+  the page mode and then the sleep mode.
+- EinkMotion's thread reads the touch and fingerprint properties from cached
+  prop_info, wakes exactly when the touch hold runs out, and no longer
+  repaints at the end of a fast mode that someone else replaced (no one-shot,
+  so the panel never saw it; it only cost a composition).
+- No region union for a single damage rectangle, reserved vectors for the
+  client target damage, and the layer name scans stop once the keyboard and
+  the status bar are found.
+---
+ libs/renderengine/skia/SkiaRenderEngine.cpp   | 159 +++----
+ .../impl/EinkPropertyWatch.h                  | 130 ++++++
+ .../include/compositionengine/impl/Output.h   |   4 +
+ .../CompositionEngine/src/Output.cpp          | 388 +++++++++++-------
+ .../CompositionEngine/src/RenderSurface.cpp   |   1 +
+ .../DisplayHardware/EinkMotion.cpp            |  91 ++--
+ .../DisplayHardware/EinkMotion.h              |  18 +-
+ .../surfaceflinger/DisplayHardware/HWC2.cpp   |   1 +
+ services/surfaceflinger/SurfaceFlinger.cpp    |   8 +-
+ 9 files changed, 544 insertions(+), 256 deletions(-)
+ create mode 100644 services/surfaceflinger/CompositionEngine/include/compositionengine/impl/EinkPropertyWatch.h
+
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+index d9a2c9c..3676341 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -914,12 +914,10 @@ static const char* const kEinkRenderSkSL = R"(
+         if (crush > 0.0) {
+             t *= smoothstep(crush * 0.6, crush, y);
+         }
+-        return t <= 0.0 ? 0.0 : pow(t, gamma);
++        return t <= 0.0 ? 0.0 : t >= 1.0 ? 1.0 : pow(t, gamma);
+     }
+     half4 main(float2 xy) {
+         half l = luma(xy);
+-        // the map holds round(rank / 16) as 0..255: thresholds strictly inside (0, 1)
+-        half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
+         half a0 = luma(xy + r * float2(1.0, 0.0));
+         half a1 = luma(xy + r * float2(0.5, 0.866));
+         half a2 = luma(xy + r * float2(-0.5, 0.866));
+@@ -935,55 +933,61 @@ static const char* const kEinkRenderSkSL = R"(
+         half lo = min(min(min(min(a0, a1), min(a2, a3)), min(min(a4, a5), min(b0, b1))), min(min(min(b2, b3), min(b4, b5)), l));
+         half hi = max(max(max(max(a0, a1), max(a2, a3)), max(max(a4, a5), max(b0, b1))), max(max(max(b2, b3), max(b4, b5)), l));
+         half spread = hi - lo;
+-        half mid = 0.5 * (lo + hi);
+-        half e = 0.25 * spread;
+-        half n = 1.0 + onSide(a0, lo, hi, e) + onSide(a1, lo, hi, e) + onSide(a2, lo, hi, e) +
+-                   onSide(a3, lo, hi, e) + onSide(a4, lo, hi, e) + onSide(a5, lo, hi, e) +
+-                   onSide(b0, lo, hi, e) + onSide(b1, lo, hi, e) + onSide(b2, lo, hi, e) +
+-                   onSide(b3, lo, hi, e) + onSide(b4, lo, hi, e) + onSide(b5, lo, hi, e);
+-        half gate = g1 > 0.0 ? smoothstep(g0, g1, n / 13.0) : 1.0;
+-        bool dark = l < mid;
+-        // anti-aliased edges to the nearer local extreme
+-        half s = smoothstep(t1, t2, spread) * gate * strength;
+-        half y = mix(l, dark ? lo : hi, s);
+-        // thin strokes (mostly surrounded by the other side) to pure black or white;
+-        // skip the 6 outer-ring fetches on flat/photo pixels where push is guaranteed 0
+-        half push = 0.0;
+-        if (spread > ms * 0.6 && gate > 0.0 && !(dark && lo > mtone)) {
+-            half k0 = luma(xy + r * float2(2.598, 1.5));
+-            half k1 = luma(xy + r * float2(0.0, 3.0));
+-            half k2 = luma(xy + r * float2(-2.598, 1.5));
+-            half k3 = luma(xy + r * float2(-2.598, -1.5));
+-            half k4 = luma(xy + r * float2(0.0, -3.0));
+-            half k5 = luma(xy + r * float2(2.598, -1.5));
+-            half o = other(a0, mid, dark) + other(a1, mid, dark) + other(a2, mid, dark) +
+-                       other(a3, mid, dark) + other(a4, mid, dark) + other(a5, mid, dark) +
+-                       other(b0, mid, dark) + other(b1, mid, dark) + other(b2, mid, dark) +
+-                       other(b3, mid, dark) + other(b4, mid, dark) + other(b5, mid, dark) +
+-                       other(k0, mid, dark) + other(k1, mid, dark) + other(k2, mid, dark) +
+-                       other(k3, mid, dark) + other(k4, mid, dark) + other(k5, mid, dark);
+-            push = smoothstep(m0, m1, o / 18.0) * smoothstep(ms * 0.6, ms, spread) * gate *
+-                    strength;
+-            y = mix(y, dark ? 0.0 : 1.0, push);
+-        }
++        half y = l;
+         bool line = false;
+         bool knocked = false;
+-        if (dark) {
+-            bool wantContour = spread >= c0 && spread < cmax && hi >= clight;
+-            // gate > 0.5 keeps knockout off high-contrast edges inside photos
+-            bool wantKnock = knock > 0.5 && push < 0.5 && spread >= ms && gate > 0.5;
+-            if (wantContour || wantKnock) {
+-                half n4 = max(max(luma(xy + float2(1.0, 0.0)), luma(xy - float2(1.0, 0.0))),
+-                              max(luma(xy + float2(0.0, 1.0)), luma(xy - float2(0.0, 1.0))));
+-                if (n4 >= mid) {
+-                    // low-contrast steps between light flat tones: a 1-px line on the darker
+-                    // side (dotted below csolid)
+-                    if (wantContour) {
+-                        float2 ip = floor(xy);
+-                        line = spread >= csolid || mod(ip.x + ip.y, 2.0) < 0.5;
++        // A flat pixel (most of a page) has no edge to snap (spread > t1), no stroke to push
++        // (spread > ms * 0.6) and no contour or knockout (spread >= c0, >= ms): it is only
++        // toned, with the same result as the full test.
++        if (spread >= min(min(t1, c0), ms * 0.6)) {
++            half mid = 0.5 * (lo + hi);
++            half e = 0.25 * spread;
++            half n = 1.0 + onSide(a0, lo, hi, e) + onSide(a1, lo, hi, e) + onSide(a2, lo, hi, e) +
++                       onSide(a3, lo, hi, e) + onSide(a4, lo, hi, e) + onSide(a5, lo, hi, e) +
++                       onSide(b0, lo, hi, e) + onSide(b1, lo, hi, e) + onSide(b2, lo, hi, e) +
++                       onSide(b3, lo, hi, e) + onSide(b4, lo, hi, e) + onSide(b5, lo, hi, e);
++            half gate = g1 > 0.0 ? smoothstep(g0, g1, n / 13.0) : 1.0;
++            bool dark = l < mid;
++            // anti-aliased edges to the nearer local extreme
++            half s = smoothstep(t1, t2, spread) * gate * strength;
++            y = mix(l, dark ? lo : hi, s);
++            // thin strokes (mostly surrounded by the other side) to pure black or white;
++            // skip the 6 outer-ring fetches on flat/photo pixels where push is guaranteed 0
++            half push = 0.0;
++            if (spread > ms * 0.6 && gate > 0.0 && !(dark && lo > mtone)) {
++                half k0 = luma(xy + r * float2(2.598, 1.5));
++                half k1 = luma(xy + r * float2(0.0, 3.0));
++                half k2 = luma(xy + r * float2(-2.598, 1.5));
++                half k3 = luma(xy + r * float2(-2.598, -1.5));
++                half k4 = luma(xy + r * float2(0.0, -3.0));
++                half k5 = luma(xy + r * float2(2.598, -1.5));
++                half o = other(a0, mid, dark) + other(a1, mid, dark) + other(a2, mid, dark) +
++                           other(a3, mid, dark) + other(a4, mid, dark) + other(a5, mid, dark) +
++                           other(b0, mid, dark) + other(b1, mid, dark) + other(b2, mid, dark) +
++                           other(b3, mid, dark) + other(b4, mid, dark) + other(b5, mid, dark) +
++                           other(k0, mid, dark) + other(k1, mid, dark) + other(k2, mid, dark) +
++                           other(k3, mid, dark) + other(k4, mid, dark) + other(k5, mid, dark);
++                push = smoothstep(m0, m1, o / 18.0) * smoothstep(ms * 0.6, ms, spread) * gate *
++                        strength;
++                y = mix(y, dark ? 0.0 : 1.0, push);
++            }
++            if (dark) {
++                bool wantContour = spread >= c0 && spread < cmax && hi >= clight;
++                // gate > 0.5 keeps knockout off high-contrast edges inside photos
++                bool wantKnock = knock > 0.5 && push < 0.5 && spread >= ms && gate > 0.5;
++                if (wantContour || wantKnock) {
++                    half n4 = max(max(luma(xy + float2(1.0, 0.0)), luma(xy - float2(1.0, 0.0))),
++                                  max(luma(xy + float2(0.0, 1.0)), luma(xy - float2(0.0, 1.0))));
++                    if (n4 >= mid) {
++                        // low-contrast steps between light flat tones: a 1-px line on the darker
++                        // side (dotted below csolid)
++                        if (wantContour) {
++                            float2 ip = floor(xy);
++                            line = spread >= csolid || mod(ip.x + ip.y, 2.0) < 0.5;
++                        }
++                        // a dithered fill pixel touching a light label: clear 1-px margin
++                        knocked = wantKnock;
+                     }
+-                    // a dithered fill pixel touching a light label: clear 1-px margin
+-                    knocked = wantKnock;
+                 }
+             }
+         }
+@@ -991,6 +995,11 @@ static const char* const kEinkRenderSkSL = R"(
+         if (knocked && t > 0.0 && t < 1.0) {
+             t = 1.0;
+         }
++        // Black and white need no threshold (it lies strictly inside (0, 1)).
++        if (t <= 0.0) return half4(0.0, 0.0, 0.0, 1.0);
++        if (t >= 1.0) return half4(1.0);
++        // the map holds round(rank / 16) as 0..255: thresholds strictly inside (0, 1)
++        half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
+         half v = t > th ? 1.0 : 0.0;
+         return half4(v, v, v, 1.0);
+     }
+@@ -1007,7 +1016,6 @@ static const char* const kEinkRenderFastSkSL = R"(
+     half4 main(float2 xy) {
+         half y = dot(img.eval(xy).rgb, W);
+         if (invert > 0.5) y = 1.0 - y;
+-        half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
+         half t = saturate((y - 0.04) / 0.92);
+         if (bleach < 1.0) {
+             t = mix(t, 1.0, smoothstep(bleach, bleach + 0.10, y));
+@@ -1015,7 +1023,10 @@ static const char* const kEinkRenderFastSkSL = R"(
+         if (crush > 0.0) {
+             t *= smoothstep(crush * 0.6, crush, y);
+         }
+-        t = t <= 0.0 ? 0.0 : pow(t, gamma);
++        if (t <= 0.0) return half4(0.0, 0.0, 0.0, 1.0);
++        if (t >= 1.0) return half4(1.0);
++        t = pow(t, gamma);
++        half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
+         half v = t > th ? 1.0 : 0.0;
+         return half4(v, v, v, 1.0);
+     }
+@@ -1031,11 +1042,12 @@ static const char* const kEinkRenderHdSkSL = R"(
+     uniform float clight;
+     uniform float cdrop;
+     uniform float invert;
+-    // panel level per step: lv0 = steps 0-3, ..., lv3 = steps 12-15 (DisplaySettings::einkLevelMap)
+-    uniform half4 lv0;
+-    uniform half4 lv1;
+-    uniform half4 lv2;
+-    uniform half4 lv3;
++    // Output value per step, (16 * panel level + 4) / 255 (DisplaySettings::einkLevelMap; the
++    // value passes the kernel's 16-level dither unchanged): pv0 = steps 0-3, ..., pv3 = 12-15.
++    uniform half4 pv0;
++    uniform half4 pv1;
++    uniform half4 pv2;
++    uniform half4 pv3;
+     const half3 W = half3(0.299, 0.587, 0.114);
+     half luma(float2 p) {
+         half v = dot(img.eval(p).rgb, W);
+@@ -1043,11 +1055,13 @@ static const char* const kEinkRenderHdSkSL = R"(
+     }
+     half4 main(float2 xy) {
+         half l = luma(xy);
+-        half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
+         half span = max(white16 - 0.04, 0.1);
+         half t = saturate((l - 0.04) / span);
+-        t = t <= 0.0 ? 0.0 : pow(t, gamma16);
+-        if (cdrop > 0.0) {
++        if (t > 0.0 && t < 1.0) t = pow(t, gamma16);
++        // The contour needs a lighter neighbour (nmax <= 1) at least c0 above this pixel, below
++        // cmax above it and at least clight: never on paper (l > 1 - c0) or on text and dark fills
++        // (l <= clight - cmax), most of a page, which then skips the 4 reads (margins for half).
++        if (cdrop > 0.0 && l > clight - cmax - 0.004 && l < 1.004 - c0) {
+             half n0 = luma(xy + float2(1.0, 0.0));
+             half n1 = luma(xy - float2(1.0, 0.0));
+             half n2 = luma(xy + float2(0.0, 1.0));
+@@ -1061,13 +1075,17 @@ static const char* const kEinkRenderHdSkSL = R"(
+                 t = min(t, max(0.25, t - cdrop));
+             }
+         }
+-        half q = clamp(floor(t * 15.0 + th), 0.0, 15.0);
++        // Steps 0 and 15 need no threshold (it lies strictly inside (0, 1)).
++        half q = t >= 1.0 ? 15.0 : 0.0;
++        if (t > 0.0 && t < 1.0) {
++            half th = (noise.eval(xy).r * 255.0 + 0.5) / 256.0;
++            q = clamp(floor(t * 15.0 + th), 0.0, 15.0);
++        }
+         const half4 steps = half4(0.0, 1.0, 2.0, 3.0);
+         const half4 near = half4(0.5);
+-        q = dot(lv0, step(abs(steps - q), near)) + dot(lv1, step(abs(steps + 4.0 - q), near)) +
+-            dot(lv2, step(abs(steps + 8.0 - q), near)) +
+-            dot(lv3, step(abs(steps + 12.0 - q), near));
+-        half v = (q * 16.0 + 4.0) / 255.0;  // passes the kernel's 16-level dither unchanged
++        half v = dot(pv0, step(abs(steps - q), near)) + dot(pv1, step(abs(steps + 4.0 - q), near)) +
++                 dot(pv2, step(abs(steps + 8.0 - q), near)) +
++                 dot(pv3, step(abs(steps + 12.0 - q), near));
+         return half4(v, v, v, 1.0);
+     }
+ )";
+@@ -1115,14 +1133,15 @@ bool SkiaRenderEngine::drawEinkRender(const DisplaySettings& display,
+         builder.uniform("clight") = display.einkContourLight;
+         builder.uniform("cdrop") =
+                 std::max(0.f, std::min(1.f, display.einkContour16));
+-        float lv[16];
++        float pv[16];
+         for (int k = 0; k < 16; k++) {
+-            lv[k] = static_cast<float>((display.einkLevelMap >> (4 * k)) & 0xFu);
++            const float level = static_cast<float>((display.einkLevelMap >> (4 * k)) & 0xFu);
++            pv[k] = (level * 16.f + 4.f) / 255.f;
+         }
+-        builder.uniform("lv0") = SkV4{lv[0], lv[1], lv[2], lv[3]};
+-        builder.uniform("lv1") = SkV4{lv[4], lv[5], lv[6], lv[7]};
+-        builder.uniform("lv2") = SkV4{lv[8], lv[9], lv[10], lv[11]};
+-        builder.uniform("lv3") = SkV4{lv[12], lv[13], lv[14], lv[15]};
++        builder.uniform("pv0") = SkV4{pv[0], pv[1], pv[2], pv[3]};
++        builder.uniform("pv1") = SkV4{pv[4], pv[5], pv[6], pv[7]};
++        builder.uniform("pv2") = SkV4{pv[8], pv[9], pv[10], pv[11]};
++        builder.uniform("pv3") = SkV4{pv[12], pv[13], pv[14], pv[15]};
+     } else if (display.einkMode == 1) {
+         builder.uniform("bleach") = display.einkBleach;
+         builder.uniform("crush") = display.einkCrush;
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/EinkPropertyWatch.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/EinkPropertyWatch.h
+new file mode 100644
+index 0000000..2af3a61
+--- /dev/null
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/EinkPropertyWatch.h
+@@ -0,0 +1,130 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <android-base/parsebool.h>
++#include <android-base/parseint.h>
++#include <sys/system_properties.h>
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++
++namespace android::compositionengine::impl {
++
++// E-ink (Bigme HiBreak Pro): SurfaceFlinger's e-ink code (EinkMotion, the render pass settings in
++// Output) caches its tuning properties and reads them again when a property changed. The area
++// serial (__system_property_area_serial) changes with every write anywhere, and a few properties
++// are written all the time: by system_server (a finger down and up, sleep, unlock, the fingerprint
++// sensor) and by SurfaceFlinger itself (the refresh mode, the one-shot, the panel holds). Each of
++// those writes made both caches read ~60 properties on SurfaceFlinger's main thread.
++//
++// This tells those writes apart. Every update adds 1 to the area serial and 2 to the low 24 bits
++// of the property's own serial (bionic system_properties.cpp: odd while the value is being
++// written), and adding a property adds 1 to the area serial. So when the area serial grew by
++// exactly the number of updates of the listed properties, nothing else changed. Anything that
++// can't be accounted for (an added property, a write in progress, a missing property that
++// appeared) counts as a change: the caller reloads, as before. A write of another property that
++// races with a listed one is seen at the next call, when the area serial moves again.
++//
++// The listed properties are the caller's to read on every call, through info(). Not thread-safe.
++template <size_t N>
++class EinkPropertyWatch {
++public:
++    explicit EinkPropertyWatch(const std::array<const char*, N>& names) : mNames(names) {}
++
++    // True on the first call, and when a property other than the listed ones was written or
++    // added since the last call.
++    bool othersChanged() {
++        const uint32_t area = __system_property_area_serial();
++        if (mKnown && area == mArea) return false;
++        bool others = !mKnown;
++        uint32_t updates = 0;
++        for (size_t i = 0; i < N; i++) {
++            if (mInfo[i] == nullptr) {
++                // Properties only appear with an area change: look again now.
++                mInfo[i] = __system_property_find(mNames[i]);
++                if (mInfo[i] != nullptr) {
++                    mCount[i] = updateCount(mInfo[i]);
++                    others = true; // added: its updates so far are not counted
++                }
++                continue;
++            }
++            const uint32_t count = updateCount(mInfo[i]);
++            updates += (count - mCount[i]) & kCountMask;
++            mCount[i] = count;
++        }
++        if (area - mArea != updates) others = true;
++        mArea = area;
++        mKnown = true;
++        return others;
++    }
++
++    // The listed property's prop_info, or null while it doesn't exist (found again at the next
++    // area change).
++    const prop_info* info(size_t i) const { return mInfo[i]; }
++
++private:
++    static constexpr uint32_t kCountMask = 0x7fffff;
++
++    // A property's updates so far (mod 2^23). A write in progress (odd serial) is not done yet.
++    static uint32_t updateCount(const prop_info* pi) {
++        return (__system_property_serial(pi) & 0xffffff) >> 1;
++    }
++
++    const std::array<const char*, N> mNames;
++    std::array<const prop_info*, N> mInfo{};
++    std::array<uint32_t, N> mCount{};
++    uint32_t mArea = 0;
++    bool mKnown = false;
++};
++
++namespace eink_detail {
++inline void copyValue(void* cookie, const char*, const char* value, uint32_t) {
++    *static_cast<std::string*>(cookie) = value;
++}
++} // namespace eink_detail
++
++// A property's value from its prop_info, parsed as base::GetBoolProperty / GetUintProperty do:
++// the default when it doesn't exist, is empty or doesn't parse.
++inline std::string einkPropValue(const prop_info* pi) {
++    std::string value;
++    if (pi != nullptr) __system_property_read_callback(pi, eink_detail::copyValue, &value);
++    return value;
++}
++
++inline bool einkPropBool(const prop_info* pi, bool defaultValue) {
++    switch (base::ParseBool(einkPropValue(pi))) {
++        case base::ParseBoolResult::kTrue:
++            return true;
++        case base::ParseBoolResult::kFalse:
++            return false;
++        default:
++            return defaultValue;
++    }
++}
++
++template <typename T>
++T einkPropUint(const prop_info* pi, T defaultValue) {
++    const std::string value = einkPropValue(pi);
++    T result;
++    if (!value.empty() && base::ParseUint(value, &result)) return result;
++    return defaultValue;
++}
++
++} // namespace android::compositionengine::impl
+diff --git a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+index ca66e2d..c5faf87 100644
+--- a/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
++++ b/services/surfaceflinger/CompositionEngine/include/compositionengine/impl/Output.h
+@@ -148,6 +148,10 @@ protected:
+     // E-ink (Bigme HiBreak Pro): fills in the enhancement settings from the properties.
+     static void applyEinkEnhance(renderengine::DisplaySettings&, bool trackKernelDither = false,
+                                int32_t* outDamagePad = nullptr);
++public:
++    // E-ink: the input method is on screen (EinkMotion, for debug.sf.eink.fast_full).
++    static void setEinkImeVisible(bool visible);
++protected:
+     mutable int32_t mLastEinkDamagePad = 0;
+     virtual renderengine::DisplaySettings generateClientCompositionDisplaySettings(
+             const std::shared_ptr<renderengine::ExternalTexture>& buffer) const;
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index 1609ee6..48a361c 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -56,7 +56,9 @@
+ 
+ #include <android-base/parseint.h>
+ #include <android-base/properties.h>
++#include <compositionengine/impl/EinkPropertyWatch.h>
+ #include <sys/system_properties.h>
++#include <atomic>
+ #include <cmath>
+ #include <mutex>
+ #include <ui/DebugUtils.h>
+@@ -1355,7 +1357,15 @@ void Output::finishFrame(GpuCompositionResult&& result) {
+         // as a fringe around the changed area.
+         const int32_t pad =
+                 getDisplayIdVariant().and_then(asPhysicalDisplayId) ? mLastEinkDamagePad : 0;
+-        if (pad > 0) {
++        if (pad > 0 && dirty.isRect()) {
++            // One rectangle (the usual case): padded as it is, without a region union.
++            const Rect r = dirty.getBounds();
++            if (!r.isValid()) {
++                dirty = Region(outputState.framebufferSpace.getBoundsAsRect());
++            } else if (!r.isEmpty()) {
++                dirty = Region(Rect(r.left - pad, r.top - pad, r.right + pad, r.bottom + pad));
++            }
++        } else if (pad > 0) {
+             Region padded;
+             for (const Rect& r : dirty) {
+                 if (!r.isValid()) {
+@@ -1607,170 +1617,238 @@ uint64_t einkLevelMap(const char* name) {
+     return map;
+ }
+ 
++// The properties behind EinkEnhance that change only when someone tunes them (or HiBreakParts
++// picks a new temperature band or per-app inversion): read again only then, not on every write of
++// the mode, the one-shot or a panel hold (EinkPropertyWatch).
++struct EinkTunables {
++    uint32_t enhancePct = 0;
++    float radius = 3.5f;
++    float t1 = 0.04f;
++    float t2 = 0.12f;
++    float gate0 = 0.55f;
++    float gate1 = 0.80f;
++    int32_t render = 3;
++    bool damagePad = true;
++    bool offscreen = true;
++    bool kernelDither = true;
++    uint32_t fastFull = 2;
++    uint32_t fastGreys = 0;
++    float minority0 = 0.50f;
++    float minority1 = 0.65f;
++    float minSpread = 0.25f;
++    float contour0 = 0.03f;
++    float contourMax = 0.32f;
++    float contourLight = 0.75f;
++    float contourSolid = 0.10f;
++    float contour16 = 0.30f;
++    float gamma = 1.25f;
++    float gamma16 = 1.25f;
++    float white16 = 1.f;
++    float gammaFast = 2.f;
++    uint64_t levelMapFast = 0xFEDCBA9876543210ull;
++    float minTone = 1.f;
++    bool knock = true;
++    bool invert = false;
++    float bleach = 0.76f;
++    float crush = 0.36f;
++    // The enhancement pass (debug.sf.eink_render=2).
++    bool enhanceFast = true;
++    float solid1 = 0.95f;
++    float solid2 = 1.0f;
++    float contrastBlack = 0.f;
++    float contrastWhite = 1.f;
++};
++
++EinkTunables loadEinkTunables() {
++    EinkTunables t;
++    t.enhancePct = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance", 0u);
++    t.radius = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.radius_x10", 35u) / 10.f;
++    t.t1 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t1_x1000", 40u) / 1000.f;
++    t.t2 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t2_x1000", 120u) / 1000.f;
++    t.gate0 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.gate0_x1000", 550u) / 1000.f;
++    t.gate1 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.gate1_x1000", 800u) / 1000.f;
++    t.render = static_cast<int32_t>(base::GetUintProperty<uint32_t>("debug.sf.eink_render", 3u));
++    t.damagePad = base::GetBoolProperty("debug.sf.eink.damage_pad", true);
++    t.offscreen = base::GetBoolProperty("debug.sf.eink.offscreen", true);
++    t.kernelDither = base::GetBoolProperty("debug.sf.eink_kernel_dither", true);
++    t.fastFull = base::GetUintProperty<uint32_t>("debug.sf.eink.fast_full", 2u);
++    t.fastGreys = base::GetUintProperty<uint32_t>(
++            "debug.sf.eink.fast_greys",
++            base::GetUintProperty<uint32_t>("vendor.xrz.hibreak_fast_greys", 0u));
++    t.minority0 = einkProp("debug.sf.eink.minority0_x1000", 500u, 1000.f);
++    t.minority1 = einkProp("debug.sf.eink.minority1_x1000", 650u, 1000.f);
++    t.minSpread = einkProp("debug.sf.eink.minspread_x1000", 250u, 1000.f);
++    const bool contourOn = base::GetBoolProperty("debug.sf.eink.contour", true);
++    t.contour0 = contourOn ? einkProp("debug.sf.eink.contour0_x1000", 30u, 1000.f) : 2.f;
++    t.contourMax = einkProp("debug.sf.eink.contourmax_x1000", 320u, 1000.f);
++    t.contourLight = einkProp("debug.sf.eink.contourlight_x1000", 750u, 1000.f);
++    t.contourSolid = einkProp("debug.sf.eink.contoursolid_x1000", 100u, 1000.f);
++    t.contour16 = (contourOn && base::GetBoolProperty("debug.sf.eink.contour16", true))
++            ? std::max(0.f,
++                       std::min(1.f, einkProp("debug.sf.eink.contour16_drop_x1000", 300u, 1000.f)))
++            : 0.f;
++    t.gamma = einkProp("debug.sf.eink.gamma_x100", 125u, 100.f);
++    t.gamma16 = einkProp("debug.sf.eink.gamma16_x100", 125u, 100.f);
++    // Upper white point of the 16-level pass: 1.0 keeps light UI surfaces (#F5F5F5,
++    // #EFEAE2, #D9FDD3) distinct from white instead of clipping >= 0.96 to white.
++    t.white16 =
++            std::max(0.5f, std::min(1.f, einkProp("debug.sf.eink.white16_x1000", 1000u, 1000.f)));
++    // Greys in FAST, measured per temperature band: HiBreakParts publishes the band's curve and
++    // map (vendor.xrz.hibreak_fast_gamma_x100 / _fast_levels) from the battery temperature, one
++    // of the two the kernel picks its waveform by. The debug properties override them for the
++    // bench.
++    t.gammaFast = einkProp("debug.sf.eink.gamma_fast_x100",
++                           base::GetUintProperty<uint32_t>("vendor.xrz.hibreak_fast_gamma_x100",
++                                                           200u),
++                           100.f);
++    t.levelMapFast = einkLevelMap(base::GetProperty("debug.sf.eink.fast_levels", "").empty()
++                                          ? "vendor.xrz.hibreak_fast_levels"
++                                          : "debug.sf.eink.fast_levels");
++    t.minTone = einkProp("debug.sf.eink.mintone_x1000", 1000u, 1000.f);
++    t.knock = base::GetBoolProperty("debug.sf.eink.knock", true);
++    // HiBreakParts' per-app "inverted" mode, set while such an app is in front
++    t.invert = base::GetBoolProperty("vendor.xrz.hibreak_eink_invert", false);
++    // HiBreakParts' contrast for this pass: light greys from `bleach` up become white
++    // (keeping an outline), greys below `crush` black; 255 / 0 turn them off. The
++    // enhancement pass keeps its own vendor.xrz.hibreak_contrast_black/white, so
++    // debug.sf.eink_render=2 still shows exactly what it did.
++    t.bleach = std::max(128u, std::min(255u, base::GetUintProperty<uint32_t>(
++                                                     "vendor.xrz.hibreak_eink_bleach", 194u))) /
++            255.f;
++    t.crush = std::min(128u, base::GetUintProperty<uint32_t>("vendor.xrz.hibreak_eink_crush", 92u)) /
++            255.f;
++    // FAST (0xb3) is also the motion mode: debug.sf.eink_enhance.fast=0 leaves the
++    // pass out while the screen moves, for a shorter composition (the repaint in the
++    // normal mode at the end of the motion has it again).
++    t.enhanceFast = base::GetBoolProperty("debug.sf.eink_enhance.fast", true);
++    t.solid1 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid1_x1000", 950u) / 1000.f;
++    t.solid2 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid2_x1000", 1000u) / 1000.f;
++    t.contrastBlack =
++            std::min(120u, base::GetUintProperty<uint32_t>("vendor.xrz.hibreak_contrast_black", 0u)) /
++            255.f;
++    t.contrastWhite = std::max(135u, std::min(255u, base::GetUintProperty<uint32_t>(
++                                                            "vendor.xrz.hibreak_contrast_white",
++                                                            255u))) /
++            255.f;
++    return t;
++}
++
++// The in-process keyboard state from EinkMotion (Output::setEinkImeVisible).
++std::atomic<bool> sEinkImeVisible{false};
++
+ EinkEnhance getEinkEnhance(bool trackKernelDither) {
+     static std::mutex sMutex;
+-    static uint32_t sSerial = 0xffffffffu;
+-    static EinkEnhance sConfig;
++    // Written all the time (the mode and one-shot by SurfaceFlinger's EinkMotion and HiBreakParts,
++    // the holds, and system_server's touch, sleep, unlock and fingerprint signals): read on every
++    // frame; their writes don't make the tuning properties be read again.
++    enum { kMode, kForce, kCommit, kHotCount };
++    static compositionengine::impl::EinkPropertyWatch<7> sWatch{{
++            "vendor.xrz.global_refresh_mode", "vendor.xrz.force_global_refresh_mode",
++            "vendor.xrz.disable_commit", "vendor.xrz.hibreak_touch", "vendor.xrz.hibreak_sleep",
++            "vendor.xrz.hibreak_unlock", "vendor.xrz.hibreak_finger"}};
++    static EinkTunables sTunables;
+     // Mirror the kernel's g_last_dither_type (docs/lessons-learned.md): 3 (1-bit Atkinson Y1)
+     // after NORMAL/FAST/HYPER, 4 (16-level Atkinson Y4) after HD/GL16. CLEAN/GC16 (0xb0/0x04)
+     // inherits g_last_dither_type when kernel dither is on.
+     static uint32_t sLastKernelDither = 3u;
+     std::lock_guard lock(sMutex);
+-    const uint32_t serial = __system_property_area_serial();
+-    if (serial != sSerial) {
+-        sSerial = serial;
+-        EinkEnhance c;
+-        const uint32_t mode =
+-                base::GetUintProperty<uint32_t>("vendor.xrz.global_refresh_mode", 0u) & 0xff;
+-        const uint32_t forceMode =
+-                base::GetUintProperty<uint32_t>("vendor.xrz.force_global_refresh_mode", 0u) & 0xff;
+-        const bool commitDisabled =
+-                base::GetBoolProperty("vendor.xrz.disable_commit", false);
+-        const uint32_t enhancePct =
+-                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance", 0u);
+-        c.radius = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.radius_x10", 35u) / 10.f;
+-        c.t1 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t1_x1000", 40u) / 1000.f;
+-        c.t2 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.t2_x1000", 120u) / 1000.f;
+-        c.gate0 =
+-                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.gate0_x1000", 550u) / 1000.f;
+-        c.gate1 =
+-                base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.gate1_x1000", 800u) / 1000.f;
+-        c.render = static_cast<int32_t>(
+-                base::GetUintProperty<uint32_t>("debug.sf.eink_render", 3u));
+-        c.damagePad = base::GetBoolProperty("debug.sf.eink.damage_pad", true);
+-        c.offscreen = base::GetBoolProperty("debug.sf.eink.offscreen", true);
+-        const uint32_t effectiveMode = (forceMode != 0) ? forceMode : mode;
+-        c.effectiveMode = effectiveMode;
+-        c.commitDisabled = commitDisabled;
+-        c.kernelDither = base::GetBoolProperty("debug.sf.eink_kernel_dither", true);
+-        if (c.render >= 3 && enhancePct > 0) {
+-            bool fastGreys = false;
+-            // The panel's mode decides what the frame must become: NORMAL (DU, dithered by the
+-            // kernel) gets the full pass; FAST and HYPER (A2, never dithered by the kernel: greys
+-            // would become partial drives and grey residue) the cheap one; the grey modes
+-            // (HD, GL16) 16 levels. CLEAN/GC16 (0xb0/0x04) inherits g_last_dither_type below.
+-            switch (effectiveMode) {
+-                case 0xb3: case 0x10: case 0x11: case 0xb7:
+-                {
+-                    // FAST is the scrolling mode and the typing mode (the whole time the keyboard
+-                    // is up). Scrolling gets the cheap version (tone and dither only): with the
+-                    // full pass a quarter of the panel frames of a drag got no new content.
+-                    // Typing gets the full pass, so key outlines and solid text stay.
+-                    // debug.sf.eink.fast_full: 2 = by the keyboard (EinkMotion publishes
+-                    // vendor.xrz.hibreak_ime_visible), 1 = always full, 0 = always cheap.
+-                    const uint32_t full =
+-                            base::GetUintProperty<uint32_t>("debug.sf.eink.fast_full", 2u);
+-                    const bool ime = base::GetBoolProperty("vendor.xrz.hibreak_ime_visible", false);
+-                    c.mode = (full == 1 || (full == 2 && ime)) ? 0 : 1;
+-                    // Greys in FAST: the 16-level version. A2 (0x11) is not dithered by the
+-                    // kernel, its auto-clean table drives each pixel in proportion to the change
+-                    // of its level and its cleanup passes then refine it: greys in 35 ms passes,
+-                    // where HD takes 443 ms (scripts/eink-bench/greys.py). Tone curve
+-                    // (debug.sf.eink.gamma_fast_x100) and level map (debug.sf.eink.fast_levels)
+-                    // are measured on the panel. debug.sf.eink.fast_greys (default: HiBreakParts'
+-                    // vendor.xrz.hibreak_fast_greys): 1 or 2 = greys always (including while the
+-                    // keyboard is up: mode 2 keeps light tones and key outlines distinguishable),
+-                    // 3 = greys except while the keyboard is up, 0 = off.
+-                    const uint32_t greys = base::GetUintProperty<uint32_t>(
+-                            "debug.sf.eink.fast_greys",
+-                            base::GetUintProperty<uint32_t>("vendor.xrz.hibreak_fast_greys", 0u));
+-                    // Only the whole-panel A2 path is undithered: partial A2 (0x10) and HYPER
+-                    // (0xb7) get the kernel's 1-bit Atkinson.
+-                    const bool a2 = effectiveMode == 0xb3 || effectiveMode == 0x11;
+-                    if (a2 && (greys == 1 || greys == 2 || (greys == 3 && c.mode == 1))) {
+-                        c.mode = 2;
+-                        fastGreys = true;
+-                    }
+-                    break;
+-                }
+-                case 0xb1: case 0x21: case 0x20: case 0x84: case 0x40: case 0xb4:
++    if (sWatch.othersChanged()) sTunables = loadEinkTunables();
++    const EinkTunables& t = sTunables;
++    const uint32_t mode =
++            compositionengine::impl::einkPropUint<uint32_t>(sWatch.info(kMode), 0u) & 0xff;
++    const uint32_t forceMode =
++            compositionengine::impl::einkPropUint<uint32_t>(sWatch.info(kForce), 0u) & 0xff;
++    const bool commitDisabled = compositionengine::impl::einkPropBool(sWatch.info(kCommit), false);
++
++    EinkEnhance c;
++    c.radius = t.radius;
++    c.t1 = t.t1;
++    c.t2 = t.t2;
++    c.gate0 = t.gate0;
++    c.gate1 = t.gate1;
++    c.render = t.render;
++    c.damagePad = t.damagePad;
++    c.offscreen = t.offscreen;
++    const uint32_t effectiveMode = (forceMode != 0) ? forceMode : mode;
++    c.effectiveMode = effectiveMode;
++    c.commitDisabled = commitDisabled;
++    c.kernelDither = t.kernelDither;
++    if (c.render >= 3 && t.enhancePct > 0) {
++        bool fastGreys = false;
++        // The panel's mode decides what the frame must become: NORMAL (DU, dithered by the
++        // kernel) gets the full pass; FAST and HYPER (A2, never dithered by the kernel: greys
++        // would become partial drives and grey residue) the cheap one; the grey modes
++        // (HD, GL16) 16 levels. CLEAN/GC16 (0xb0/0x04) inherits g_last_dither_type below.
++        switch (effectiveMode) {
++            case 0xb3: case 0x10: case 0x11: case 0xb7:
++            {
++                // FAST is the scrolling mode and the typing mode (the whole time the keyboard
++                // is up). Scrolling gets the cheap version (tone and dither only): with the
++                // full pass a quarter of the panel frames of a drag got no new content.
++                // Typing gets the full pass, so key outlines and solid text stay.
++                // debug.sf.eink.fast_full: 2 = by the keyboard (EinkMotion's
++                // setEinkImeVisible), 1 = always full, 0 = always cheap.
++                const bool ime = sEinkImeVisible.load(std::memory_order_relaxed);
++                c.mode = (t.fastFull == 1 || (t.fastFull == 2 && ime)) ? 0 : 1;
++                // Greys in FAST: the 16-level version. A2 (0x11) is not dithered by the
++                // kernel, its auto-clean table drives each pixel in proportion to the change
++                // of its level and its cleanup passes then refine it: greys in 35 ms passes,
++                // where HD takes 443 ms (scripts/eink-bench/greys.py). Tone curve
++                // (debug.sf.eink.gamma_fast_x100) and level map (debug.sf.eink.fast_levels)
++                // are measured on the panel. debug.sf.eink.fast_greys (default: HiBreakParts'
++                // vendor.xrz.hibreak_fast_greys): 1 or 2 = greys always (including while the
++                // keyboard is up: mode 2 keeps light tones and key outlines distinguishable),
++                // 3 = greys except while the keyboard is up, 0 = off.
++                const uint32_t greys = t.fastGreys;
++                // Only the whole-panel A2 path is undithered: partial A2 (0x10) and HYPER
++                // (0xb7) get the kernel's 1-bit Atkinson.
++                const bool a2 = effectiveMode == 0xb3 || effectiveMode == 0x11;
++                if (a2 && (greys == 1 || greys == 2 || (greys == 3 && c.mode == 1))) {
+                     c.mode = 2;
+-                    break;
+-                default:
+-                    c.mode = 0;
+-            }
+-            c.strength = enhancePct / 100.f;
+-            c.minority0 = einkProp("debug.sf.eink.minority0_x1000", 500u, 1000.f);
+-            c.minority1 = einkProp("debug.sf.eink.minority1_x1000", 650u, 1000.f);
+-            c.minSpread = einkProp("debug.sf.eink.minspread_x1000", 250u, 1000.f);
+-            const bool contourOn = base::GetBoolProperty("debug.sf.eink.contour", true);
+-            if (contourOn) {
+-                c.contour0 = einkProp("debug.sf.eink.contour0_x1000", 30u, 1000.f);
+-            } else {
+-                c.contour0 = 2.f;
+-            }
+-            c.contourMax = einkProp("debug.sf.eink.contourmax_x1000", 320u, 1000.f);
+-            c.contourLight = einkProp("debug.sf.eink.contourlight_x1000", 750u, 1000.f);
+-            c.contourSolid = einkProp("debug.sf.eink.contoursolid_x1000", 100u, 1000.f);
+-            c.contour16 = (contourOn && base::GetBoolProperty("debug.sf.eink.contour16", true))
+-                    ? std::max(0.f,
+-                               std::min(1.f,
+-                                        einkProp("debug.sf.eink.contour16_drop_x1000", 300u,
+-                                                 1000.f)))
+-                    : 0.f;
+-            c.gamma = einkProp("debug.sf.eink.gamma_x100", 125u, 100.f);
+-            c.gamma16 = einkProp("debug.sf.eink.gamma16_x100", 125u, 100.f);
+-            c.levelMap = 0xFEDCBA9876543210ull;
+-            // Upper white point of the 16-level pass: 1.0 keeps light UI surfaces (#F5F5F5,
+-            // #EFEAE2, #D9FDD3) distinct from white instead of clipping >= 0.96 to white.
+-            c.white16 = std::max(
+-                    0.5f,
+-                    std::min(1.f, einkProp("debug.sf.eink.white16_x1000", 1000u, 1000.f)));
+-            if (fastGreys) {
+-                // Measured per temperature band: HiBreakParts publishes the band's curve and map
+-                // (vendor.xrz.hibreak_fast_gamma_x100 / _fast_levels) from the battery
+-                // temperature, one of the two the kernel picks its waveform by. The debug
+-                // properties override them for the bench.
+-                c.gamma16 = einkProp("debug.sf.eink.gamma_fast_x100",
+-                                     base::GetUintProperty<uint32_t>(
+-                                             "vendor.xrz.hibreak_fast_gamma_x100", 200u),
+-                                     100.f);
+-                c.levelMap = einkLevelMap(
+-                        base::GetProperty("debug.sf.eink.fast_levels", "").empty()
+-                                ? "vendor.xrz.hibreak_fast_levels"
+-                                : "debug.sf.eink.fast_levels");
+-            }
+-            c.minTone = einkProp("debug.sf.eink.mintone_x1000", 1000u, 1000.f);
+-            c.knock = base::GetBoolProperty("debug.sf.eink.knock", true);
+-            // HiBreakParts' per-app "inverted" mode, set while such an app is in front
+-            c.invert = base::GetBoolProperty("vendor.xrz.hibreak_eink_invert", false);
+-            // HiBreakParts' contrast for this pass: light greys from `bleach` up become white
+-            // (keeping an outline), greys below `crush` black; 255 / 0 turn them off. The
+-            // enhancement pass keeps its own vendor.xrz.hibreak_contrast_black/white, so
+-            // debug.sf.eink_render=2 still shows exactly what it did.
+-            c.bleach = std::max(128u, std::min(255u, base::GetUintProperty<uint32_t>(
+-                                                             "vendor.xrz.hibreak_eink_bleach",
+-                                                             194u))) / 255.f;
+-            c.crush = std::min(128u, base::GetUintProperty<uint32_t>(
+-                                             "vendor.xrz.hibreak_eink_crush", 92u)) / 255.f;
+-            c.black = 0.f;
+-            c.white = 1.f;
+-        } else {
+-            c.render = 0;
+-            const bool blackAndWhite = mode == 0 || mode == 0xb2 || mode == 0xb3 || mode == 0x02 ||
+-                    mode == 0x10 || mode == 0x11;
+-            if (blackAndWhite) {
+-                c.strength = enhancePct / 100.f;
+-                // FAST (0xb3) is also the motion mode: debug.sf.eink_enhance.fast=0 leaves the
+-                // pass out while the screen moves, for a shorter composition (the repaint in the
+-                // normal mode at the end of the motion has it again).
+-                if (mode == 0xb3 && !base::GetBoolProperty("debug.sf.eink_enhance.fast", true)) {
+-                    c.strength = 0.f;
++                    fastGreys = true;
+                 }
++                break;
+             }
+-            c.solid1 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid1_x1000", 950u) /
+-                    1000.f;
+-            c.solid2 = base::GetUintProperty<uint32_t>("debug.sf.eink_enhance.solid2_x1000",
+-                                                       1000u) / 1000.f;
+-            c.black = std::min(120u, base::GetUintProperty<uint32_t>(
+-                                             "vendor.xrz.hibreak_contrast_black", 0u)) / 255.f;
+-            c.white = std::max(135u, std::min(255u, base::GetUintProperty<uint32_t>(
+-                                                            "vendor.xrz.hibreak_contrast_white",
+-                                                            255u))) / 255.f;
++            case 0xb1: case 0x21: case 0x20: case 0x84: case 0x40: case 0xb4:
++                c.mode = 2;
++                break;
++            default:
++                c.mode = 0;
++        }
++        c.strength = t.enhancePct / 100.f;
++        c.minority0 = t.minority0;
++        c.minority1 = t.minority1;
++        c.minSpread = t.minSpread;
++        c.contour0 = t.contour0;
++        c.contourMax = t.contourMax;
++        c.contourLight = t.contourLight;
++        c.contourSolid = t.contourSolid;
++        c.contour16 = t.contour16;
++        c.gamma = t.gamma;
++        c.gamma16 = fastGreys ? t.gammaFast : t.gamma16;
++        c.levelMap = fastGreys ? t.levelMapFast : 0xFEDCBA9876543210ull;
++        c.white16 = t.white16;
++        c.minTone = t.minTone;
++        c.knock = t.knock;
++        c.invert = t.invert;
++        c.bleach = t.bleach;
++        c.crush = t.crush;
++        c.black = 0.f;
++        c.white = 1.f;
++    } else {
++        c.render = 0;
++        const bool blackAndWhite = mode == 0 || mode == 0xb2 || mode == 0xb3 || mode == 0x02 ||
++                mode == 0x10 || mode == 0x11;
++        if (blackAndWhite) {
++            c.strength = t.enhancePct / 100.f;
++            if (mode == 0xb3 && !t.enhanceFast) c.strength = 0.f;
+         }
+-        sConfig = c;
++        c.solid1 = t.solid1;
++        c.solid2 = t.solid2;
++        c.black = t.contrastBlack;
++        c.white = t.contrastWhite;
+     }
+-    EinkEnhance out = sConfig;
++    EinkEnhance out = c;
+     if (out.render >= 3 && out.strength > 0.f &&
+         (out.effectiveMode == 0xb0 || out.effectiveMode == 0x04)) {
+         out.mode = (!out.kernelDither || sLastKernelDither == 4u) ? 2 : 0;
+@@ -1848,6 +1926,10 @@ renderengine::DisplaySettings Output::generateClientCompositionDisplaySettings(
+     return clientCompositionDisplay;
+ }
+ 
++void Output::setEinkImeVisible(bool visible) {
++    sEinkImeVisible.store(visible, std::memory_order_relaxed);
++}
++
+ void Output::applyEinkEnhance(renderengine::DisplaySettings& settings, bool trackKernelDither,
+                               int32_t* outDamagePad) {
+     const EinkEnhance eink = getEinkEnhance(trackKernelDither);
+diff --git a/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp b/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
+index c92d4b7..60e9c27 100644
+--- a/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/RenderSurface.cpp
+@@ -229,6 +229,7 @@ void RenderSurface::queueBuffer(base::unique_fd readyFence, float hdrSdrRatio) {
+                 // ANativeWindow surface damage uses the OpenGL convention (bottom-left origin).
+                 const int32_t height = static_cast<int32_t>(mTexture->getBuffer()->getHeight());
+                 std::vector<android_native_rect_t> rects;
++                rects.reserve(static_cast<size_t>(mBufferDamage->end() - mBufferDamage->begin()));
+                 for (const Rect& r : *mBufferDamage) {
+                     rects.push_back({r.left, height - r.top, r.right, height - r.bottom});
+                 }
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index 4c583c3..1a9bf72 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -20,6 +20,7 @@
+ #include "EinkMotion.h"
+ 
+ #include <android-base/properties.h>
++#include <compositionengine/impl/Output.h>
+ #include <log/log.h>
+ 
+ #include <algorithm>
+@@ -30,6 +31,9 @@
+ namespace android {
+ namespace {
+ 
++using compositionengine::impl::einkPropBool;
++using compositionengine::impl::einkPropUint;
++
+ constexpr char kModeProperty[] = "vendor.xrz.global_refresh_mode";
+ // One-shot mode for the composer's next commit.
+ constexpr char kForceModeProperty[] = "vendor.xrz.force_global_refresh_mode";
+@@ -37,6 +41,8 @@ constexpr char kForceModeProperty[] = "vendor.xrz.force_global_refresh_mode";
+ constexpr char kDisableCommitProperty[] = "vendor.xrz.disable_commit";
+ // A finger is on the screen (system_server, DisplayPolicy).
+ constexpr char kTouchProperty[] = "vendor.xrz.hibreak_touch";
++// The phone is going to sleep (1) or waking up (0) (system_server, Notifier and PhoneWindowManager).
++constexpr char kSleepProperty[] = "vendor.xrz.hibreak_sleep";
+ // The keyguard went away: a new value (uptime ms) with every unlock (system_server).
+ constexpr char kUnlockProperty[] = "vendor.xrz.hibreak_unlock";
+ // A finger on the fingerprint sensor: uptime ms of its last acquire, 0 once the sensor has
+@@ -59,6 +65,10 @@ uint32_t readUint(const prop_info* pi, uint32_t fallback) {
+ 
+ } // namespace
+ 
++EinkMotion::EinkMotion()
++      : mWatch({kModeProperty, kForceModeProperty, kDisableCommitProperty, kTouchProperty,
++                kSleepProperty, kUnlockProperty, kFingerProperty}) {}
++
+ bool EinkMotion::enabled() {
+     static const bool sEnabled = base::GetBoolProperty("debug.sf.eink_motion", false);
+     return sEnabled;
+@@ -83,17 +93,21 @@ void EinkMotion::setRepaint(std::function<void()> repaint) {
+ }
+ 
+ void EinkMotion::reloadConfigIfChanged() {
+-    // The global serial changes with every property write anywhere; reloading is cheap.
+-    const uint32_t serial = __system_property_area_serial();
+-    if (serial == mPropSerial) return;
+-    mPropSerial = serial;
++    // The tuning properties, again only when a property other than the ones written all the time
++    // changed (EinkPropertyWatch); those are read below on every composite.
++    if (mWatch.othersChanged()) reloadTunables();
++    mConfig.touchDown = mConfig.touchEnabled && einkPropBool(mWatch.info(kHotTouch), false);
++    mConfig.asleep = einkPropBool(mWatch.info(kHotSleep), false);
++    mConfig.unlock = einkPropUint<uint64_t>(mWatch.info(kHotUnlock), 0);
++}
++
++void EinkMotion::reloadTunables() {
+     Config c;
+     c.motion = base::GetBoolProperty("vendor.xrz.hibreak_motion_fast", true);
+     c.ime = base::GetBoolProperty("vendor.xrz.hibreak_ime_fast", true);
+     // The first frames of a flick after idle would otherwise go out in the normal mode, which
+     // the kernel runs as a multi-pass update (~550 ms) that the FAST frames queue behind.
+     c.touchEnabled = c.motion && base::GetBoolProperty("debug.sf.eink_motion.touch", true);
+-    c.touchDown = c.touchEnabled && base::GetBoolProperty(kTouchProperty, false);
+     c.touchHold =
+             ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.touch_hold_ms", 5000));
+     c.touchGap = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_motion.touch_gap_ms", 400));
+@@ -121,7 +135,6 @@ void EinkMotion::reloadConfigIfChanged() {
+     c.barsMode = base::GetUintProperty<uint32_t>("debug.sf.eink_motion.reading_bars_mode", 0xb3);
+     if (isPageMode(c.barsMode)) c.readingBars = false;
+     c.sleep = base::GetBoolProperty("debug.sf.eink_sleep", true);
+-    c.asleep = base::GetBoolProperty("vendor.xrz.hibreak_sleep", false);
+     c.sleepMode = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.mode", 0xb2);
+     c.sleepClean = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.clean", 4);
+     c.sleepQuiet = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.quiet_ms", 120));
+@@ -134,7 +147,6 @@ void EinkMotion::reloadConfigIfChanged() {
+     c.wakeMode = base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.wake_mode", 0xb2);
+     c.wakeMin = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.wake_min_ms", 150));
+     c.wakeMax = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.wake_max_ms", 450));
+-    c.unlock = base::GetUintProperty<uint64_t>(kUnlockProperty, 0);
+     c.unlockMin = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.unlock_min_ms", 150));
+     c.unlockMax = ms2ns(base::GetUintProperty<uint32_t>("debug.sf.eink_sleep.unlock_max_ms", 700));
+     // The sensor reports a finger down, then the match ~230 ms later (2026-11-24); a finger that
+@@ -162,6 +174,12 @@ uint32_t EinkMotion::touchSerial() {
+     return mTouchProp ? __system_property_serial(mTouchProp) : 0u;
+ }
+ 
++bool EinkMotion::touchDownNow() {
++    // Read here, not from mConfig: the thread waits without composites coming in.
++    if (!mTouchProp) mTouchProp = __system_property_find(kTouchProperty);
++    return einkPropBool(mTouchProp, false);
++}
++
+ void EinkMotion::writeMode(uint32_t mode) {
+     base::SetProperty(kModeProperty, std::to_string(mode));
+     if (!mModeProp) mModeProp = __system_property_find(kModeProperty);
+@@ -209,6 +227,16 @@ void EinkMotion::endBars() {
+     mBarsActive = false;
+ }
+ 
++bool EinkMotion::takeBarsBase(uint32_t* base) {
++    // The page mode the reader's menu stands in for, if the property still holds our barsMode.
++    if (!mBarsActive || readMode() != mConfig.barsMode || modeSerial() != mWrittenSerial) {
++        return false;
++    }
++    *base = mBarsBase;
++    mBarsActive = false;
++    return true;
++}
++
+ void EinkMotion::settleBars() {
+     // The motion ended (mBase is about to be put back): in the mode the status bar asks for now.
+     if (mBarsActive && mBase == mConfig.barsMode && !(mConfig.readingBars && mBarsVisible)) {
+@@ -234,17 +262,20 @@ void EinkMotion::beginTurnHold(uint32_t turnBase, nsecs_t now) {
+     mCondition.notify_one();
+ }
+ 
+-void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now) {
++void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now, uint32_t base) {
+     mAsleep = asleep;
+-    const uint32_t current = readMode();
++    const uint32_t actual = readMode();
++    // base (non-zero): the mode the property stands in for (the page mode under a reader's menu),
++    // so the sleep mode replaces barsMode in one write instead of the page mode and then it.
++    const uint32_t current = base != 0 ? base : actual;
+     if (asleep) {
+         // The mode to come back to: the user's, not a fast mode of ours that is still set.
+-        const bool ours = mFast && current == mWritten && modeSerial() == mWrittenSerial;
++        const bool ours = mFast && actual == mWritten && modeSerial() == mWrittenSerial;
+         mSleepBase = ours ? mBase : current;
+         if (ours && mConfig.sleepMode == 0) writeMode(mBase);
+         mFast = false;
+         mStreak = 0;
+-        if (mConfig.sleepMode != 0 && current != mConfig.sleepMode) {
++        if (mConfig.sleepMode != 0 && actual != mConfig.sleepMode) {
+             mSleepWritten = mConfig.sleepMode;
+             writeMode(mSleepWritten);
+             mSleepWrittenSerial = mWrittenSerial;
+@@ -252,7 +283,7 @@ void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now) {
+         }
+     } else if (mSleepModeSet) {
+         // Unless someone else changed the mode meanwhile.
+-        if (current == mSleepWritten && modeSerial() == mSleepWrittenSerial) writeMode(mSleepBase);
++        if (actual == mSleepWritten && modeSerial() == mSleepWrittenSerial) writeMode(mSleepBase);
+         mSleepModeSet = false;
+     }
+     if (!asleep && mForceArmed && mConfig.wakeMode == 0) {
+@@ -292,9 +323,10 @@ void EinkMotion::beginUnlockHold(nsecs_t now) {
+     mCondition.notify_one();
+ }
+ 
+-bool EinkMotion::fingerReading(nsecs_t now) const {
++bool EinkMotion::fingerReading(nsecs_t now) {
+     // Read here, not from mConfig: the thread waits without composites coming in.
+-    const uint64_t at = base::GetUintProperty<uint64_t>(kFingerProperty, 0);
++    if (!mFingerProp) mFingerProp = __system_property_find(kFingerProperty);
++    const uint64_t at = einkPropUint<uint64_t>(mFingerProp, 0);
+     const uint64_t nowMs = static_cast<uint64_t>(ns2ms(now));
+     return at != 0 && at <= nowMs && nowMs - at < static_cast<uint64_t>(ns2ms(mConfig.fingerWindow));
+ }
+@@ -333,13 +365,17 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+     if (mConfig.sleep && mConfig.asleep != mAsleep) {
+         // The mode to come back to is the page mode, not ours for the status bar (the lock
+         // screen shows it too).
++        uint32_t sleepBase = 0;
+         if (mFast && mBarsActive && mBase == mConfig.barsMode) {
+             mBase = mBarsBase;
+             mBarsActive = false;
+         } else if (!mFrozen && !mFast) {
+-            endBars();
++            // Going to sleep from a reader's menu: the sleep mode goes straight over barsMode.
++            if (!(mConfig.asleep && mConfig.sleepMode != 0 && takeBarsBase(&sleepBase))) {
++                endBars();
++            }
+         }
+-        beginSleepTransition(mConfig.asleep, now);
++        beginSleepTransition(mConfig.asleep, now, sleepBase);
+         // An unlock seen while still asleep (its signal came first: a fingerprint match that
+         // woke the phone hides the keyguard at once) is shown with this wake-up.
+         if (!mAsleep && mUnlockPending) beginUnlockHold(now);
+@@ -380,12 +416,10 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+     }
+     mLastFrame = now;
+     mImeVisible = imeVisible;
+-    if (imeVisible != mImePublished) {
+-        // SurfaceFlinger's e-ink render pass gives FAST frames the full pass while the keyboard
+-        // is up (typing) and the cheap one otherwise (scrolling): debug.sf.eink.fast_full.
+-        mImePublished = imeVisible;
+-        base::SetProperty("vendor.xrz.hibreak_ime_visible", imeVisible ? "1" : "0");
+-    }
++    // SurfaceFlinger's e-ink render pass gives FAST frames the full pass while the keyboard is up
++    // (typing) and the cheap one otherwise (scrolling): debug.sf.eink.fast_full. In-process: it
++    // was the property vendor.xrz.hibreak_ime_visible, an IPC with every keyboard change.
++    compositionengine::impl::Output::setEinkImeVisible(imeVisible);
+     if (mFrozen) {
+         // A finger or the keyboard during a held page turn: that is interaction, show it FAST.
+         if (mFreezeForTurn && (mConfig.touchDown || (mConfig.ime && imeVisible))) {
+@@ -622,10 +656,12 @@ void EinkMotion::threadLoop() {
+         // immediately re-enter FAST and oscillate every 700 ms; but only for touchHold: a thumb
+         // resting while reading (or a touch that never ended for us) must not keep the screen in
+         // FAST's one-bit cheap pass. Once it has run out, the touch alone doesn't bring FAST back.
+-        if (mConfig.touchEnabled && base::GetBoolProperty(kTouchProperty, false)) {
++        if (mConfig.touchEnabled && touchDownNow()) {
+             if (mTouchHoldSince == 0) mTouchHoldSince = now;
+             if (now - mTouchHoldSince < mConfig.touchHold) {
+-                mCondition.wait_for(lock, std::chrono::milliseconds(100));
++                // Looked at again every 100 ms (a lift writes no composite), and when it runs out.
++                const nsecs_t left = mConfig.touchHold - (now - mTouchHoldSince);
++                mCondition.wait_for(lock, std::chrono::nanoseconds(std::min(ms2ns(100), left)));
+                 continue;
+             }
+             mTouchHoldExpired = true;
+@@ -638,7 +674,8 @@ void EinkMotion::threadLoop() {
+         // skips a composite without new buffers, so the repaint goes out with its one-shot in
+         // that mode (otherwise the panel keeps the last FAST frame until the composer's own idle
+         // refresh ~0.6 s later).
+-        if (readMode() == mWritten && modeSerial() == mWrittenSerial) {
++        const bool ours = readMode() == mWritten && modeSerial() == mWrittenSerial;
++        if (ours) {
+             settleBars();
+             writeMode(mBase);
+             if (mConfig.settleForce) {
+@@ -652,6 +689,10 @@ void EinkMotion::threadLoop() {
+         mStreak = 0;
+         mLastFrame = 0; // the repaint must not count as motion
+         mLastMotionFrame = 0;
++        // Someone else changed the mode meanwhile: no settle of ours to show. A repaint without
++        // new buffers and without the one-shot never reaches the panel, it only cost a
++        // composition with the e-ink pass.
++        if (!ours) continue;
+         const auto repaint = mRepaint;
+         lock.unlock();
+         if (repaint) repaint();
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index 1b2ab7d..695e125 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -21,6 +21,7 @@
+ #include <mutex>
+ #include <thread>
+ 
++#include <compositionengine/impl/EinkPropertyWatch.h>
+ #include <sys/system_properties.h>
+ #include <utils/Timers.h>
+ 
+@@ -64,7 +65,7 @@ public:
+     void onComposite(bool imeVisible, float damage = 1.f, bool barsVisible = false);
+ 
+ private:
+-    EinkMotion() = default;
++    EinkMotion();
+ 
+     struct Config {
+         bool motion = true;      // vendor.xrz.hibreak_motion_fast
+@@ -135,21 +136,24 @@ private:
+     };
+ 
+     void reloadConfigIfChanged();
++    void reloadTunables();
+     uint32_t readMode();
+     uint32_t modeSerial();
+     uint32_t touchSerial();
++    bool touchDownNow();
+     void writeMode(uint32_t mode);
+     bool isFast(uint32_t mode) const;
+     static bool isPageMode(uint32_t mode);
+     uint32_t pageWaveform(uint32_t mode) const;
+     void beginTurnHold(uint32_t turnBase, nsecs_t now);
+     void threadLoop();
+-    void beginSleepTransition(bool asleep, nsecs_t now);
++    void beginSleepTransition(bool asleep, nsecs_t now, uint32_t base = 0);
+     void beginUnlockHold(nsecs_t now);
+-    bool fingerReading(nsecs_t now) const;
++    bool fingerReading(nsecs_t now);
+     void applySleepMode();
+     void startBars(uint32_t base);
+     void endBars();
++    bool takeBarsBase(uint32_t* base);
+     void settleBars();
+ 
+     std::mutex mMutex;
+@@ -157,9 +161,14 @@ private:
+     bool mStarted = false;
+     std::function<void()> mRepaint;
+     Config mConfig;
+-    uint32_t mPropSerial = 0xffffffffu;
++    // The properties written all the time (system_server, and our own writes): read on every
++    // composite from their prop_info; writing them doesn't reload the tuning properties.
++    enum HotProperty { kHotMode, kHotForce, kHotCommit, kHotTouch, kHotSleep, kHotUnlock,
++                       kHotFinger, kHotCount };
++    compositionengine::impl::EinkPropertyWatch<kHotCount> mWatch;
+     const prop_info* mModeProp = nullptr;
+     const prop_info* mTouchProp = nullptr;
++    const prop_info* mFingerProp = nullptr;
+ 
+     nsecs_t mLastFrame = 0;
+     nsecs_t mLastMotionFrame = 0; // the last frame that counted as motion
+@@ -169,7 +178,6 @@ private:
+     nsecs_t mMotionEnd = 0;
+     uint32_t mStreak = 0;
+     bool mImeVisible = false;
+-    bool mImePublished = false;
+     bool mFast = false;    // the property holds our fast mode
+     uint32_t mBase = 0;    // the mode to put back
+     uint32_t mWritten = 0; // what we wrote, to notice when someone else changes the mode
+diff --git a/services/surfaceflinger/DisplayHardware/HWC2.cpp b/services/surfaceflinger/DisplayHardware/HWC2.cpp
+index 52a118d..517e434 100644
+--- a/services/surfaceflinger/DisplayHardware/HWC2.cpp
++++ b/services/surfaceflinger/DisplayHardware/HWC2.cpp
+@@ -472,6 +472,7 @@ Error Display::setClientTarget(uint32_t slot, const sp<GraphicBuffer>& target,
+     // Full-buffer damage is encoded as zero rects for HWC.
+     std::vector<Hwc2::IComposerClient::Rect> hwcDamage;
+     if (!(damage.isRect() && damage.getBounds() == Rect::INVALID_RECT)) {
++        hwcDamage.reserve(static_cast<size_t>(damage.end() - damage.begin()));
+         for (const Rect& r : damage) {
+             hwcDamage.push_back({r.left, r.top, r.right, r.bottom});
+         }
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 2e4cad1..7872df8 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3267,9 +3267,11 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         for (const auto& [layer, layerFE] : layers) {
+             const auto& snapshot = layerFE->mSnapshot;
+             if (!snapshot || !snapshot->isVisible) continue;
+-            if (snapshot->name.find("InputMethod#") != std::string::npos) imeVisible = true;
+-            if (snapshot->name.find("StatusBar#") != std::string::npos ||
+-                snapshot->name.find("NotificationShade#") != std::string::npos) {
++            if (!imeVisible && snapshot->name.find("InputMethod#") != std::string::npos) {
++                imeVisible = true;
++            }
++            if (!barsVisible && (snapshot->name.find("StatusBar#") != std::string::npos ||
++                                 snapshot->name.find("NotificationShade#") != std::string::npos)) {
+                 barsVisible = true;
+             }
+             const FloatRect bounds = snapshot->transformedBounds;

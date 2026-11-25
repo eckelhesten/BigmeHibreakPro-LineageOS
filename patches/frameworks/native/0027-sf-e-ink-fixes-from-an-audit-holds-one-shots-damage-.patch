@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 24 Nov 2026 21:22:45 +0100
+Subject: [PATCH] sf: e-ink: fixes from an audit: holds, one-shots, damage, no
+ pass at eink_enhance=0
+
+- A settle one-shot cleared up to 500 ms later no longer removes a sleep, wake,
+  unlock or page hold's own one-shot (the sleep screen's GC16 was lost).
+- A held page turn released after another app changed the mode shows that mode;
+  it no longer writes the reader's menu mode or page mode over it.
+- The fingerprint check reads the time after the property, not before an IPC.
+- Page holds only for changes of at least min_area_pct (a cursor or progress
+  line within 2 s of a tap came out as a GC16 page); the touch cadence only
+  extends FAST for frames with damage.
+- Unlocking into a reader's full-screen page puts the page mode back and shows
+  the page with its GC16 at the release, not the wake mode and a second hold.
+- Going to sleep during a wake or unlock hold keeps the page mode under the
+  reader's menu mode; a sleep mode equal to the fast mode still restores the
+  user's mode; eink_sleep=0 while asleep clears an armed one-shot.
+- Damage share against the panel's area, only the panel's layers (a parallax
+  wallpaper made home screen changes look 2-4x smaller; virtual displays).
+- debug.sf.eink_enhance=0 with the render pass is no pass at all (it ran the
+  enhancement pass's contrast clip); the damage padding is bounded.
+
+- The developer option "Disable HW overlays" can no longer switch off the
+  forced GPU composition that debug.sf.force_client_composition asks for.
+---
+ .../CompositionEngine/src/Output.cpp          |  9 ++-
+ .../DisplayHardware/EinkMotion.cpp            | 67 ++++++++++++++++---
+ .../DisplayHardware/EinkMotion.h              |  3 +-
+ services/surfaceflinger/SurfaceFlinger.cpp    | 25 ++++++-
+ 4 files changed, 90 insertions(+), 14 deletions(-)
+
+diff --git a/services/surfaceflinger/CompositionEngine/src/Output.cpp b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+index 48a361c..5b63106 100644
+--- a/services/surfaceflinger/CompositionEngine/src/Output.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/Output.cpp
+@@ -1835,6 +1835,11 @@ EinkEnhance getEinkEnhance(bool trackKernelDither) {
+         c.crush = t.crush;
+         c.black = 0.f;
+         c.white = 1.f;
++    } else if (c.render >= 3) {
++        // debug.sf.eink_enhance=0 with the render pass: no pass at all (the bench's raw
++        // profiles). It fell through to the enhancement pass's branch below, whose contrast from
++        // HiBreakParts (48..208) alone turned the pass on and clipped every grey.
++        c.render = 0;
+     } else {
+         c.render = 0;
+         const bool blackAndWhite = mode == 0 || mode == 0xb2 || mode == 0xb3 || mode == 0x02 ||
+@@ -1876,7 +1881,9 @@ int32_t einkDamagePadding(const EinkEnhance& e) {
+     } else if (e.strength > 0.f) {
+         reach = 2.f * e.radius;
+     }
+-    return reach > 0.f ? static_cast<int32_t>(std::ceil(reach)) + 1 : 0;
++    // Bounded: the radius comes from a property, and the padded rectangle must not overflow.
++    return reach > 0.f ? std::min(64, static_cast<int32_t>(std::ceil(std::min(reach, 63.f))) + 1)
++                       : 0;
+ }
+ 
+ } // namespace
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+index 1a9bf72..d8cefd1 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.cpp
+@@ -252,7 +252,11 @@ void EinkMotion::settleBars() {
+ void EinkMotion::beginTurnHold(uint32_t turnBase, nsecs_t now) {
+     // The composer presents the frames but leaves the panel alone until the thread lets it go.
+     mTurnBase = turnBase;
++    // The mode the hold is for: someone else writing it meanwhile (another app came to the front)
++    // makes the release show that mode instead of this page mode.
++    mTurnBaseSerial = modeSerial();
+     mTurnToBars = false;
++    mSettleArmed = 0; // the release arms its own one-shot; the settle's must not clear it
+     mFrozen = true;
+     mFreezeForTurn = true;
+     mFreezeForSleep = false;
+@@ -280,6 +284,12 @@ void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now, uint32_t base) {
+             writeMode(mSleepWritten);
+             mSleepWrittenSerial = mWrittenSerial;
+             mSleepModeSet = (mSleepBase != mConfig.sleepMode);
++        } else if (mConfig.sleepMode != 0 && ours && mSleepBase != mConfig.sleepMode) {
++            // Our fast mode is the sleep mode already: it stays, and waking up still puts the
++            // user's mode back.
++            mSleepWritten = actual;
++            mSleepWrittenSerial = modeSerial();
++            mSleepModeSet = true;
+         }
+     } else if (mSleepModeSet) {
+         // Unless someone else changed the mode meanwhile.
+@@ -291,6 +301,8 @@ void EinkMotion::beginSleepTransition(bool asleep, nsecs_t now, uint32_t base) {
+     }
+     base::SetProperty(kDisableCommitProperty, "1");
+     mForceArmed = false;
++    // A settle one-shot of ours from up to 500 ms ago must not be cleared over this hold's own.
++    mSettleArmed = 0;
+     mFrozen = true;
+     mFreezeForTurn = false; // a held page turn is shown with the sleep or wake picture
+     mFreezeForSleep = asleep;
+@@ -314,6 +326,7 @@ void EinkMotion::beginUnlockHold(nsecs_t now) {
+     mLastMotionFrame = 0;
+     base::SetProperty(kDisableCommitProperty, "1");
+     mForceArmed = false; // armed again during this hold, for the screen it ends with
++    mSettleArmed = 0;    // nor may the settle's clearing remove that one
+     mFrozen = true;
+     mFreezeForTurn = false;
+     mFreezeForSleep = false;
+@@ -323,11 +336,13 @@ void EinkMotion::beginUnlockHold(nsecs_t now) {
+     mCondition.notify_one();
+ }
+ 
+-bool EinkMotion::fingerReading(nsecs_t now) {
++bool EinkMotion::fingerReading() {
+     // Read here, not from mConfig: the thread waits without composites coming in.
+     if (!mFingerProp) mFingerProp = __system_property_find(kFingerProperty);
+     const uint64_t at = einkPropUint<uint64_t>(mFingerProp, 0);
+-    const uint64_t nowMs = static_cast<uint64_t>(ns2ms(now));
++    // The time after the read: an acquire written while the thread was writing a property (an
++    // IPC of a few ms) is newer than the thread's own `now`, and would not count.
++    const uint64_t nowMs = static_cast<uint64_t>(ns2ms(systemTime()));
+     return at != 0 && at <= nowMs && nowMs - at < static_cast<uint64_t>(ns2ms(mConfig.fingerWindow));
+ }
+ 
+@@ -355,6 +370,13 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+         if (mFrozen) {
+             base::SetProperty(kDisableCommitProperty, "0");
+             mFrozen = false;
++            mFreezeForSleep = false;
++            mFreezeForUnlock = false;
++            mFreezeForTurn = false;
++        }
++        if (mForceArmed) {
++            base::SetProperty(kForceModeProperty, "-1");
++            mForceArmed = false;
+         }
+         if (mSleepModeSet && readMode() == mSleepWritten && modeSerial() == mSleepWrittenSerial) {
+             writeMode(mSleepBase);
+@@ -369,8 +391,10 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+         if (mFast && mBarsActive && mBase == mConfig.barsMode) {
+             mBase = mBarsBase;
+             mBarsActive = false;
+-        } else if (!mFrozen && !mFast) {
+-            // Going to sleep from a reader's menu: the sleep mode goes straight over barsMode.
++        } else if (!mFast) {
++            // Going to sleep from a reader's menu (also during a wake or unlock hold: the lock
++            // screen shows the status bar): the sleep mode goes straight over barsMode, and the
++            // page mode is the one to come back to.
+             if (!(mConfig.asleep && mConfig.sleepMode != 0 && takeBarsBase(&sleepBase))) {
+                 endBars();
+             }
+@@ -450,7 +474,8 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+     uint32_t current = readMode();
+     // Occasional frames under a resting finger (a cursor blink) don't extend the fast mode;
+     // the touch hold in the thread does that, for a bounded time.
+-    if (motionFast || (mFast && inCadence && counts) || (touchFast && touchCadence)) {
++    if (motionFast || (mFast && inCadence && counts) ||
++        (touchFast && touchCadence && damage > 0.f)) {
+         mMotionEnd = now;
+     }
+     if (mFast && (current != mWritten || modeSerial() != mWrittenSerial)) {
+@@ -488,7 +513,10 @@ void EinkMotion::onComposite(bool imeVisible, float damage, bool barsVisible) {
+     // frame: the composer decides about a frame when it arrives, so a hold that began with the
+     // third frame still let the first go out as an update of its own. Not with a finger down (a drag follows the finger),
+     // with the keyboard up, or for the repaint that shows a hold (no new content).
+-    if (!mFast && damage > 0.f && counts && !touchFast && !(mConfig.ime && imeVisible) &&
++    // Only a change of at least min_area_pct: within touch_recent_ms of a tap any frame counts as
++    // motion, and a cursor or a progress line then held the panel and came out as a GC16 page.
++    if (!mFast && damage > 0.f && damage >= mConfig.minArea && !touchFast &&
++        !(mConfig.ime && imeVisible) &&
+         mConfig.cleanHold > 0 && mConfig.sleep && isPageMode(current) &&
+         now - mTurnReleased > ms2ns(150)) {
+         beginTurnHold(current, now);
+@@ -513,7 +541,16 @@ void EinkMotion::threadLoop() {
+             const nsecs_t now = systemTime();
+             const nsecs_t quietAt = mLastFrame + mConfig.cleanQuiet;
+             const nsecs_t due = std::min(quietAt, mFreezeStart + mConfig.cleanHold);
+-            if (mTurnToBars) {
++            if (modeSerial() != mTurnBaseSerial) {
++                // Someone else wrote the mode during the hold (another app came to the front):
++                // the release is in that mode, not as a page, and the reader's menu mode and
++                // page mode of ours are not put over it.
++                mTurnBase = readMode();
++                mTurnBaseSerial = modeSerial();
++                mTurnToBars = false;
++                mBarsActive = false;
++            }
++            if (mTurnToBars && isPageMode(mTurnBase)) {
+                 // Not a page turn: the reader's menu. Shown at once in barsMode.
+                 mTurnToBars = false;
+                 mFrozen = false;
+@@ -543,7 +580,7 @@ void EinkMotion::threadLoop() {
+             mFreezeForTurn = false;
+             // The composer lost the damage of the frames it held back: the first picture after
+             // the hold goes out with the one-shot, in the mode it is meant for.
+-            if (moving) {
++            if (moving && !isFast(mTurnBase)) {
+                 // Longer motion (an animated scroll, a finger): FAST from here, then the usual
+                 // settle into the page mode.
+                 mBase = mTurnBase;
+@@ -554,6 +591,8 @@ void EinkMotion::threadLoop() {
+                 mTouchHoldSince = 0;
+                 base::SetProperty(kForceModeProperty, std::to_string(mConfig.fastMode));
+             } else {
++                // pageWaveform: GC16 for a page mode, the mode itself otherwise (0 = the
++                // composer's current mode).
+                 base::SetProperty(kForceModeProperty, std::to_string(pageWaveform(mTurnBase)));
+                 mStreak = 0;
+                 mLastMotionFrame = 0;
+@@ -600,7 +639,7 @@ void EinkMotion::threadLoop() {
+             // bounded by finger_max_ms. A match ends this hold with the unlock's own; no match
+             // (another finger, a knuckle) shows the lock screen once the sensor gives up.
+             if (!mFreezeForSleep && !mFreezeForUnlock && mConfig.fingerMax > 0 &&
+-                fingerReading(now)) {
++                fingerReading()) {
+                 const nsecs_t until = mFreezeStart + mConfig.fingerMax;
+                 if (now < until) {
+                     // Looked at again every 40 ms: the result writes no composite.
+@@ -618,6 +657,16 @@ void EinkMotion::threadLoop() {
+                 if (show != 0) base::SetProperty(kForceModeProperty, std::to_string(show));
+                 mForceArmed = true;
+             }
++            uint32_t pageBase = 0;
++            if (mFreezeForUnlock && mBarsActive && !(mConfig.readingBars && mBarsVisible) &&
++                takeBarsBase(&pageBase)) {
++                // Unlocked into a reader's full-screen page (the lock screen had the status bar,
++                // so barsMode stood in for the page mode): the page mode back and the page shown
++                // in it now, not the wake mode and then a held page update of its own.
++                writeMode(pageBase);
++                base::SetProperty(kForceModeProperty, std::to_string(pageWaveform(pageBase)));
++                mTurnReleased = now;
++            }
+             // The screen has settled: show it in one update.
+             base::SetProperty(kDisableCommitProperty, "0");
+             ALOGI("%s: panel released after %d ms%s",
+diff --git a/services/surfaceflinger/DisplayHardware/EinkMotion.h b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+index 695e125..71308c1 100644
+--- a/services/surfaceflinger/DisplayHardware/EinkMotion.h
++++ b/services/surfaceflinger/DisplayHardware/EinkMotion.h
+@@ -149,7 +149,7 @@ private:
+     void threadLoop();
+     void beginSleepTransition(bool asleep, nsecs_t now, uint32_t base = 0);
+     void beginUnlockHold(nsecs_t now);
+-    bool fingerReading(nsecs_t now);
++    bool fingerReading();
+     void applySleepMode();
+     void startBars(uint32_t base);
+     void endBars();
+@@ -196,6 +196,7 @@ private:
+     uint64_t mUnlockSeen = 0;     // the last vendor.xrz.hibreak_unlock acted on
+     bool mUnlockPending = false;  // an unlock came while asleep: shown with the next wake-up
+     uint32_t mTurnBase = 0;       // the page mode the held animation is shown in
++    uint32_t mTurnBaseSerial = 0; // global_refresh_mode's serial when the hold began
+     nsecs_t mTurnReleased = 0;    // when the last hold was let go
+     nsecs_t mFreezeStart = 0;
+     bool mSleepModeSet = false;   // the property holds our sleep mode
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 7872df8..2d9a08b 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -3260,13 +3260,26 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+         // layer (the screen, for the app or wallpaper behind).
+         // And whether the status bar or the notification shade is on screen (an e-reader shows
+         // its pages full screen, its menus, library and settings with the status bar).
++        // Only the panel's layers (not those of a virtual display, a recording or a mirror), and
++        // against the panel's area: a wallpaper wider than the screen (parallax) made the
++        // largest layer two to four screens, and a change on the home screen looked that much
++        // smaller.
+         bool imeVisible = false;
+         bool barsVisible = false;
+         float changed = 0.f;
+         float screen = 1.f;
++        std::optional<ui::LayerStack> panelStack;
++        FloatRect panel;
++        if (const auto display =
++                    FTL_FAKE_GUARD(mStateLock, getDisplayDeviceLocked(pacesetterId))) {
++            panelStack = display->getLayerStack();
++            panel = display->getLayerStackSpaceRect().toFloatRect();
++            if (!panel.isEmpty()) screen = panel.getWidth() * panel.getHeight();
++        }
+         for (const auto& [layer, layerFE] : layers) {
+             const auto& snapshot = layerFE->mSnapshot;
+             if (!snapshot || !snapshot->isVisible) continue;
++            if (panelStack && snapshot->outputFilter.layerStack != *panelStack) continue;
+             if (!imeVisible && snapshot->name.find("InputMethod#") != std::string::npos) {
+                 imeVisible = true;
+             }
+@@ -3274,9 +3287,12 @@ CompositeResultsPerDisplay SurfaceFlinger::composite(
+                                  snapshot->name.find("NotificationShade#") != std::string::npos)) {
+                 barsVisible = true;
+             }
+-            const FloatRect bounds = snapshot->transformedBounds;
++            FloatRect bounds = snapshot->transformedBounds;
++            if (panelStack && !panel.isEmpty()) bounds = bounds.intersect(panel);
+             if (bounds.isEmpty()) continue;
+-            screen = std::max(screen, bounds.getWidth() * bounds.getHeight());
++            if (!panelStack || panel.isEmpty()) {
++                screen = std::max(screen, bounds.getWidth() * bounds.getHeight());
++            }
+             if (!snapshot->changes.test(frontend::RequestedLayerState::Changes::Buffer)) continue;
+             FloatRect area = bounds;
+             const Rect damage = snapshot->surfaceDamage.getBounds();
+@@ -9534,7 +9550,10 @@ void SurfaceFlinger::sfdo_scheduleCommit() {
+ }
+ 
+ void SurfaceFlinger::sfdo_forceClientComposition(bool enabled) {
+-    mDebugDisableHWC = enabled;
++    // debug.sf.force_client_composition: the composer can't do device composition at all (MT6877
++    // e-ink: its fences never complete), so the developer option must not switch it off.
++    mDebugDisableHWC =
++            enabled || base::GetBoolProperty("debug.sf.force_client_composition"s, false);
+     scheduleRepaint();
+ }
+ 

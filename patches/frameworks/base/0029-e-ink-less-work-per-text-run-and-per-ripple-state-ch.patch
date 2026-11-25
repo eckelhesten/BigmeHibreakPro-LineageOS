@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 24 Nov 2026 20:48:19 +0100
+Subject: [PATCH] e-ink: less work per text run and per ripple state change
+
+- hwui: opaque black or white text (most text on e-ink) skips the Lab
+  conversion (3 powf and a cbrtf) of the colour snap, which can't change
+  it; the e-ink paint is copied once when it is needed (always with
+  debug.hwui.eink_glyphs) instead of default-constructed and then assigned.
+  Same paint, same output.
+- hwui: no CC_UNLIKELY on the e-ink text and shadow paths: on an e-ink
+  device they are taken for every text run and every shadow.
+- RippleDrawable: with debug.eink.no_ripple the state scan is skipped (its
+  results were never used).
+---
+ .../graphics/drawable/RippleDrawable.java     |  4 +-
+ libs/hwui/hwui/DrawTextFunctor.h              | 43 +++++++++++--------
+ .../pipeline/skia/ReorderBarrierDrawables.cpp |  2 +-
+ 3 files changed, 27 insertions(+), 22 deletions(-)
+
+diff --git a/graphics/java/android/graphics/drawable/RippleDrawable.java b/graphics/java/android/graphics/drawable/RippleDrawable.java
+index 370a7448..82770bcb 100644
+--- a/graphics/java/android/graphics/drawable/RippleDrawable.java
++++ b/graphics/java/android/graphics/drawable/RippleDrawable.java
+@@ -317,6 +317,8 @@ public class RippleDrawable extends LayerDrawable {
+     @Override
+     protected boolean onStateChange(int[] stateSet) {
+         final boolean changed = super.onStateChange(stateSet);
++        // E-ink: no ripple and no hover or focus wash, the content is drawn as it is.
++        if (EINK_NO_RIPPLE) return changed;
+ 
+         boolean enabled = false;
+         boolean pressed = false;
+@@ -337,8 +339,6 @@ public class RippleDrawable extends LayerDrawable {
+                 windowFocused = true;
+             }
+         }
+-        // E-ink: no ripple and no hover or focus wash, the content is drawn as it is.
+-        if (EINK_NO_RIPPLE) return changed;
+         setRippleActive(enabled && pressed);
+         setBackgroundActive(hovered, focused, pressed, windowFocused);
+ 
+diff --git a/libs/hwui/hwui/DrawTextFunctor.h b/libs/hwui/hwui/DrawTextFunctor.h
+index ff6552e7..f2062a47 100644
+--- a/libs/hwui/hwui/DrawTextFunctor.h
++++ b/libs/hwui/hwui/DrawTextFunctor.h
+@@ -18,6 +18,8 @@
+ #include <SkRRect.h>
+ #include <SkTextBlob.h>
+ 
++#include <optional>
++
+ #include "../utils/Color.h"
+ #include "Canvas.h"
+ #include "FeatureFlags.h"
+@@ -113,15 +115,21 @@ static void adjustHighContrastInnerTextColor(uirenderer::Lab* lab) {
+ // and colours only as dither patterns, which break up thin glyph strokes). Translucent text
+ // keeps its alpha when it is clearly faded (hints, disabled), otherwise it becomes opaque.
+ // Text with a shader or colour filter is left alone (gradients, tinted emoji effects).
+-static bool snapTextColorForEink(const Paint& paint, Paint* out) {
+-    if (paint.getShader() != nullptr || paint.getColorFilter() != nullptr) return false;
++// Returns the colour to draw with, or nothing to keep the paint's.
++static std::optional<SkColor4f> snapTextColorForEink(const Paint& paint) {
++    if (paint.getShader() != nullptr || paint.getColorFilter() != nullptr) return std::nullopt;
+     SkColor4f c = paint.getColor4f();
+-    if (c.fA == 0.f) return false;
++    if (c.fA == 0.f) return std::nullopt;
++    // Opaque black or white (most text on e-ink) is what the snap gives already: no Lab.
++    if (c.fA == 1.f && ((c.fR == 0.f && c.fG == 0.f && c.fB == 0.f) ||
++                        (c.fR == 1.f && c.fG == 1.f && c.fB == 1.f))) {
++        return std::nullopt;
++    }
+     uirenderer::Lab lab = uirenderer::sRGBToLab(c);
+     // Mid greys stay as they are: whether they should be black or white depends on what is
+     // behind them (grey hint text on white, grey captions on black), which SurfaceFlinger's
+     // e-ink enhancement decides from the composed picture.
+-    if (lab.L > 55 && lab.L < 85) return false;
++    if (lab.L > 55 && lab.L < 85) return std::nullopt;
+     SkColor4f snapped = lab.L <= 55 ? SkColors::kBlack : SkColors::kWhite;
+     // Faded text (hints, disabled): optionally raised to a fixed alpha. Nearly invisible text
+     // (fades in progress) is left alone.
+@@ -129,10 +137,8 @@ static bool snapTextColorForEink(const Paint& paint, Paint* out) {
+     snapped.fA = c.fA >= 0.5f ? 1.f
+             : (faded > 0.f && c.fA >= 0.15f) ? std::max(c.fA, faded)
+             : c.fA;
+-    if (snapped == c) return false;
+-    *out = paint;
+-    out->setColor(snapped);
+-    return true;
++    if (snapped == c) return std::nullopt;
++    return snapped;
+ }
+ 
+ // E-ink glyphs (Properties::einkGlyphs): rasterised straight to black and white instead of
+@@ -204,18 +210,17 @@ public:
+             innerPaint.setStyle(SkPaint::kFill_Style);
+             canvas->drawGlyphs(glyphFunc, glyphCount, innerPaint, x, y, totalAdvance);
+             gDrawTextBlobMode = DrawTextBlobMode::Normal;
+-        } else if (CC_UNLIKELY(uirenderer::Properties::einkText)) {
+-            Paint einkPaint;
+-            bool changed = snapTextColorForEink(paint, &einkPaint);
+-            if (uirenderer::Properties::einkGlyphs > 0) {
+-                if (!changed) {
+-                    einkPaint = paint;
+-                    changed = true;
+-                }
+-                applyEinkGlyphs(&einkPaint);
++        } else if (uirenderer::Properties::einkText) {
++            // (No CC_UNLIKELY: on an e-ink device this is every text run.)
++            const std::optional<SkColor4f> snapped = snapTextColorForEink(paint);
++            if (!snapped && uirenderer::Properties::einkGlyphs <= 0) {
++                canvas->drawGlyphs(glyphFunc, glyphCount, paint, x, y, totalAdvance);
++            } else {
++                Paint einkPaint(paint);
++                if (snapped) einkPaint.setColor(*snapped);
++                if (uirenderer::Properties::einkGlyphs > 0) applyEinkGlyphs(&einkPaint);
++                canvas->drawGlyphs(glyphFunc, glyphCount, einkPaint, x, y, totalAdvance);
+             }
+-            canvas->drawGlyphs(glyphFunc, glyphCount, changed ? einkPaint : paint, x, y,
+-                               totalAdvance);
+         } else {
+             // standard draw path
+             canvas->drawGlyphs(glyphFunc, glyphCount, paint, x, y, totalAdvance);
+diff --git a/libs/hwui/pipeline/skia/ReorderBarrierDrawables.cpp b/libs/hwui/pipeline/skia/ReorderBarrierDrawables.cpp
+index 8d1feb27..b806dbe3 100644
+--- a/libs/hwui/pipeline/skia/ReorderBarrierDrawables.cpp
++++ b/libs/hwui/pipeline/skia/ReorderBarrierDrawables.cpp
+@@ -131,7 +131,7 @@ static SkColor multiplyAlpha(SkColor color, float alpha) {
+ 
+ // copied from FrameBuilder::deferShadow
+ void EndReorderBarrierDrawable::drawShadow(SkCanvas* canvas, RenderNodeDrawable* caster) {
+-    if (CC_UNLIKELY(Properties::einkNoShadow)) return;
++    if (Properties::einkNoShadow) return;  // e-ink: every shadow; no CC_UNLIKELY
+     const RenderProperties& casterProperties = caster->getNodeProperties();
+ 
+     if (casterProperties.getAlpha() <= 0.0f || casterProperties.getOutline().getAlpha() <= 0.0f ||

@@ -37,9 +37,9 @@ public class FrontLightWarmthTile extends TileService {
     @Override
     public void onStartListening() {
         if (!mListening) {
-            getContentResolver().registerContentObserver(
+            SystemSettingsStore.deviceResolver(this).registerContentObserver(
                     Settings.System.getUriFor(Keys.FRONTLIGHT_WARMTH), false, mObserver);
-            getContentResolver().registerContentObserver(
+            SystemSettingsStore.deviceResolver(this).registerContentObserver(
                     Settings.System.getUriFor(Keys.FRONTLIGHT_ENABLED), false, mObserver);
             mListening = true;
         }
@@ -53,7 +53,7 @@ public class FrontLightWarmthTile extends TileService {
 
     private void unregisterObserver() {
         if (mListening) {
-            getContentResolver().unregisterContentObserver(mObserver);
+            SystemSettingsStore.deviceResolver(this).unregisterContentObserver(mObserver);
             mListening = false;
         }
     }
@@ -126,7 +126,7 @@ public class FrontLightWarmthTile extends TileService {
 
     private void writePending() {
         if (mPending < 0) return;
-        Settings.System.putInt(getContentResolver(), Keys.FRONTLIGHT_WARMTH, mPending);
+        Settings.System.putInt(SystemSettingsStore.deviceResolver(this), Keys.FRONTLIGHT_WARMTH, mPending);
         mPending = -1;
         mLastWrite = SystemClock.uptimeMillis();
     }
@@ -147,7 +147,7 @@ public class FrontLightWarmthTile extends TileService {
     private void refresh() {
         Tile tile = getQsTile();
         if (tile == null) return;
-        boolean enabled = Settings.System.getInt(getContentResolver(),
+        boolean enabled = Settings.System.getInt(SystemSettingsStore.deviceResolver(this),
                 Keys.FRONTLIGHT_ENABLED, 1) != 0;
         tile.setState(enabled ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
         tile.setSubtitle(getString(R.string.warmth_value, FrontLightController.getWarmth(this)));

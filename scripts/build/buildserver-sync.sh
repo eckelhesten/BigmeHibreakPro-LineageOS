@@ -10,11 +10,13 @@ LOG=/srv/sync3.log
 WD=""
 trap 'kill "${WD:-}" 2>/dev/null || true' EXIT INT TERM
 ( while sleep 15; do
-    for p in $(pgrep -f "^git fetch --no-auto-gc"); do
+    # git by name or by path (/usr/bin/git): the anchored pattern missed the second.
+    for p in $(pgrep -f "(^|/)git fetch --no-auto-gc"); do
       [ -r "/proc/$p/cmdline" ] || continue
       if ! grep -qa -- "--depth" "/proc/$p/cmdline" 2>/dev/null; then
         [ -r "/proc/$p/cmdline" ] || continue
-        tr "\0" " " < "/proc/$p/cmdline" 2>/dev/null | cut -c1-200 >> /srv/sync3-killed.log
+        # One line per kill (cmdline has no newline of its own).
+        printf '%s\n' "$(tr "\0" " " < "/proc/$p/cmdline" 2>/dev/null | cut -c1-200)" >> /srv/sync3-killed.log
         kill "$p" 2>/dev/null || true
       fi
     done

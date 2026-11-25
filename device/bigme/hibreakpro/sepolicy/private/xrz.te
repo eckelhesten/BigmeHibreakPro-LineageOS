@@ -25,6 +25,11 @@ typeattribute xrz_system_file xrz_system_file_31_0;
 get_prop({ system_server surfaceflinger system_app }, vendor_xrz_prop)
 set_prop({ system_server surfaceflinger system_app }, vendor_xrz_prop)
 
+# Bigme's composer reads system_prop properties (the platform's, not its own), which the vendor
+# policy never allowed: ~540 denials per boot, each a kernel audit record that logd wakes up for.
+# Denied as before, just not logged.
+dontaudit hal_graphics_composer_server system_prop:file { getattr map open read };
+
 # init chown/chmods eink_debug nodes on fs and switches clean_a2 / anti_flicker / global_dither
 allow init xrz_debugfs:dir search;
 allow init xrz_debugfs:file { w_file_perms setattr };

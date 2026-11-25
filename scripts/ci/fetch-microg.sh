@@ -1,6 +1,7 @@
 #!/bin/bash
-# Runs ON the build server (called by buildserver-build.sh when vendor/microg is missing):
-# fetch the pinned official microG release and turn it into product-partition modules.
+# Runs ON the build server (called by buildserver-build.sh when vendor/microg is missing), or in
+# your own tree: scripts/ci/fetch-microg.sh [tree] (default /srv/lineage). Fetches the pinned
+# official microG release and turns it into product-partition modules.
 #
 # - Downloads GmsCore (com.google.android.gms) and Companion (com.android.vending) from
 #   github.com/microg/GmsCore, checks the pinned SHA-256 of each file, and refuses an APK unless
@@ -15,9 +16,11 @@
 #   push messages, as LineageOS for microG does.
 #
 # To update microG: change VERSION / the file names / the SHA-256 values below (from the release
-# page's asset digests), delete vendor/microg on the server and build.
+# page's asset digests) and build: buildserver-build.sh fetches again whenever this script differs
+# from the one that fetched vendor/microg (.fetch-microg.sha256).
 set -euo pipefail
-cd /srv/lineage
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+cd "${1:-/srv/lineage}"
 VERSION=v0.3.18.252432
 GMS=com.google.android.gms-252432036.apk
 GMS_SHA=1094fa60ace2367ac52bd08d1bd4f33fa8144ba930e355121b28234b8ebbf382
@@ -57,7 +60,9 @@ priv = set()
 for f in manifests:
     try: s = open(f, errors="replace").read()
     except OSError: continue
-    for m in re.finditer(r"<permission\b(.*?)/?>", s, re.S):
+    # Not commented-out declarations, not <permission-group> / <permission-tree>.
+    s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
+    for m in re.finditer(r"<permission\s(.*?)/?>", s, re.S):
         a = m.group(1)
         n = re.search(r'android:name="([^"]+)"', a)
         lvl = re.search(r'android:protectionLevel="([^"]+)"', a)
@@ -158,3 +163,5 @@ prebuilt_etc {
 }
 EOF
 echo "microG $VERSION ready in $D"
+# Which version of this script fetched it (buildserver-build.sh fetches again when it changes).
+sha256sum < "$SELF" | cut -c1-64 > "$D/.fetch-microg.sha256"

@@ -20,8 +20,8 @@ function Write-Step([string]$Message) {
 }
 
 function Fail([string]$Message) {
-    Write-Error $Message
-    exit 1
+    # Caught below (prints ERROR, the resume warning while flashing, and exits 1).
+    throw $Message
 }
 
 # Windows PowerShell 5.1 turns native stderr into terminating ErrorRecords when
@@ -96,11 +96,25 @@ function Get-FastbootSlot {
     return ""
 }
 
+function Assert-OneDevice {
+    # Exactly one phone, over adb and fastboot together: with two, every command could go to either.
+    $adbLines = @((Invoke-CaptureStdout "adb" @("devices")).Output -split "`r?`n" |
+        Select-Object -Skip 1 | Where-Object { $_ -match "\s(device|recovery|sideload|unauthorized)$" })
+    $fbLines = @((Invoke-CaptureStdout "fastboot" @("devices")).Output -split "`r?`n" |
+        Where-Object { $_.Trim().Length -gt 0 })
+    $n = $adbLines.Count + $fbLines.Count
+    if ($n -gt 1) { Fail "$n phones connected: connect only the one to flash." }
+}
+
 function Wait-FastbootMode([string]$WantUserspace) {
     for ($i = 0; $i -lt 60; $i++) {
         if (Get-FastbootConnected) {
             if ((Get-FastbootUserspace) -eq $WantUserspace) {
-                return
+                # "no" is also what a failed getvar gives (fastbootd going down on its way to the
+                # bootloader): the bootloader is there once it answers for its slot too.
+                if ($WantUserspace -eq "yes" -or (Get-FastbootSlot) -ne "") {
+                    return
+                }
             }
         }
         Start-Sleep -Seconds 1
@@ -124,9 +138,11 @@ try {
     if (-not (Test-Path -LiteralPath "SHA256SUMS")) {
         Fail "SHA256SUMS not found in $PSScriptRoot"
     }
+    $checked = 0
     foreach ($line in Get-Content -LiteralPath "SHA256SUMS") {
         $trimmed = $line.Trim()
         if ($trimmed.Length -eq 0) { continue }
+        $checked++
         if ($trimmed -notmatch "^([0-9a-fA-F]{64})\s+\*?(.+)$") {
             Fail "Malformed line in SHA256SUMS: $trimmed"
         }
@@ -141,8 +157,12 @@ try {
         }
         Write-Host "${file}: OK"
     }
+    if ($checked -eq 0) {
+        Fail "SHA256SUMS lists no images."
+    }
 
     Write-Step "Detecting the phone"
+    Assert-OneDevice
     $mode = ""
     $adbState = Invoke-CaptureStdout "adb" @("get-state")
     if ($adbState.ExitCode -eq 0 -and $adbState.Output -eq "device") {

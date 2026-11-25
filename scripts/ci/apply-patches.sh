@@ -20,5 +20,13 @@ while IFS= read -r dir; do
   fi
   echo ">> $rel"
   git -C "$SRC/$rel" am --abort >/dev/null 2>&1 || true
-  git -C "$SRC/$rel" -c user.name=ci -c user.email=ci@localhost am --3way "$dir"/*.patch
+  base=$(git -C "$SRC/$rel" rev-parse HEAD)
+  if ! git -C "$SRC/$rel" -c user.name=ci -c user.email=ci@localhost am --3way "$dir"/*.patch; then
+    # Back to where this project was: with the series' first patches left committed, a second
+    # run failed on them instead of on the patch that doesn't apply.
+    git -C "$SRC/$rel" am --abort >/dev/null 2>&1 || true
+    git -C "$SRC/$rel" reset -q --hard "$base"
+    echo "patches for $rel do not apply; $rel is back at $base" >&2
+    exit 1
+  fi
 done <<<"$patch_dirs"

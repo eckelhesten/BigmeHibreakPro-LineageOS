@@ -15,9 +15,13 @@ rm -rf "$D.old"
 mkdir -p "$D"
 echo "start uptime=$(cat /proc/uptime)" > "$D/status"
 
-# Bigger in-memory log buffers, so `adb logcat -d` from the host still has the early boot.
-logcat -b all -G 16M 2>/dev/null
-logcat -b all -v threadtime -f "$D/logcat.txt" -r 1536 -n 2 &
+# Bigger in-memory log buffers, so `adb logcat -d` from the host still has the early boot. logd
+# fills them up over the uptime and keeps them: 8 MB each (16 MB was ~100 MB of logd memory over
+# the eight buffers by the end of a long uptime).
+logcat -b all -G 8M 2>/dev/null
+# 2 x 1 MB of rotated logcat (was 3 x 1.5 MB): with the previous boot's copy this stays near 5 MB
+# of the 32 MB /metadata.
+logcat -b all -v threadtime -f "$D/logcat.txt" -r 1024 -n 1 &
 LOGCAT=$!
 
 n=0

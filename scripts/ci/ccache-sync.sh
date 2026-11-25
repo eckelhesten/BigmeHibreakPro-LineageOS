@@ -10,6 +10,7 @@
 # Data goes directly between the store host and the server (4 parallel ssh streams, ~170 Mbit/s
 # down / ~280 Mbit/s up on 2026-11-13). The server's throwaway key is copied to the store host for
 # the transfer and removed afterwards. ccache already compresses its files (zstd), so plain tar.
+# With rsync on the store host and a cache saved before, a save sends only the new entries.
 set -euo pipefail
 MODE="${1:?save|restore}"; IP="${2:?server ip}"; KEY="${3:?ssh key}"; KH="${4:?known_hosts}"
 [[ "$MODE" == save || "$MODE" == restore ]] || { echo "usage: ccache-sync.sh save|restore <ip> <key> <known_hosts>" >&2; exit 2; }
@@ -34,7 +35,27 @@ O=(-i "$RD/key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHosts
 chmod 600 "$RD/key"
 GROUPS_=("0 1 2 3" "4 5 6 7" "8 9 a b" "c d e f")
 start=$(date +%s)
-if [ "$MODE" = save ]; then
+if [ "$MODE" = save ] && [ -d "$SD" ] && command -v rsync >/dev/null 2>&1 \
+    && ssh -n "${O[@]}" root@"$IP" "command -v rsync >/dev/null"; then
+  # A cache saved before: only the new entries go (ccache files never change once written), into
+  # a hard-linked copy of the old cache that replaces it when complete. The full transfer below
+  # moved all 10-50 GB again for every save.
+  rm -rf "$SD.new"
+  cp -al "$SD" "$SD.new"
+  rc=0
+  rsync -rlt --delete --exclude=/ccache.conf -e "ssh ${O[*]}" root@"$IP":/srv/ccache/ "$SD.new/" || rc=$?
+  # 24: files vanished while a build was running (ccache's own cleanup): not an error.
+  if [ "$rc" != 0 ] && [ "$rc" != 24 ]; then
+    echo "ccache save FAILED (rsync $rc), keeping the previous cache"; rm -rf "$SD.new"; exit 1
+  fi
+  ssh -n "${O[@]}" root@"$IP" "if [ -f /srv/ccache/ccache.conf ]; then cat /srv/ccache/ccache.conf; fi" > "$SD.new/ccache.conf.tmp" \
+    && mv "$SD.new/ccache.conf.tmp" "$SD.new/ccache.conf"
+  [ -s "$SD.new/ccache.conf" ] || rm -f "$SD.new/ccache.conf"
+  rm -rf "$SD.old"
+  mv "$SD" "$SD.old" && mv "$SD.new" "$SD"
+  rm -rf "$SD.old"
+  echo "ccache saved (changes only): $(du -sh "$SD" | cut -f1) in $(( $(date +%s) - start )) s"
+elif [ "$MODE" = save ]; then
   rm -rf "$SD.new"; mkdir -p "$SD.new"
   pids=()
   for g in "${GROUPS_[@]}"; do

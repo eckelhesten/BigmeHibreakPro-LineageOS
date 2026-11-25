@@ -13,8 +13,9 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.ContentObserver;
 import android.os.Handler;
-import android.os.Looper;
+import android.os.HandlerThread;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemProperties;
 import android.provider.Settings;
@@ -30,13 +31,17 @@ import java.util.Objects;
  * that used to be switches. Full refreshes happen only when asked (Refresh tile, side key,
  * Keys.EINK_REFRESH_REQUEST), never automatically: the owner wants no unasked flashes (2026-11-23),
  * although white areas get darker over app switches without one (scripts/eink-bench/ghost.py).
+ *
+ * Runs on its own thread at display priority: an app switch's mode change (a task stack query,
+ * property writes, SurfaceFlinger's repaint, all blocking IPCs) must not wait behind the front
+ * light or anything else on the app's main thread.
  */
 class EinkPolicy {
     private static final String TAG = "HiBreakEinkPolicy";
 
     private final Context mContext;
     private final ContentResolver mResolver;
-    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private final Handler mHandler;
     private PowerManager mPowerManager;
     private KeyguardManager mKeyguardManager;
     private String mTopPackage;
@@ -47,12 +52,16 @@ class EinkPolicy {
     private float mBandTemp = Float.NaN;
     private String mAppliedFastBand;
     private String mCachedAppProfilesRaw;
+    private boolean mAppProfilesCached;
     private Map<String, Integer> mAppProfiles = Collections.emptyMap();
     private final Runnable mUpdateTop = this::updateTopPackage;
 
     EinkPolicy(Context context) {
         mContext = context;
         mResolver = context.getContentResolver();
+        HandlerThread thread = new HandlerThread(TAG, Process.THREAD_PRIORITY_DISPLAY);
+        thread.start();
+        mHandler = new Handler(thread.getLooper());
     }
 
     void start() {
@@ -98,10 +107,13 @@ class EinkPolicy {
                 int t = intent.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE,
                         Integer.MIN_VALUE);
                 if (t == Integer.MIN_VALUE) return;
+                // Most battery broadcasts are level, voltage or current changes.
+                if (t / 10f == mBatteryTemp) return;
                 mBatteryTemp = t / 10f;
                 applyFastGreyBand();
             }
-        }, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        }, new IntentFilter(Intent.ACTION_BATTERY_CHANGED), null, mHandler,
+                Context.RECEIVER_NOT_EXPORTED);
         IntentFilter power = new IntentFilter(Intent.ACTION_USER_PRESENT);
         power.addAction(Intent.ACTION_SCREEN_ON);
         power.addAction(Intent.ACTION_SCREEN_OFF);
@@ -110,10 +122,12 @@ class EinkPolicy {
             public void onReceive(Context context, Intent intent) {
                 applyMode();
             }
-        }, power, Context.RECEIVER_NOT_EXPORTED);
-        Eink.applyFixedSettings();
-        updateTopPackage();
-        applyAll();
+        }, power, null, mHandler, Context.RECEIVER_NOT_EXPORTED);
+        mHandler.post(() -> {
+            Eink.applyFixedSettings();
+            updateTopPackage();
+            applyAll();
+        });
     }
 
     private void updateTopPackage() {
@@ -151,9 +165,11 @@ class EinkPolicy {
 
     private Map<String, Integer> getCachedAppProfiles() {
         String raw = Settings.System.getString(mResolver, Keys.EINK_APP_PROFILES);
-        if (mCachedAppProfilesRaw == null || !Objects.equals(raw, mCachedAppProfilesRaw)) {
+        // (An unset setting is a valid cached value too: no per-app profiles.)
+        if (!mAppProfilesCached || !Objects.equals(raw, mCachedAppProfilesRaw)) {
             mCachedAppProfilesRaw = raw;
             mAppProfiles = Eink.parseAppProfiles(raw);
+            mAppProfilesCached = true;
         }
         return mAppProfiles;
     }

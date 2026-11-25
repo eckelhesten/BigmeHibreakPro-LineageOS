@@ -25,7 +25,7 @@ public class EinkModeTile extends TileService {
     @Override
     public void onStartListening() {
         if (!mListening) {
-            getContentResolver().registerContentObserver(
+            SystemSettingsStore.deviceResolver(this).registerContentObserver(
                     Settings.System.getUriFor(Keys.EINK_PROFILE), false, mObserver);
             mListening = true;
         }
@@ -45,15 +45,15 @@ public class EinkModeTile extends TileService {
 
     private void unregisterObserver() {
         if (mListening) {
-            getContentResolver().unregisterContentObserver(mObserver);
+            SystemSettingsStore.deviceResolver(this).unregisterContentObserver(mObserver);
             mListening = false;
         }
     }
 
     @Override
     public void onClick() {
-        Eink.setProfile(getContentResolver(),
-                Eink.getProfile(getContentResolver()) == Eink.PROFILE_READING
+        Eink.setProfile(SystemSettingsStore.deviceResolver(this),
+                Eink.getProfile(SystemSettingsStore.deviceResolver(this)) == Eink.PROFILE_READING
                         ? Eink.PROFILE_DEFAULT : Eink.PROFILE_READING);
         refresh();
     }
@@ -61,7 +61,7 @@ public class EinkModeTile extends TileService {
     private void refresh() {
         Tile tile = getQsTile();
         if (tile == null) return;
-        boolean reading = Eink.getProfile(getContentResolver()) == Eink.PROFILE_READING;
+        boolean reading = Eink.getProfile(SystemSettingsStore.deviceResolver(this)) == Eink.PROFILE_READING;
         tile.setState(reading ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
         tile.setSubtitle(null);
         tile.updateTile();

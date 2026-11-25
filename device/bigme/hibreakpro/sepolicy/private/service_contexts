@@ -3,3 +3,9 @@ mtkIms                                    u:object_r:radio_service:s0
 mwis                                      u:object_r:radio_service:s0
 vodata                                    u:object_r:radio_service:s0
 imsa                                      u:object_r:radio_service:s0
+# Also stock's, for the services the IMS stack looks up (WiFi offload, GBA, SMS, subscription
+# stubs): unlabelled, each lookup was a radio service_manager denial.
+wfo                                       u:object_r:radio_service:s0
+GbaService                                u:object_r:radio_service:s0
+imtksms                                   u:object_r:radio_service:s0
+isubstub                                  u:object_r:radio_service:s0

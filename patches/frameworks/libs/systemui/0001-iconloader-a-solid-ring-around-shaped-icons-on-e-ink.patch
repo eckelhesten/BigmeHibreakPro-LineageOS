@@ -58,7 +58,7 @@ index 563d5b9..dc2ec52 100644
 +            val night =
 +                (res.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
 +                    Configuration.UI_MODE_NIGHT_YES
-+            val ringPx = minOf(2f * res.displayMetrics.density, bounds.width() * 0.10f)
++            val ringPx = minOf(2f * res.displayMetrics.density, bounds.width() * 0.08f)
 +            val ringPaint = einkRingPaint.get()!!
 +            ringPaint.color = if (night) Color.WHITE else Color.BLACK
 +            ringPaint.alpha = alpha

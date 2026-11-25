@@ -33,7 +33,9 @@ jobs:
           set -euo pipefail
           now=$(date +%s)
           servers_json=$(hcloud server list -l hibreak=ci -o json)
-          jq -r '.[] | "\(.name)\t\(.labels.created | tonumber? // 0)"' <<<"$servers_json" |
+          # The created label (Unix time, set by hcloud-build.sh), else Hetzner's own creation
+          # time: a hibreak=ci server without the label was never deleted.
+          jq -r '.[] | "\(.name)\t\((.labels.created // "" | tonumber?) // ((.created // "") | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601?) // 0)"' <<<"$servers_json" |
           while IFS=$'\t' read -r name created; do
             (( created > 0 )) || continue
             age=$(( (now - created) / 3600 ))

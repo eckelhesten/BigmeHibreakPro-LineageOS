@@ -16,7 +16,10 @@ d = r.find("default"); drem = d.get("remote"); drev = d.get("revision")
 for pr in r.iter("project"):
     if (pr.get("path") or pr.get("name")) == sys.argv[2]:
         rem = pr.get("remote", drem); fetch = remotes[rem].rstrip("/")
-        if fetch.startswith(".."): fetch = "https://github.com"  # manifest URL is github.com/LineageOS/android
+        # Relative to the manifest's URL, github.com/LineageOS/android: ".." is github.com,
+        # "." github.com/LineageOS.
+        if fetch.startswith(".."): fetch = "https://github.com"
+        elif fetch == "." or fetch.startswith("./"): fetch = "https://github.com/LineageOS"
         rev = pr.get("revision") or remrev.get(rem) or drev or ""
         print(rem, pr.get("name"), fetch + "/" + pr.get("name"), rev, sep="\t")
         break

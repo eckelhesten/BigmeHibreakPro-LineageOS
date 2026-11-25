@@ -1,0 +1,421 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hibreak <hibreak@localhost>
+Date: Tue, 24 Nov 2026 21:27:57 +0100
+Subject: [PATCH] e-ink: fixes from an audit: sleep signal, fingerprint, sleep
+ screen, users
+
+- vendor.xrz.hibreak_sleep has one writer, the power manager's Notifier.
+  PhoneWindowManager's write came from a queue: after a quick sleep and wake
+  its late "asleep" followed the Notifier's "awake" (a bogus sleep hold).
+- vendor.xrz.hibreak_finger goes back to 0 with the unlock and going to sleep:
+  a match that unlocked nothing no longer holds the next wake-up.
+- Sleep screen: one line HH:MM in landscape (two lines pushed the date and
+  icons off the screen); no icons of lock-screen-secret notifications; icons
+  that fail to load are not loaded again on every change.
+- Display off between updates: DOZE <-> DOZE_SUSPEND while the display is on
+  no longer restarts off_ms; off_ms < 0 keeps the display on after a tick.
+- No-animations option: the scale reset is posted, not set from inside the
+  listener (Compose ended with the window manager's scale).
+- Wallpaper colours for the clock, icons and keyguard status bar of the
+  current user, not SystemUI's own (secondary users); the sleep screen's
+  weather from the system user, where HiBreakParts writes it.
+- Touch boost: LAUNCH counts as sent only when the HAL took it.
+- Window outline skipped for windows thinner than the line; brightness slider
+  outline radius on the line's centre; keyguard scrim alpha "NaN" rejected;
+  weather icon cache bounded.
+---
+ .../internal/policy/EinkWindowOutline.java    |  1 +
+ .../android/keyguard/ClockEventController.kt  |  6 ++-
+ .../impl/SystemUIApplicationImpl.java         |  7 +++-
+ .../brightness/ui/compose/BrightnessSlider.kt |  6 ++-
+ .../systemui/doze/EinkDozeScreenOff.java      |  9 +++++
+ .../systemui/shade/EinkSleepScreen.java       | 38 +++++++++++++++----
+ .../systemui/shade/EinkWeatherIcon.java       |  2 +
+ .../NotificationIconContainerViewBinder.kt    |  6 ++-
+ .../phone/KeyguardStatusBarView.java          |  6 ++-
+ .../statusbar/phone/ScrimController.java      |  2 +
+ .../server/policy/EinkPanelSignals.java       | 25 ++++++++----
+ .../server/policy/PhoneWindowManager.java     | 19 ----------
+ .../com/android/server/power/Notifier.java    |  3 +-
+ .../server/power/PowerManagerService.java     |  6 ++-
+ 14 files changed, 90 insertions(+), 46 deletions(-)
+
+diff --git a/core/java/com/android/internal/policy/EinkWindowOutline.java b/core/java/com/android/internal/policy/EinkWindowOutline.java
+index ef0952bb..b48f302a 100644
+--- a/core/java/com/android/internal/policy/EinkWindowOutline.java
++++ b/core/java/com/android/internal/policy/EinkWindowOutline.java
+@@ -76,6 +76,7 @@ public final class EinkWindowOutline {
+             // Keep the whole line inside the background's edge.
+             final float half = width / 2f;
+             final Rect rect = outline.mRect;
++            if (rect.width() <= width || rect.height() <= width) return;
+             final float radius = Math.max(outline.mRadius - half, 0f);
+             canvas.drawRoundRect(rect.left + half, rect.top + half, rect.right - half,
+                     rect.bottom - half, radius, radius, paint);
+diff --git a/packages/SystemUI/src/com/android/keyguard/ClockEventController.kt b/packages/SystemUI/src/com/android/keyguard/ClockEventController.kt
+index a381ce6f..930789c6 100644
+--- a/packages/SystemUI/src/com/android/keyguard/ClockEventController.kt
++++ b/packages/SystemUI/src/com/android/keyguard/ClockEventController.kt
+@@ -263,10 +263,12 @@ constructor(
+         if (android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)) {
+             // E-ink: pure black on a light lock wallpaper, white on a dark one, decided by the
+             // lock wallpaper's dark-text hint (ImageWallpaperColorExtractor's e-ink rule).
++            // The current user's wallpaper: SystemUI itself runs as the system user.
+             val wm = context.getSystemService(android.app.WallpaperManager::class.java)
++            val user = android.app.ActivityManager.getCurrentUser()
+             val colors =
+-                wm?.getWallpaperColors(android.app.WallpaperManager.FLAG_LOCK)
+-                    ?: wm?.getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM)
++                wm?.getWallpaperColors(android.app.WallpaperManager.FLAG_LOCK, user)
++                    ?: wm?.getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM, user)
+             val isDark =
+                 colors?.let {
+                     (it.colorHints and android.app.WallpaperColors.HINT_SUPPORTS_DARK_TEXT) == 0
+diff --git a/packages/SystemUI/src/com/android/systemui/application/impl/SystemUIApplicationImpl.java b/packages/SystemUI/src/com/android/systemui/application/impl/SystemUIApplicationImpl.java
+index dfb3e5d4..6f5630a1 100644
+--- a/packages/SystemUI/src/com/android/systemui/application/impl/SystemUIApplicationImpl.java
++++ b/packages/SystemUI/src/com/android/systemui/application/impl/SystemUIApplicationImpl.java
+@@ -107,9 +107,12 @@ public class SystemUIApplicationImpl extends SystemUIApplication implements
+                 || SystemProperties.getBoolean("debug.sysui.eink_animations", true)) {
+             return;
+         }
+-        // Held here: ValueAnimator keeps its listeners as weak references.
++        // Held here: ValueAnimator keeps its listeners as weak references. Posted: set from
++        // inside the listener, the 0 reached the listeners after this one first and the new
++        // scale then reached them too, last (Compose kept the window manager's scale).
++        final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
+         sEinkNoAnimations = scale -> {
+-            if (scale != 0f) ValueAnimator.setDurationScale(0f);
++            if (scale != 0f) main.post(() -> ValueAnimator.setDurationScale(0f));
+         };
+         ValueAnimator.registerDurationScaleChangeListener(sEinkNoAnimations);
+         ValueAnimator.setDurationScale(0f);
+diff --git a/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt b/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt
+index 99ef675f..2e411f64 100644
+--- a/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt
++++ b/packages/SystemUI/src/com/android/systemui/brightness/ui/compose/BrightnessSlider.kt
+@@ -350,8 +350,12 @@ fun BrightnessSlider(
+                                         color = einkOutlineColor,
+                                         topLeft = Offset(stroke / 2, stroke / 2),
+                                         size = Size(size.width - stroke, size.height - stroke),
++                                        // The line's centre runs stroke / 2 inside the edge.
+                                         cornerRadius =
+-                                            CornerRadius(SliderTrackRoundedCorner.toPx()),
++                                            CornerRadius(
++                                                (SliderTrackRoundedCorner.toPx() - stroke / 2)
++                                                    .coerceAtLeast(0f)
++                                            ),
+                                         style = Stroke(stroke),
+                                     )
+                                 }
+diff --git a/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java b/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
+index a2d99405..56baefb7 100644
+--- a/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
++++ b/packages/SystemUI/src/com/android/systemui/doze/EinkDozeScreenOff.java
+@@ -80,6 +80,12 @@ public final class EinkDozeScreenOff {
+                 // (DOZE <-> DOZE_SUSPEND) without waking the display up unnecessarily.
+                 mAlwaysOnState = state;
+                 return;
++            } else {
++                // The display is on (going to sleep, or an update): the new sub-state at once,
++                // and the pending turn-off stays as it was instead of starting off_ms again.
++                mService.setDozeScreenState(state);
++                mAlwaysOnState = state;
++                return;
+             }
+             releasePipeline();
+             mHandler.removeCallbacks(mTurnOff);
+@@ -170,6 +176,9 @@ public final class EinkDozeScreenOff {
+         if (gen != mSessionGen || mAlwaysOnState == Display.STATE_UNKNOWN) {
+             return;
+         }
++        // off_ms < 0: the display stays on the whole time (the behaviour before this class); a
++        // tick must not turn it off after tick_ms.
++        if (mSleepDelay < 0) return;
+         releasePipeline();
+         mHandler.removeCallbacks(mTurnOff);
+         int delay = mTickDelay;
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+index 60e74b96..3a9574b2 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkSleepScreen.java
+@@ -133,6 +133,9 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+     private final Rect mBounds = new Rect();
+     private final List<Drawable> mIcons = new ArrayList<>();
+     private final List<IconSpec> mIconSpecs = new ArrayList<>();
++    // The icons last asked for, including any that failed to load: those are not tried again on
++    // every pipeline change and tick, only when the set changes.
++    private final List<IconSpec> mWantedSpecs = new ArrayList<>();
+     private Typeface mTimeTypeface;
+     private boolean mTimeTypefaceIsFlex;
+     private int mTimeTypefaceWeight = -1;
+@@ -280,6 +283,7 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+             setVisibility(GONE);
+             mIcons.clear();
+             mIconSpecs.clear();
++            mWantedSpecs.clear();
+         }
+     }
+ 
+@@ -331,7 +335,11 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+                 Log.w(TAG, "notification icons", e);
+             }
+         }
+-        if (sameIconSpecs(mIconSpecs, nextSpecs)) return false;
++        if (sameIconSpecs(mIconSpecs, nextSpecs) || sameIconSpecs(mWantedSpecs, nextSpecs)) {
++            return false;
++        }
++        mWantedSpecs.clear();
++        mWantedSpecs.addAll(nextSpecs);
+ 
+         List<IconSpec> loadedSpecs = new ArrayList<>(nextSpecs.size());
+         List<Drawable> loadedIcons = new ArrayList<>(nextSpecs.size());
+@@ -391,6 +399,13 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+             List<IconSpec> specs, List<StatusBarNotification> sbns) {
+         if (!isAlerting(entry)) return false;
+         StatusBarNotification sbn = entry.getSbn();
++        // Never on the lock screen (the app's or the user's choice): not on the sleep screen
++        // either, also not for the moment before the keyguard's filter has run.
++        if (sbn.getNotification().visibility == android.app.Notification.VISIBILITY_SECRET
++                || entry.getRanking().getLockscreenVisibilityOverride()
++                        == android.app.Notification.VISIBILITY_SECRET) {
++            return false;
++        }
+         String pkg = sbn.getPackageName();
+         if (seen.contains(pkg)) return false;
+         Icon icon = sbn.getNotification().getSmallIcon();
+@@ -449,8 +464,10 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         mEventTitle = null;
+         final long now = System.currentTimeMillis();
+         try {
++            // The device's weather (HiBreakParts runs as the system user and writes it there);
++            // the next event stays the current user's own, so a secondary user sees none.
+             String weather = Settings.System.getStringForUser(mContext.getContentResolver(),
+-                    WEATHER_DATA, UserHandle.USER_CURRENT);
++                    WEATHER_DATA, UserHandle.USER_SYSTEM);
+             String[] f = weather != null ? weather.split(";", 9) : null;
+             // Version 1: city in field 6, no condition. Version 2: code, condition, city.
+             if (f != null && f.length == 7 && "1".equals(f[0])) {
+@@ -540,11 +557,16 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         final boolean is24 = DateFormat.is24HourFormat(mContext);
+         int hour = is24 ? now.get(Calendar.HOUR_OF_DAY) : now.get(Calendar.HOUR);
+         if (!is24 && hour == 0) hour = 12;
+-        String[] lines = {
+-                String.format(Locale.ROOT, is24 ? "%02d" : "%d", hour),
+-                String.format(Locale.ROOT, "%02d", now.get(Calendar.MINUTE))};
+-
+-        // The numerals: two lines, centred, their block starting at 17 % of the height.
++        final String hours = String.format(Locale.ROOT, is24 ? "%02d" : "%d", hour);
++        final String minutes = String.format(Locale.ROOT, "%02d", now.get(Calendar.MINUTE));
++        // Landscape (wider than high): one line, or the two lines (about the screen's height at
++        // min(w, h)) push the date and the icons off the screen.
++        final boolean landscape = w > h;
++        String[] lines = landscape ? new String[] {hours + ":" + minutes}
++                : new String[] {hours, minutes};
++
++        // The numerals: two lines (one in landscape), centred, starting at 17 % (14 %) of the
++        // height.
+         if (mTimeTypeface == null || mTimeTypefaceWeight != mWeight) {
+             mTimeTypeface = clockTypeface(mWeight);
+             mTimeTypefaceWeight = mWeight;
+@@ -556,7 +578,7 @@ public final class EinkSleepScreen extends View implements StatusBarStateControl
+         mTimePaint.setFontFeatureSettings("tnum");
+         mTimePaint.setTextSize(ref * mSize);
+         mTimePaint.setTextAlign(Paint.Align.CENTER);
+-        float y = h * 0.17f;
++        float y = h * (landscape ? 0.14f : 0.17f);
+         for (String line : lines) {
+             mTimePaint.getTextBounds("0", 0, 1, mBounds);
+             final float digit = mBounds.height();
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java b/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java
+index 12e9854e..fc9994a1 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/EinkWeatherIcon.java
+@@ -56,6 +56,8 @@ final class EinkWeatherIcon {
+             List<Path> paths = new ArrayList<>();
+             List<Integer> modes = new ArrayList<>();
+             build(kind, day, paths, modes);
++            // Bounded: every unknown kind gets an entry (drawn as a cloud).
++            if (CACHE.size() >= 64) CACHE.clear();
+             cached = new CachedIcon(paths, modes, inkBounds(paths, modes, 0f));
+             CACHE.put(key, cached);
+             return cached;
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/notification/icon/ui/viewbinder/NotificationIconContainerViewBinder.kt b/packages/SystemUI/src/com/android/systemui/statusbar/notification/icon/ui/viewbinder/NotificationIconContainerViewBinder.kt
+index 13dc39ca..2202d8e0 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/notification/icon/ui/viewbinder/NotificationIconContainerViewBinder.kt
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/notification/icon/ui/viewbinder/NotificationIconContainerViewBinder.kt
+@@ -371,9 +371,11 @@ object NotificationIconContainerViewBinder {
+     private fun einkAodIconColor(context: android.content.Context): Int? {
+         if (!android.os.SystemProperties.getBoolean("debug.sysui.eink_palette", false)) return null
+         val wm = context.getSystemService(android.app.WallpaperManager::class.java) ?: return null
++        // The current user's wallpaper: SystemUI itself runs as the system user.
++        val user = android.app.ActivityManager.getCurrentUser()
+         val colors =
+-            wm.getWallpaperColors(android.app.WallpaperManager.FLAG_LOCK)
+-                ?: wm.getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM)
++            wm.getWallpaperColors(android.app.WallpaperManager.FLAG_LOCK, user)
++                ?: wm.getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM, user)
+                 ?: return null
+         val darkText =
+             (colors.colorHints and android.app.WallpaperColors.HINT_SUPPORTS_DARK_TEXT) != 0
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/phone/KeyguardStatusBarView.java b/packages/SystemUI/src/com/android/systemui/statusbar/phone/KeyguardStatusBarView.java
+index ca45c07d..b411120d 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/phone/KeyguardStatusBarView.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/phone/KeyguardStatusBarView.java
+@@ -480,10 +480,12 @@ public class KeyguardStatusBarView extends RelativeLayout {
+             // dark-text hint (from the strip under the status bar, ImageWallpaperColorExtractor).
+             android.app.WallpaperManager wm =
+                     mContext.getSystemService(android.app.WallpaperManager.class);
++            // The current user's wallpaper: SystemUI itself runs as the system user.
++            final int user = android.app.ActivityManager.getCurrentUser();
+             android.app.WallpaperColors colors = wm == null ? null
+-                    : wm.getWallpaperColors(android.app.WallpaperManager.FLAG_LOCK);
++                    : wm.getWallpaperColors(android.app.WallpaperManager.FLAG_LOCK, user);
+             if (colors == null && wm != null) {
+-                colors = wm.getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM);
++                colors = wm.getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM, user);
+             }
+             if (colors != null) {
+                 boolean darkText = (colors.getColorHints()
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimController.java b/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimController.java
+index 7a319bd2..b80b58dd 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimController.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/phone/ScrimController.java
+@@ -224,6 +224,8 @@ public class ScrimController implements ViewTreeObserver.OnPreDrawListener, Dump
+         try {
+             float alpha = Float.parseFloat(
+                     SystemProperties.get("debug.sysui.keyguard_scrim_alpha", "0.2"));
++            // "NaN" parses, and passes through min/max.
++            if (Float.isNaN(alpha)) return 0.2f;
+             return Math.max(0f, Math.min(1f, alpha));
+         } catch (NumberFormatException e) {
+             return 0.2f;
+diff --git a/services/core/java/com/android/server/policy/EinkPanelSignals.java b/services/core/java/com/android/server/policy/EinkPanelSignals.java
+index d2e9860c..300a4231 100644
+--- a/services/core/java/com/android/server/policy/EinkPanelSignals.java
++++ b/services/core/java/com/android/server/policy/EinkPanelSignals.java
+@@ -14,12 +14,12 @@ import android.util.Slog;
+ /**
+  * E-ink (HiBreak Pro): tells SurfaceFlinger (frameworks/native EinkMotion) about an unlock and a
+  * finger on the fingerprint sensor, so that it can hold the panel until the screen behind them
+- * has settled, as it does when the phone goes to sleep or wakes up (vendor.xrz.hibreak_sleep,
+- * PhoneWindowManager).
++ * has settled, as it does when the phone goes to sleep or wakes up (vendor.xrz.hibreak_sleep).
+  *
+- * vendor.xrz.hibreak_sleep: written here too, by the power manager at the change itself;
+- * PhoneWindowManager's write comes from the main thread, which a fingerprint wake-up can keep
+- * busy for ~0.5 s.
++ * vendor.xrz.hibreak_sleep: written here only, by the power manager at the change itself.
++ * PhoneWindowManager wrote it too, from the main thread, which a fingerprint wake-up can keep
++ * busy for ~0.5 s: after a quick sleep and wake its late "asleep" came after the power manager's
++ * "awake".
+  *
+  * vendor.xrz.hibreak_unlock: the uptime in ms of the last keyguard going away. The lock screen
+  * then goes to home (or the app) in one panel update.
+@@ -50,11 +50,13 @@ public final class EinkPanelSignals {
+     private EinkPanelSignals() {}
+ 
+     /**
+-     * The default display group starts going to sleep or waking up (vendor.xrz.hibreak_sleep,
+-     * also written by PhoneWindowManager): called by the power manager's Notifier at once.
++     * The default display group starts going to sleep or waking up (vendor.xrz.hibreak_sleep):
++     * called by the power manager's Notifier at once.
+      */
+     public static void setAsleep(boolean asleep) {
+         if (!ENABLED) return;
++        // A match that unlocked nothing (lockdown, a PIN required) ends with the sleep.
++        if (asleep) clearFinger();
+         set("vendor.xrz.hibreak_sleep", asleep ? "1" : "0");
+     }
+ 
+@@ -62,6 +64,15 @@ public final class EinkPanelSignals {
+     public static void keyguardGoingAway() {
+         if (!ENABLED) return;
+         set(UNLOCK, Long.toString(SystemClock.uptimeMillis()));
++        // The match the unlock came from is used up.
++        clearFinger();
++    }
++
++    private static synchronized void clearFinger() {
++        final boolean had = sFinger;
++        sMatched = false;
++        sFinger = false;
++        if (had) set(FINGER, "0");
+     }
+ 
+     /** An acquire of the keyguard's fingerprint authentication. */
+diff --git a/services/core/java/com/android/server/policy/PhoneWindowManager.java b/services/core/java/com/android/server/policy/PhoneWindowManager.java
+index 90b54044..69fefe33 100644
+--- a/services/core/java/com/android/server/policy/PhoneWindowManager.java
++++ b/services/core/java/com/android/server/policy/PhoneWindowManager.java
+@@ -6148,23 +6148,6 @@ public class PhoneWindowManager implements WindowManagerPolicy {
+         return isAnyDefaultAdjacentGroupInteractive || isDefaultGroupInteractive;
+     }
+ 
+-    /**
+-     * E-ink (HiBreak Pro): tells SurfaceFlinger that the phone is going to sleep or waking up,
+-     * before the keyguard hears of it. SurfaceFlinger (frameworks/native EinkMotion) then holds
+-     * the panel until the screen has settled, so the steps in between never show.
+-     */
+-    private static final boolean EINK_SLEEP =
+-            SystemProperties.getBoolean("debug.sf.eink_motion", false);
+-
+-    private static void setEinkAsleep(int displayGroupId, boolean asleep) {
+-        if (!EINK_SLEEP || displayGroupId != Display.DEFAULT_DISPLAY_GROUP) return;
+-        try {
+-            SystemProperties.set("vendor.xrz.hibreak_sleep", asleep ? "1" : "0");
+-        } catch (RuntimeException e) {
+-            Slog.w(TAG, "Could not set vendor.xrz.hibreak_sleep", e);
+-        }
+-    }
+-
+     // Called on the PowerManager's Notifier thread.
+     @Override
+     public void startedGoingToSleep(int displayGroupId,
+@@ -6172,7 +6155,6 @@ public class PhoneWindowManager implements WindowManagerPolicy {
+         if (!isReadyToSignalSleep(displayGroupId)) {
+             return;
+         }
+-        setEinkAsleep(displayGroupId, true);
+ 
+         if (DEBUG_WAKEUP) {
+             Slog.i(TAG, "Started going to sleep... (groupId=" + displayGroupId + " why="
+@@ -6244,7 +6226,6 @@ public class PhoneWindowManager implements WindowManagerPolicy {
+     // Called on the PowerManager's Notifier thread.
+     @Override
+     public void startedWakingUp(int displayGroupId, @WakeReason int pmWakeReason) {
+-        setEinkAsleep(displayGroupId, false);
+         if (DEBUG_WAKEUP) {
+             Slog.i(TAG, "Started waking up... (groupId=" + displayGroupId + " why="
+                     + WindowManagerPolicyConstants.onReasonToString(
+diff --git a/services/core/java/com/android/server/power/Notifier.java b/services/core/java/com/android/server/power/Notifier.java
+index 7cf6d544..64688408 100644
+--- a/services/core/java/com/android/server/power/Notifier.java
++++ b/services/core/java/com/android/server/power/Notifier.java
+@@ -656,7 +656,8 @@ public class Notifier {
+             final int changeReason = interactivity.changeReason;
+             // E-ink: SurfaceFlinger hears of it now, not when the main thread gets to the policy
+             // (a fingerprint wake-up kept it busy for ~470 ms, and the lock screen reached the
+-            // panel meanwhile, 2026-11-24). PhoneWindowManager writes the same value again.
++            // panel meanwhile, 2026-11-24). The only writer: a second one from the policy's
++            // queue could set it back to asleep after a quick sleep and wake.
+             if (groupId == android.view.Display.DEFAULT_DISPLAY_GROUP) {
+                 com.android.server.policy.EinkPanelSignals.setAsleep(!interactivity.isInteractive);
+             }
+diff --git a/services/core/java/com/android/server/power/PowerManagerService.java b/services/core/java/com/android/server/power/PowerManagerService.java
+index d6953f50..15229c4a 100644
+--- a/services/core/java/com/android/server/power/PowerManagerService.java
++++ b/services/core/java/com/android/server/power/PowerManagerService.java
+@@ -5075,8 +5075,10 @@ public final class PowerManagerService extends SystemService
+         if (!always && on == mLaunchSent) {
+             return true;
+         }
+-        mLaunchSent = on;
+-        return mNativeWrapper.nativeSetPowerMode(Mode.LAUNCH, on);
++        final boolean sent = mNativeWrapper.nativeSetPowerMode(Mode.LAUNCH, on);
++        // A call the HAL refused is tried again with the next change, not taken as done.
++        if (sent) mLaunchSent = on;
++        return sent;
+     }
+ 
+     private void extendTouchBoostInternal(int durationMs) {

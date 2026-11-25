@@ -59,19 +59,39 @@ declare -A TEST
 for c in build/make/target/product/security/*.x509.pem; do
   TEST[$(openssl x509 -in "$c" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d : | tr A-F a-f)]=$(basename "$c" .x509.pem)
 done
-n=0
-while IFS= read -r -d '' pkg; do
+# apksigner (a JVM each, ~750 packages per flavour): in parallel, one result file per package,
+# then the results in order.
+verify_pkg() { # pkg result-file: line 1 the note (or empty), then the signers' SHA-256 digests
+  local pkg=$1 res=$2 out note=""
   if out=$("$J" -jar "$A" verify --print-certs "$pkg" 2>/dev/null); then
-    signers=$(sed -n 's/^Signer .*certificate SHA-256 digest: //p' <<<"$out")
+    :
   elif [ "$(basename "$pkg")" = PrebuiltExchange3Google.apk ] \
       && out=$("$J" -jar "$A" verify --max-sdk-version 23 --print-certs "$pkg" 2>/dev/null); then
     # Upstream MindTheGapps ships this API 23 APK with its v2 block stripped; its v1 Google signature is intact.
-    echo "apk with stripped v2 signature (expected MindTheGapps upstream): $(basename "$pkg")"
-    signers=$(sed -n 's/^Signer .*certificate SHA-256 digest: //p' <<<"$out")
+    note="apk with stripped v2 signature (expected MindTheGapps upstream): $(basename "$pkg")"
   else
-    signers=""
+    out=""
   fi
+  { printf '%s\n' "$note"; sed -n 's/^Signer .*certificate SHA-256 digest: //p' <<<"$out"; } > "$res"
+}
+export -f verify_pkg
+export J A
+mkdir -p "$tmp/pkgs"
+find "$P/system" "$P/system_ext" "$P/product" \( -name '*.apk' -o -name '*.apex' -o -name '*.capex' \) -print0 \
+  | sort -z > "$tmp/pkglist"
+i=0
+while IFS= read -r -d '' pkg; do
+  printf '%s\0%s\0' "$pkg" "$tmp/pkgs/$i"; i=$((i + 1))
+done < "$tmp/pkglist" | xargs -0 -n 2 -P "$(nproc 2>/dev/null || echo 4)" bash -c 'verify_pkg "$1" "$2"' _
+n=0
+while IFS= read -r -d '' pkg; do
+  res=$tmp/pkgs/$n
   n=$((n + 1))
+  note=""; signers=""
+  if [ -f "$res" ]; then
+    note=$(head -1 "$res"); signers=$(tail -n +2 "$res")
+  fi
+  [ -n "$note" ] && echo "$note"
   if [ -z "$signers" ]; then
     echo "PACKAGE DOES NOT VERIFY: $pkg"; bad=1
   else
@@ -85,7 +105,7 @@ while IFS= read -r -d '' pkg; do
       fi
     done <<<"$signers"
   fi
-done < <(find "$P/system" "$P/system_ext" "$P/product" \( -name '*.apk' -o -name '*.apex' -o -name '*.capex' \) -print0)
+done < "$tmp/pkglist"
 [ "$n" -gt 0 ] || { echo "NO APKS/APEXES VERIFIED IN $P"; bad=1; }
 echo "checked $n APKs/APEXes"
 
@@ -186,6 +206,9 @@ while pos + 110 <= len(cpio) and cpio[pos:pos + 6] in (b"070701", b"070702"):
 sys.exit(1 if bad else 0)
 EOF
   fi
+else
+  # Not a release (build.yml publishes user builds only): said, not skipped silently.
+  echo "note: ro.build.type is $(sed -n 's/^ro.build.type=//p' "$P/system/build.prop"), not user: the user-build checks (release-keys tags, debuggable, debug files) were skipped"
 fi
 [ $bad = 0 ] && echo "release build OK" || echo "release build has problems"
 exit $bad

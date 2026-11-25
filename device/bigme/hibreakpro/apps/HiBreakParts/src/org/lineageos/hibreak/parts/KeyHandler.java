@@ -51,6 +51,7 @@ public class KeyHandler implements DeviceKeyHandler {
     private boolean mTorchCallbackRegistered;
     private int mTorchRetries;
     private boolean mTorchRetryScheduled;
+    private PowerManager.WakeLock mWakeLock;
     private final Runnable mRetryInitTorch = () -> {
         mTorchRetryScheduled = false;
         initTorch();
@@ -83,9 +84,30 @@ public class KeyHandler implements DeviceKeyHandler {
             return event;
         }
         if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) {
-            mHandler.post(() -> run(setting));
+            // Awake until the action has run: with the screen off (the flashlight, the camera)
+            // the CPU could suspend between the key and the background thread.
+            final PowerManager.WakeLock wl = wakeLock();
+            if (wl != null) wl.acquire(5000);
+            mHandler.post(() -> {
+                try {
+                    run(setting);
+                } finally {
+                    if (wl != null && wl.isHeld()) wl.release();
+                }
+            });
         }
         return null;
+    }
+
+    private PowerManager.WakeLock wakeLock() {
+        if (mWakeLock == null) {
+            PowerManager pm = mContext.getSystemService(PowerManager.class);
+            if (pm == null) return null;
+            mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "hibreak:sidekey");
+            // One per press: each release ends its own acquire.
+            mWakeLock.setReferenceCounted(true);
+        }
+        return mWakeLock;
     }
 
     private void resolveKeypad() {
@@ -130,11 +152,10 @@ public class KeyHandler implements DeviceKeyHandler {
             }
             switch (action) {
                 case "eink_refresh":
-                    if (interactive) {
-                        Settings.System.putStringForUser(cr, Keys.EINK_REFRESH_REQUEST,
-                                Long.toString(SystemClock.elapsedRealtimeNanos()),
-                                UserHandle.USER_SYSTEM);
-                    }
+                    // Directly (system_server may set vendor.xrz.*, xrz.te): through the
+                    // Keys.EINK_REFRESH_REQUEST setting it was a settings write and a round trip
+                    // to the app first. The setting stays for the shell and the bench.
+                    if (interactive) Eink.fullRefresh();
                     break;
                 case "eink_mode":
                     if (interactive) {
@@ -259,7 +280,15 @@ public class KeyHandler implements DeviceKeyHandler {
         CameraManager cm = mContext.getSystemService(CameraManager.class);
         if (cm == null) return;
         try {
-            if (!mTorchCallbackRegistered) initTorch();
+            if (!mTorchCallbackRegistered) {
+                initTorch();
+                if (mTorchCallbackRegistered) {
+                    // The callback reports the torch's state (someone else may have turned it on)
+                    // on this thread, after this message: toggle after that, not from false.
+                    mHandler.post(this::toggleTorch);
+                    return;
+                }
+            }
             if (mTorchCameraId != null) {
                 boolean next = !mTorchOn;
                 cm.setTorchMode(mTorchCameraId, next);

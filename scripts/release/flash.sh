@@ -42,6 +42,14 @@ fb_connected() {
   fastboot devices 2>/dev/null | grep -q .
 }
 
+# Exactly one phone, over adb and fastboot together: with two, every command could go to either.
+one_device() {
+  local n
+  n=$( { adb devices 2>/dev/null | sed 1d | grep -E '[[:space:]](device|recovery|sideload|unauthorized)$' || true
+         fastboot devices 2>/dev/null || true; } | grep -c . || true)
+  [ "${n:-0}" -le 1 ] || die "${n} phones connected: connect only the one to flash"
+}
+
 fb_userspace() {
   local v
   v=$(fb_var is-userspace)
@@ -66,7 +74,11 @@ wait_fastboot_mode() {
   for i in $(seq 1 60); do
     if fb_connected; then
       if [ "$(fb_userspace)" = "$want" ]; then
-        return 0
+        # "no" is also what a failed getvar gives (fastbootd going down on its way to the
+        # bootloader): the bootloader is there once it answers for its slot too.
+        if [ "$want" = yes ] || [ -n "$(fb_slot)" ]; then
+          return 0
+        fi
       fi
     fi
     sleep 1
@@ -82,9 +94,11 @@ command -v adb >/dev/null || die "adb not found: install Android platform tools"
 command -v fastboot >/dev/null || die "fastboot not found: install Android platform tools"
 
 step "Checking the images"
+[ -s SHA256SUMS ] || die "SHA256SUMS is missing or empty"
 if command -v sha256sum >/dev/null; then sha256sum -c SHA256SUMS; else shasum -a 256 -c SHA256SUMS; fi
 
 step "Detecting the phone"
+one_device
 mode=""
 if [ "$(adb get-state 2>/dev/null || true)" = device ]; then
   mode=adb
@@ -100,21 +114,21 @@ fi
 
 slot=""
 if [ "$mode" = adb ]; then
-  hw=$(adb shell getprop ro.boot.hardware | tr -d '\r')
+  hw=$(adb shell getprop ro.boot.hardware </dev/null | tr -d '\r')
   [ "$hw" = mt6877 ] || die "unexpected hardware '${hw}', expected 'mt6877' (Bigme HiBreak Pro)"
 
-  vfp=$(adb shell getprop ro.vendor.build.fingerprint | tr -d '\r')
+  vfp=$(adb shell getprop ro.vendor.build.fingerprint </dev/null | tr -d '\r')
   if [ "$vfp" != "$EXPECTED_VENDOR_FP" ]; then
     die "unexpected vendor firmware '${vfp}'. This ROM requires the black-and-white EEA HiBreak Pro running stock Bigme_HiBreak_EEA_V1.0_20260312 (not Color, CN, or other versions)."
   fi
 
-  locked=$(adb shell getprop ro.boot.flash.locked | tr -d '\r')
-  vstate=$(adb shell getprop ro.boot.vbmeta.device_state | tr -d '\r')
+  locked=$(adb shell getprop ro.boot.flash.locked </dev/null | tr -d '\r')
+  vstate=$(adb shell getprop ro.boot.vbmeta.device_state </dev/null | tr -d '\r')
   if [ "$locked" != 0 ] && [ "$vstate" != unlocked ]; then
     die "bootloader is locked (ro.boot.flash.locked='${locked}', device_state='${vstate}'). Unlock it first: adb reboot bootloader && fastboot flashing unlock"
   fi
 
-  raw_slot=$(adb shell getprop ro.boot.slot_suffix | tr -d '\r')
+  raw_slot=$(adb shell getprop ro.boot.slot_suffix </dev/null | tr -d '\r')
   slot=${raw_slot#_}
   case "$slot" in
     a|b) ;;

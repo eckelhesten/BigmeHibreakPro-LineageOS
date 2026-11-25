@@ -5,6 +5,7 @@ package org.lineageos.hibreak.parts;
 
 import android.content.ContentResolver;
 import android.database.ContentObserver;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -20,6 +21,7 @@ import androidx.preference.SwitchPreferenceCompat;
 public class SettingsFragment extends PreferenceFragmentCompat {
     private static final String[] KEY_PREFS = {"key_f1", "key_f2"};
     private static final long WARMTH_WRITE_INTERVAL_MS = 80;
+    private static final Uri WARMTH_URI = Settings.System.getUriFor(Keys.FRONTLIGHT_WARMTH);
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private SystemSettingsStore mStore;
@@ -28,14 +30,21 @@ public class SettingsFragment extends PreferenceFragmentCompat {
     private final Runnable mWriteWarmth = this::flushWarmth;
     private final ContentObserver mObserver = new ContentObserver(mHandler) {
         @Override
-        public void onChange(boolean selfChange) {
-            if (isAdded()) sync();
+        public void onChange(boolean selfChange, Uri uri) {
+            if (!isAdded()) return;
+            // The warmth slider writes every 80 ms while it is dragged: only the slider then,
+            // not all the settings again.
+            if (WARMTH_URI.equals(uri)) {
+                syncWarmth();
+            } else {
+                sync();
+            }
         }
     };
 
     @Override
     public void onCreatePreferences(Bundle savedInstanceState, String rootKey) {
-        mStore = new SystemSettingsStore(requireContext().getContentResolver());
+        mStore = new SystemSettingsStore(requireContext());
         getPreferenceManager().setPreferenceDataStore(mStore);
         setPreferencesFromResource(R.xml.settings, rootKey);
 
@@ -77,12 +86,13 @@ public class SettingsFragment extends PreferenceFragmentCompat {
     @Override
     public void onStart() {
         super.onStart();
-        ContentResolver cr = requireContext().getContentResolver();
         for (String key : new String[] {Keys.EINK_PROFILE, Keys.FRONTLIGHT_ENABLED,
                 Keys.FRONTLIGHT_WARMTH, Keys.KEY_F1, Keys.KEY_F2}) {
-            cr.registerContentObserver(Settings.System.getUriFor(key), false, mObserver);
+            (SystemSettingsStore.isPerUser(key) ? requireContext().getContentResolver()
+                    : SystemSettingsStore.deviceResolver(requireContext()))
+                    .registerContentObserver(Settings.System.getUriFor(key), false, mObserver);
         }
-        sync();
+        // onResume (always next) syncs.
     }
 
     @Override
@@ -101,6 +111,7 @@ public class SettingsFragment extends PreferenceFragmentCompat {
     @Override
     public void onStop() {
         flushWarmthNow();
+        // Both resolvers share the observer's registrations (one content service).
         requireContext().getContentResolver().unregisterContentObserver(mObserver);
         super.onStop();
     }
@@ -140,10 +151,7 @@ public class SettingsFragment extends PreferenceFragmentCompat {
         }
         SwitchPreferenceCompat fl = findPreference("frontlight_enabled");
         if (fl != null) fl.setChecked(mStore.getBoolean("frontlight_enabled", true));
-        SeekBarPreference warmth = findPreference("frontlight_warmth");
-        if (warmth != null && mPendingWarmth < 0) {
-            warmth.setValue(mStore.getInt("frontlight_warmth", Keys.DEFAULT_WARMTH));
-        }
+        syncWarmth();
         ContentResolver cr = requireContext().getContentResolver();
         SwitchPreferenceCompat bold = findPreference("text_bold");
         if (bold != null) {
@@ -152,8 +160,14 @@ public class SettingsFragment extends PreferenceFragmentCompat {
         }
         SwitchPreferenceCompat anim = findPreference("no_animations");
         if (anim != null) {
-            anim.setChecked(Settings.Global.getFloat(cr,
-                    Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f);
+            anim.setChecked(animationsOff(cr));
+        }
+    }
+
+    private void syncWarmth() {
+        SeekBarPreference warmth = findPreference("frontlight_warmth");
+        if (warmth != null && mPendingWarmth < 0) {
+            warmth.setValue(mStore.getInt("frontlight_warmth", Keys.DEFAULT_WARMTH));
         }
     }
 
@@ -170,8 +184,7 @@ public class SettingsFragment extends PreferenceFragmentCompat {
         }
         SwitchPreferenceCompat anim = findPreference("no_animations");
         if (anim != null) {
-            anim.setChecked(Settings.Global.getFloat(cr,
-                    Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f);
+            anim.setChecked(animationsOff(cr));
             anim.setOnPreferenceChangeListener((p, v) -> {
                 float scale = (Boolean) v ? 0f : 1f;
                 return Settings.Global.putFloat(cr, Settings.Global.ANIMATOR_DURATION_SCALE, scale)
@@ -181,6 +194,14 @@ public class SettingsFragment extends PreferenceFragmentCompat {
                                 Settings.Global.TRANSITION_ANIMATION_SCALE, scale);
             });
         }
+    }
+
+    /** All three scales at 0, as the switch sets them (developer options set them one by one). */
+    private static boolean animationsOff(ContentResolver cr) {
+        return Settings.Global.getFloat(cr, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
+                && Settings.Global.getFloat(cr, Settings.Global.WINDOW_ANIMATION_SCALE, 1f) == 0f
+                && Settings.Global.getFloat(cr, Settings.Global.TRANSITION_ANIMATION_SCALE, 1f)
+                        == 0f;
     }
 
     private CharSequence describeAction(String value) {

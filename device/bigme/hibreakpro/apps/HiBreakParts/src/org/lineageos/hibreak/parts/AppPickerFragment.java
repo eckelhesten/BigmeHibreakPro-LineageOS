@@ -36,7 +36,7 @@ public class AppPickerFragment extends PreferenceFragmentCompat {
                     return;
                 }
                 Context prefContext = getPreferenceManager().getContext();
-                SystemSettingsStore store = new SystemSettingsStore(appContext.getContentResolver());
+                SystemSettingsStore store = new SystemSettingsStore(appContext);
                 for (AppList.App app : apps) {
                     Preference pref = new Preference(prefContext);
                     pref.setTitle(app.label);

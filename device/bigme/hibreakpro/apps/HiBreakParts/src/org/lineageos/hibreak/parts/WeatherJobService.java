@@ -24,6 +24,8 @@ public class WeatherJobService extends JobService {
     private static final int JOB_PERIODIC = 0x48420001;
     private static final int JOB_NOW = 0x48420002;
     private static final long HOUR_MS = 60 * 60 * 1000L;
+    /** The hourly job skips its run when a fetch (at sleep, after a change) is newer than this. */
+    private static final long FRESH_MS = 25 * 60 * 1000L;
     private final Object mLock = new Object();
     private final SparseArray<ActiveJob> mActive = new SparseArray<>();
 
@@ -36,11 +38,14 @@ public class WeatherJobService extends JobService {
             cancelled.set(true);
             HttpURLConnection c = conn.getAndSet(null);
             if (c != null) {
-                try {
-                    c.disconnect();
-                } catch (RuntimeException ignored) {
-                    // Best-effort socket abort.
-                }
+                // Not on the main thread (onStopJob): closing a TLS socket writes to it.
+                new Thread(() -> {
+                    try {
+                        c.disconnect();
+                    } catch (RuntimeException ignored) {
+                        // Best-effort socket abort.
+                    }
+                }, "HiBreakWeatherCancel").start();
             }
             Thread t = thread;
             if (t != null) t.interrupt();
@@ -71,9 +76,20 @@ public class WeatherJobService extends JobService {
         }
     }
 
+    /** A fetch at once (going to sleep with old data), unless one is already waiting. */
+    static void scheduleNowIfIdle(Context context) {
+        JobScheduler js = context.getSystemService(JobScheduler.class);
+        if (js != null && js.getPendingJob(JOB_NOW) != null) return;
+        schedule(context, true);
+    }
+
     @Override
     public boolean onStartJob(JobParameters params) {
         int id = params.getJobId();
+        if (id == JOB_PERIODIC && Weather.enabled(getContentResolver())) {
+            long age = System.currentTimeMillis() - Weather.fetchedAt(getContentResolver());
+            if (age >= 0 && age < FRESH_MS) return false;  // fetched recently: nothing to do
+        }
         ActiveJob job = new ActiveJob();
         Thread t = new Thread(() -> {
             boolean ok = false;

@@ -22,6 +22,7 @@ import android.util.Log;
 
 import java.util.Calendar;
 import java.util.TimeZone;
+import java.util.regex.Pattern;
 
 /**
  * Keeps the sleep screen's corners current (Settings > Display > E-ink & front light >
@@ -35,8 +36,11 @@ import java.util.TimeZone;
  *   event by day: an all-day event wins when it starts on an earlier day than the next timed
  *   event (tomorrow's birthday before Saturday's appointment); on the same day the timed event
  *   wins, so a birthday today doesn't hide today's 14:00 meeting. Recomputed when the
- *   calendars change, when the phone goes to sleep, when the time or zone changes, and when the
- *   shown event ends (a non-waking alarm: it fires at the next minute tick after the end).
+ *   calendars change, when the time, zone, date or language changes, and when the shown event
+ *   ends (a non-waking alarm: it fires at the next minute tick after the end, and the query runs
+ *   in the alarm's delivery, not a second later, when the CPU may be asleep again). Going to sleep
+ *   queries the provider only when the last answer may be stale (nothing to rely on yet, another
+ *   day, the event over): a query per screen-off woke the calendar provider each time.
  */
 class SleepScreenInfo {
     private static final String TAG = "HiBreakSleepInfo";
@@ -45,13 +49,21 @@ class SleepScreenInfo {
     private static final long LOOKAHEAD = 7 * DAY;
     private static final long WEATHER_REFRESH_AT_SLEEP = 30 * MINUTE;
     private static final int MAX_TITLE_LEN = 120;
+    private static final Pattern WHITESPACE = Pattern.compile("\\s+");
 
     private final Context mContext;
     private final ContentResolver mResolver;
     private final Handler mHandler;
     private boolean mCalendarObserverRegistered;
+    /** The last query's answer still holds: no calendar change or other trigger since. */
+    private boolean mCalendarClean;
+    /** When the last query ran (local midnight of its day) and when its event ends. */
+    private long mQueryDay = Long.MIN_VALUE;
+    private long mShownEnd = Long.MAX_VALUE;
     private final Runnable mUpdateCalendar = this::updateCalendar;
-    private final AlarmManager.OnAlarmListener mEventEnded = this::updateCalendarSoon;
+    // At once: the alarm's (and a broadcast's) wakelock ends with the callback, and a delayed
+    // query waited for the next wake-up (uptime stops while the CPU sleeps).
+    private final AlarmManager.OnAlarmListener mEventEnded = this::updateCalendarNow;
 
     SleepScreenInfo(Context context) {
         mContext = context;
@@ -107,16 +119,21 @@ class SleepScreenInfo {
                     registerCalendarObserver();
                 }
                 if (Intent.ACTION_SCREEN_OFF.equals(action)) {
-                    // Run immediately before the sleep screen draws and the CPU suspends.
-                    mHandler.removeCallbacks(mUpdateCalendar);
-                    updateCalendar();
+                    // Run immediately before the sleep screen draws and the CPU suspends, unless
+                    // the last answer still holds.
+                    if (!calendarCurrent()) updateCalendarNow();
                     refreshWeatherIfOld();
-                } else {
+                } else if (Intent.ACTION_LOCALE_CHANGED.equals(action)) {
+                    // A second later: this thread can hear of it before the app's main thread
+                    // has the new configuration, and the strings (the condition's language, an
+                    // untitled event, the default unit) would still be the old language's.
                     updateCalendarSoon();
-                }
-                // The condition's language and the default unit follow the locale.
-                if (Intent.ACTION_LOCALE_CHANGED.equals(action)) {
-                    Weather.relabel(mContext);
+                    mHandler.removeCallbacks(mRelabel);
+                    mHandler.postDelayed(mRelabel, 1000);
+                } else {
+                    // The time, zone or date (midnight, maybe asleep: in the broadcast), or the
+                    // first unlock.
+                    updateCalendarNow();
                 }
             }
         }, filter, null, mHandler, Context.RECEIVER_NOT_EXPORTED);
@@ -148,33 +165,47 @@ class SleepScreenInfo {
 
     private void refreshWeatherIfOld() {
         if (!Weather.enabled(mResolver)) return;
-        String data = Settings.System.getString(mResolver, Keys.SLEEP_WEATHER_DATA);
-        long fetched = 0;
-        if (data != null) {
-            String[] f = data.split(";", 9);
-            if (f.length >= 7) {
-                try {
-                    fetched = Long.parseLong(f[5]);  // the same field in versions 1 and 2
-                } catch (NumberFormatException ignored) {
-                    // refetch
-                }
-            }
-        }
+        long fetched = Weather.fetchedAt(mResolver);
         long age = System.currentTimeMillis() - fetched;
         if (fetched <= 0 || age < 0 || age > WEATHER_REFRESH_AT_SLEEP) {
-            WeatherJobService.schedule(mContext, true);
+            // A fetch that is already waiting (offline) keeps its place and its backoff.
+            WeatherJobService.scheduleNowIfIdle(mContext);
         }
+    }
+
+    private final Runnable mRelabel = this::relabelWeather;
+
+    private void relabelWeather() {
+        Weather.relabel(mContext);
+    }
+
+    private void updateCalendarNow() {
+        mHandler.removeCallbacks(mUpdateCalendar);
+        updateCalendar();
     }
 
     private void updateCalendarSoon() {
         // Calendar sync writes in bursts; one query after it settles.
+        mCalendarClean = false;
         mHandler.removeCallbacks(mUpdateCalendar);
         mHandler.postDelayed(mUpdateCalendar, 1000);
+    }
+
+    /**
+     * The last query's answer still holds: the calendar observer is up (it reports every change),
+     * nothing asked for a new query since, it is the same day (the 7-day window and "today" move
+     * at midnight) and the shown event is not over (its alarm doesn't wake the phone).
+     */
+    private boolean calendarCurrent() {
+        final long now = System.currentTimeMillis();
+        return mCalendarClean && mCalendarObserverRegistered && now < mShownEnd
+                && startDay(now, now) == mQueryDay;
     }
 
     private void updateCalendar() {
         AlarmManager alarms = mContext.getSystemService(AlarmManager.class);
         alarms.cancel(mEventEnded);
+        mCalendarClean = false;
         if (Settings.System.getInt(mResolver, Keys.SLEEP_CALENDAR, 1) == 0) {
             put("");
             return;
@@ -221,7 +252,12 @@ class SleepScreenInfo {
             Log.w(TAG, "calendar query: " + e);
             return;
         }
-        if (timed == null) timed = ongoingMultiDay;
+        // An ongoing multi-day event (on call this week) shows unless a timed event starts today:
+        // a meeting on Friday no longer hides it on Monday.
+        if (ongoingMultiDay != null
+                && (timed == null || startDay(timed.begin, now) > today)) {
+            timed = ongoingMultiDay;
+        }
         // By day: the earlier start day wins, the timed event on the same day. Events that have
         // already started count from today.
         Event next = timed;
@@ -229,21 +265,26 @@ class SleepScreenInfo {
                 || startDay(allDay.begin, now) < startDay(timed.begin, now))) {
             next = allDay;
         }
+        mQueryDay = today;
+        mShownEnd = next == null ? Long.MAX_VALUE : next.end;
+        mCalendarClean = true;
         if (next == null) {
             put("");
             return;
         }
         String title = next.title == null || next.title.isBlank()
                 ? mContext.getString(R.string.sleep_calendar_no_title)
-                : next.title.replaceAll("\\s+", " ").trim();
+                : WHITESPACE.matcher(next.title).replaceAll(" ").trim();
         if (title.length() > MAX_TITLE_LEN) {
             int cut = MAX_TITLE_LEN;
             if (Character.isHighSurrogate(title.charAt(cut - 1))) cut--;
             title = title.substring(0, cut);
         }
         put("1;" + next.begin + ";" + next.end + ";" + (next.allDay ? 1 : 0) + ";" + title);
-        // Show the next one once this one is over; not worth waking the phone for.
-        alarms.set(AlarmManager.RTC, next.end, "HiBreakSleepInfo", mEventEnded, mHandler);
+        // Show the next one once this one is over; not worth waking the phone for. A window, not
+        // set(): an inexact alarm days ahead could come hours after the end.
+        alarms.setWindow(AlarmManager.RTC, next.end, MINUTE, "HiBreakSleepInfo", mEventEnded,
+                mHandler);
     }
 
     private void put(String value) {

@@ -11,6 +11,7 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.text.InputType;
 import android.util.Log;
+import android.view.KeyEvent;
 import android.view.inputmethod.EditorInfo;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -33,8 +34,8 @@ public class SleepScreenFragment extends PreferenceFragmentCompat {
 
     @Override
     public void onCreatePreferences(Bundle savedInstanceState, String rootKey) {
-        ContentResolver cr = requireContext().getContentResolver();
-        SystemSettingsStore store = new SystemSettingsStore(cr);
+        ContentResolver cr = SystemSettingsStore.deviceResolver(requireContext());
+        SystemSettingsStore store = new SystemSettingsStore(requireContext());
         getPreferenceManager().setPreferenceDataStore(store);
         setPreferencesFromResource(R.xml.sleep_screen, rootKey);
 
@@ -81,7 +82,7 @@ public class SleepScreenFragment extends PreferenceFragmentCompat {
 
     private void updateCitySummary() {
         Weather.City city = Weather.City.decode(Settings.System.getString(
-                requireContext().getContentResolver(), Keys.SLEEP_WEATHER_CITY));
+                SystemSettingsStore.deviceResolver(requireContext()), Keys.SLEEP_WEATHER_CITY));
         mCity.setSummary(city != null ? city.name : getString(R.string.sleep_weather_city_none));
     }
 
@@ -93,7 +94,7 @@ public class SleepScreenFragment extends PreferenceFragmentCompat {
         input.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
         input.setHint(R.string.sleep_weather_city_hint);
         Weather.City current = Weather.City.decode(
-                Settings.System.getString(context.getContentResolver(), Keys.SLEEP_WEATHER_CITY));
+                Settings.System.getString(SystemSettingsStore.deviceResolver(context), Keys.SLEEP_WEATHER_CITY));
         if (current != null) {
             input.setText(current.name);
             input.selectAll();
@@ -111,7 +112,11 @@ public class SleepScreenFragment extends PreferenceFragmentCompat {
                 .setNegativeButton(android.R.string.cancel, null)
                 .create();
         input.setOnEditorActionListener((v, actionId, event) -> {
-            if (actionId != EditorInfo.IME_ACTION_SEARCH) return false;
+            // The keyboard's search key, or Enter on a hardware keyboard (IME_NULL with the key).
+            final boolean enter = actionId == EditorInfo.IME_NULL && event != null
+                    && event.getKeyCode() == KeyEvent.KEYCODE_ENTER;
+            if (enter && event.getAction() != KeyEvent.ACTION_DOWN) return true;
+            if (actionId != EditorInfo.IME_ACTION_SEARCH && !enter) return false;
             dialog.dismiss();
             search(input.getText().toString().trim());
             return true;
@@ -167,7 +172,7 @@ public class SleepScreenFragment extends PreferenceFragmentCompat {
         AlertDialog dialog = new AlertDialog.Builder(requireContext())
                 .setTitle(R.string.sleep_weather_city)
                 .setItems(labels, (d, which) -> {
-                    Settings.System.putString(requireContext().getContentResolver(),
+                    Settings.System.putString(SystemSettingsStore.deviceResolver(requireContext()),
                             Keys.SLEEP_WEATHER_CITY, cities.get(which).encode());
                     updateCitySummary();
                 })

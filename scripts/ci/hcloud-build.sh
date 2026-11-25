@@ -18,6 +18,7 @@
 #                   "vanilla microg gapps" for a release; device.mk). Targets other than bacon
 #                   build the first one only.
 #   OUT_DIR         out    artifacts land in $OUT_DIR/<build name>/
+#   FETCH_MODE      all    logs = only the logs and the server's checksums (no zip or images)
 #   RELEASE_KEYS_DIR  our release keys (docs/signing.md, e.g. ~/.hibreak-release-keys): installed
 #                   on the server as soon as the source is synced (scripts/ci/install-keys.sh); the
 #                   pipeline waits for them before building. Unset: install them by hand during the
@@ -174,7 +175,7 @@ deadline=$(( START + MAX_HOURS * 3600 ))
 last=""
 build_started=0
 while :; do
-  sleep 60
+  sleep 30
   if (( $(date +%s) > deadline )); then echo "MAX_HOURS=$MAX_HOURS reached, giving up" >&2; exit 1; fi
   st=$(s 'cat /srv/PIPELINE_STATE 2>/dev/null; tmux has-session -t ci 2>/dev/null || echo NO_TMUX' 2>/dev/null) || continue
   # Pipeline killed from outside (e.g. OOM takes the whole tmux scope) before it could write "done ..."
@@ -214,11 +215,17 @@ if ! grep -q '^done ok$' <<<"$st"; then
     *flavours-check*) s 'cat /srv/flavours-check.log' || true ;;
     *) s 'tail -60 /srv/build.log' || true ;;
   esac
+  # The whole logs for the run's artifacts (fetch-artifacts.sh only runs after a good build).
+  if [[ -n "${OUT_DIR:-}" ]]; then
+    mkdir -p "$OUT_DIR/failed" \
+      && s 'cd /srv && tar -cf - --ignore-failed-read *.log 2>/dev/null' | tar -C "$OUT_DIR/failed" -xf - \
+      && log "logs of the failed build in $OUT_DIR/failed" || true
+  fi
   exit 1
 fi
 
 if [[ "$BUILD_TARGET" == bacon && "${SYNC_ONLY:-0}" != 1 ]]; then
   log "fetching artifacts"
-  OUT_DIR="$OUT_DIR" scripts/build/fetch-artifacts.sh "$IP"
+  OUT_DIR="$OUT_DIR" FETCH_MODE="${FETCH_MODE:-all}" scripts/build/fetch-artifacts.sh "$IP"
 fi
 log "build finished"

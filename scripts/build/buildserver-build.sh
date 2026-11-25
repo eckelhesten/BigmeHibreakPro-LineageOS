@@ -26,9 +26,12 @@ esac
 export HIBREAK_FLAVOR
 echo "== flavour: $HIBREAK_FLAVOR"
 
-# microG lives outside our trees (vendor/microg, ~110 MB of release APKs): fetch it once. A copy
-# from before it had its own Soong namespace would clash with MindTheGapps' GmsCore: refetch.
-if [ "$HIBREAK_FLAVOR" = microg ] && ! grep -qs '^soong_namespace' vendor/microg/Android.bp; then
+# microG lives outside our trees (vendor/microg, ~110 MB of release APKs): fetch it once, and again
+# when fetch-microg.sh changed (a new version pinned there). A copy from before it had its own
+# Soong namespace would clash with MindTheGapps' GmsCore: refetch.
+microg_want=$(sha256sum < /srv/hibreak-src/scripts/ci/fetch-microg.sh | cut -c1-64)
+if [ "$HIBREAK_FLAVOR" = microg ] && { ! grep -qs '^soong_namespace' vendor/microg/Android.bp \
+     || [ "$(cat vendor/microg/.fetch-microg.sha256 2>/dev/null)" != "$microg_want" ]; }; then
   bash /srv/hibreak-src/scripts/ci/fetch-microg.sh || { echo "BUILD_RESULT=microg-fetch-failed"; exit 1; }
 fi
 # MindTheGapps comes in with the sync (manifests/flavors/gapps.xml, Git LFS). An LFS pointer

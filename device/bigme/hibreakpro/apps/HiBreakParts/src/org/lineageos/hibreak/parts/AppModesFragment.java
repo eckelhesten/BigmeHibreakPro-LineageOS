@@ -44,8 +44,15 @@ public class AppModesFragment extends PreferenceFragmentCompat {
                     return;
                 }
                 Context prefContext = getPreferenceManager().getContext();
-                ContentResolver cr = appContext.getContentResolver();
+                ContentResolver cr = SystemSettingsStore.deviceResolver(appContext);
                 Map<String, Integer> profiles = Eink.getAppProfiles(cr);
+                // Loaded once for all apps, not twice per app.
+                CharSequence[] entries = prefContext.getResources()
+                        .getTextArray(R.array.app_profile_entries);
+                CharSequence[] values = prefContext.getResources()
+                        .getTextArray(R.array.app_profile_values);
+                String auto = prefContext.getString(R.string.app_profile_auto);
+                String autoReading = prefContext.getString(R.string.app_profile_auto_reading);
                 for (AppList.App app : apps) {
                     ListPreference pref = new ListPreference(prefContext);
                     pref.setPersistent(false);
@@ -53,8 +60,8 @@ public class AppModesFragment extends PreferenceFragmentCompat {
                     pref.setTitle(app.label);
                     pref.setIcon(app.icon);
                     pref.setDialogTitle(app.label);
-                    pref.setEntries(R.array.app_profile_entries);
-                    pref.setEntryValues(R.array.app_profile_values);
+                    pref.setEntries(entries);
+                    pref.setEntryValues(values);
                     Integer own = profiles.get(app.packageName);
                     pref.setValue(own != null ? Integer.toString(own) : "-1");
                     // "Automatic" says what it means for this app: Reading for known e-readers.
@@ -62,8 +69,7 @@ public class AppModesFragment extends PreferenceFragmentCompat {
                     pref.setSummaryProvider(p -> {
                         ListPreference lp = (ListPreference) p;
                         if (!"-1".equals(lp.getValue())) return lp.getEntry();
-                        return prefContext.getString(reader ? R.string.app_profile_auto_reading
-                                : R.string.app_profile_auto);
+                        return reader ? autoReading : auto;
                     });
                     pref.setOnPreferenceChangeListener((p, value) -> {
                         if (!isAdded()) return false;

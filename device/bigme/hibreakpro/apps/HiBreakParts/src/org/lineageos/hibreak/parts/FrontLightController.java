@@ -15,8 +15,9 @@ import android.hardware.SensorManager;
 import android.hardware.display.BrightnessInfo;
 import android.hardware.display.DisplayManager;
 import android.os.Handler;
-import android.os.Looper;
+import android.os.HandlerThread;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.SystemProperties;
 import android.os.SystemClock;
 import android.provider.Settings;
@@ -50,6 +51,9 @@ import java.io.IOException;
  *   switched on doesn't make it jump.
  * - Settings.System "hibreak_frontlight_warmth" (0 = all cold .. 100 = all warm, default 70)
  *   splits the level between the two channels; "hibreak_frontlight_enabled" = 0 keeps it off.
+ * - Runs on its own thread: the LM3630A writes are blocking I2C sysfs writes (two every 40 ms
+ *   while auto mode ramps), and they kept the app's main thread (the e-ink policy, the tiles)
+ *   waiting.
  */
 class FrontLightController implements DisplayManager.DisplayListener, SensorEventListener {
     private static final String TAG = "HiBreakFrontLight";
@@ -83,7 +87,7 @@ class FrontLightController implements DisplayManager.DisplayListener, SensorEven
     private static final long RAMP_STEP_MS = 40;
 
     private final Context mContext;
-    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private final Handler mHandler;
     private DisplayManager mDisplayManager;
     private PowerManager mPowerManager;
     private SensorManager mSensorManager;
@@ -108,12 +112,22 @@ class FrontLightController implements DisplayManager.DisplayListener, SensorEven
     private int mTarget = -1;
     private int mLevel = -1;
     private boolean mWasOn;
+    private boolean mWasAuto;
 
     private final Runnable mRampStep = this::rampStep;
     private final Runnable mLuxTick = this::luxTick;
 
+    /** The tuning properties' last text and what it parsed to (autoGain runs on every tick). */
+    private static String sLuxText;
+    private static String sGainText;
+    private static float[] sLux = AUTO_LUX;
+    private static float[] sGain = AUTO_GAIN;
+
     FrontLightController(Context context) {
         mContext = context;
+        HandlerThread thread = new HandlerThread(TAG, Process.THREAD_PRIORITY_FOREGROUND);
+        thread.start();
+        mHandler = new Handler(thread.getLooper());
     }
 
     void start() {
@@ -149,7 +163,7 @@ class FrontLightController implements DisplayManager.DisplayListener, SensorEven
         mContext.getContentResolver().registerContentObserver(
                 Settings.System.getUriFor(Settings.System.SCREEN_BRIGHTNESS_MODE), false,
                 observer);
-        update();
+        mHandler.post(this::update);
     }
 
     @Override
@@ -228,7 +242,8 @@ class FrontLightController implements DisplayManager.DisplayListener, SensorEven
     public void onAccuracyChanged(Sensor sensor, int accuracy) {}
 
     static int getWarmth(Context context) {
-        int w = Settings.System.getInt(context.getContentResolver(), Keys.FRONTLIGHT_WARMTH,
+        int w = Settings.System.getInt(SystemSettingsStore.deviceResolver(context),
+                Keys.FRONTLIGHT_WARMTH,
                 Keys.DEFAULT_WARMTH);
         return Math.max(0, Math.min(100, w));
     }
@@ -260,40 +275,50 @@ class FrontLightController implements DisplayManager.DisplayListener, SensorEven
         boolean on = enabled && display != null && display.getState() == Display.STATE_ON
                 && mPowerManager.isInteractive();
         boolean auto = isAutoMode();
+        if (mWasAuto && !auto) {
+            // Out of auto mode: the last reading may be hours old when auto comes back, and the
+            // sensor reports on change only. Until its first reading, auto is as manual.
+            mLux = -1f;
+            mRawLux = -1f;
+        }
+        mWasAuto = auto;
         setSensorEnabled(on && auto);
 
         int level = 0;
         boolean sliderChanged = false;
         if (on) {
             BrightnessInfo info = display.getBrightnessInfo();
-            if (info != null && Float.isFinite(info.brightness)
-                    && Float.isFinite(info.brightnessMinimum)
-                    && Float.isFinite(info.brightnessMaximum)
-                    && info.brightnessMaximum > info.brightnessMinimum
-                    && info.brightness >= 0f) {
-                // Slider position (perceptual, 0..1), not the linear brightness: the linear value
-                // stays tiny over most of the slider, and the LM3630A's output is roughly linear
-                // in its code, invisible below ~64 in a lit room (measured on camera).
-                float pos = BrightnessUtils.convertLinearToGammaFloat(info.brightness,
-                        info.brightnessMinimum, info.brightnessMaximum)
-                        / (float) BrightnessUtils.GAMMA_SPACE_MAX;
-                pos = Float.isFinite(pos) ? Math.max(0f, Math.min(1f, pos)) : 0f;
-                sliderChanged = mLastSlider >= 0f && Math.abs(pos - mLastSlider) > 0.002f;
-                mLastSlider = pos;
-                if (pos > 0.01f) {
-                    // Bottom of the slider = off; then 1..MAX on a gentle curve, so the lower
-                    // half still has the dim levels needed for reading in the dark.
-                    float slider = 1 + (MAX - 1) * (float) Math.pow(pos, 1.5);
-                    // Auto: scaled by the ambient light; no reading yet = as in manual mode.
-                    float gain = auto && mLux >= 0f ? autoGain(mLux) : 1f;
-                    level = Math.round(slider * gain);
-                    level = Math.min(MAX, gain > 0f ? Math.max(1, level) : 0);
-                }
-                if (level != mLoggedLevel) {
-                    mLoggedLevel = level;
-                    Log.i(TAG, "level " + level + " (slider " + Math.round(pos * 100) + "%"
-                            + (auto ? ", auto, lux " + Math.round(mLux) : "") + ")");
-                }
+            if (info == null || !Float.isFinite(info.brightness)
+                    || !Float.isFinite(info.brightnessMinimum)
+                    || !Float.isFinite(info.brightnessMaximum)
+                    || info.brightnessMaximum <= info.brightnessMinimum
+                    || info.brightness < 0f) {
+                // No brightness to go by for a moment (the display changing state): the light
+                // stays as it is instead of going off and on again.
+                return;
+            }
+            // Slider position (perceptual, 0..1), not the linear brightness: the linear value
+            // stays tiny over most of the slider, and the LM3630A's output is roughly linear
+            // in its code, invisible below ~64 in a lit room (measured on camera).
+            float pos = BrightnessUtils.convertLinearToGammaFloat(info.brightness,
+                    info.brightnessMinimum, info.brightnessMaximum)
+                    / (float) BrightnessUtils.GAMMA_SPACE_MAX;
+            pos = Float.isFinite(pos) ? Math.max(0f, Math.min(1f, pos)) : 0f;
+            sliderChanged = mLastSlider >= 0f && Math.abs(pos - mLastSlider) > 0.002f;
+            mLastSlider = pos;
+            if (pos > 0.01f) {
+                // Bottom of the slider = off; then 1..MAX on a gentle curve, so the lower
+                // half still has the dim levels needed for reading in the dark.
+                float slider = 1 + (MAX - 1) * (float) Math.pow(pos, 1.5);
+                // Auto: scaled by the ambient light; no reading yet = as in manual mode.
+                float gain = auto && mLux >= 0f ? autoGain(mLux) : 1f;
+                level = Math.round(slider * gain);
+                level = Math.min(MAX, gain > 0f ? Math.max(1, level) : 0);
+            }
+            if (level != mLoggedLevel) {
+                mLoggedLevel = level;
+                Log.i(TAG, "level " + level + " (slider " + Math.round(pos * 100) + "%"
+                        + (auto ? ", auto, lux " + Math.round(mLux) : "") + ")");
             }
         }
 
@@ -309,7 +334,11 @@ class FrontLightController implements DisplayManager.DisplayListener, SensorEven
             }
             mTarget = level;
             mHandler.removeCallbacks(mRampStep);
-            rampStep();
+            if (mLevel == mTarget) {
+                apply(mLevel); // already there: the warmth may have changed
+            } else {
+                rampStep();
+            }
         } else {
             mHandler.removeCallbacks(mRampStep);
             mTarget = level;
@@ -326,9 +355,18 @@ class FrontLightController implements DisplayManager.DisplayListener, SensorEven
     }
 
     /** Gain on the slider's level for the ambient light, interpolated on a log scale of the lux. */
-    static float autoGain(float lux) {
-        float[] xs = parseList(SystemProperties.get(PROP_AUTO_LUX), AUTO_LUX, true);
-        float[] ys = parseList(SystemProperties.get(PROP_AUTO_GAIN), AUTO_GAIN, false);
+    static synchronized float autoGain(float lux) {
+        // Parsed again only when the tuning text changed.
+        String luxText = SystemProperties.get(PROP_AUTO_LUX);
+        String gainText = SystemProperties.get(PROP_AUTO_GAIN);
+        if (!luxText.equals(sLuxText) || !gainText.equals(sGainText)) {
+            sLuxText = luxText;
+            sGainText = gainText;
+            sLux = parseList(luxText, AUTO_LUX, true);
+            sGain = parseList(gainText, AUTO_GAIN, false);
+        }
+        float[] xs = sLux;
+        float[] ys = sGain;
         if (xs.length != ys.length) {
             xs = AUTO_LUX;
             ys = AUTO_GAIN;

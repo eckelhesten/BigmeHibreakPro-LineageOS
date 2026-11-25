@@ -39,12 +39,16 @@ top of the script.
 ## Build on your own machine
 
 The steps are the ones `scripts/build/buildserver-pipeline.sh` runs:
-1. `repo init -u https://github.com/LineageOS/android.git -b lineage-23.2 --git-lfs`, copy
-   `manifests/*.xml` into `.repo/local_manifests/`, `repo sync`.
-2. Put `device/bigme` and `vendor/bigme` into the tree.
+1. `repo init -u https://github.com/LineageOS/android.git -b lineage-23.2 --git-lfs`. For the
+   gapps flavour copy `manifests/flavors/gapps.xml` into `.repo/local_manifests/` (the other
+   flavours need no local manifest). `repo sync`.
+2. Put `device/bigme` and `vendor/bigme` into the tree. The vendor tree is not in git: it holds
+   the stock firmware's images and blobs; its IMS service is made from the stock system_ext with
+   `device/bigme/hibreakpro/tools/ims/extract-ims.py`.
 3. `scripts/ci/apply-patches.sh <tree> patches`.
-4. Install your keys (`scripts/ci/install-keys.sh` shows what goes where).
-5. `source build/envsetup.sh && breakfast hibreakpro user && m bacon`.
+4. For the microg flavour: `scripts/ci/fetch-microg.sh <tree>` (vendor/microg).
+5. Install your keys (`scripts/ci/install-keys.sh` shows what goes where).
+6. `source build/envsetup.sh && breakfast hibreakpro user && m bacon`.
 
 ## Flavours
 
@@ -62,5 +66,5 @@ up in the images (`scripts/build/buildserver-build.sh` does this for you).
 - `scripts/ci/check-release-build.sh` checks that every APK, APEX and SELinux certificate uses
   your keys.
 - `scripts/ci/check-flavours.sh` checks each flavour's images and update zip.
-- `scripts/release/package.sh` turns a flavour's images into the install zip with `flash.sh` and
-  `INSTALL.txt`.
+- `scripts/release/package.sh` turns a flavour's images into the install zip with `flash.sh`
+  (Linux, macOS), `flash.ps1` (Windows) and `INSTALL.txt`.

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- E-ink: a long-pressed bubble (incoming or outgoing) always gets white text, and the
+         stock system_accent3_300 is paper in the two-tone palette, so the selected message
+         went blank. Ink instead: white on black. -->
+    <color name="message_bubble_color_selected">#ff000000</color>
+    <!-- Ink outline of outgoing bubbles (see dimens.xml). -->
+    <color name="message_bubble_outgoing_stroke_color">#ff000000</color>
+</resources>

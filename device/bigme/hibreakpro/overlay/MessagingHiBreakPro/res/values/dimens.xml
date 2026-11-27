@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- E-ink: outgoing bubbles are white on a white background, so give them a thin black
+         outline (patches/packages/apps/Messaging 0001; 1dp like the Twelve widget's).
+         Incoming bubbles are solid black, so the two read apart at a glance. -->
+    <dimen name="message_bubble_outgoing_stroke_width">1dp</dimen>
+</resources>

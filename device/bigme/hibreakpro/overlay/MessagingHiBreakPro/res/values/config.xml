@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- E-ink: Messaging tints each contact's incoming bubbles and letter-tile avatar with
+         letter_tile_colors[hash(lookup key) % 12] (system accent shades 300-600) and draws the
+         text and tile letter in white. The two-tone palette turns shades below 500 into paper,
+         so half the contacts got white text on white bubbles (blank threads). Off: every
+         incoming bubble and tile is primary_color (accent1_600, ink), white on black. -->
+    <bool name="contact_colors">false</bool>
+</resources>

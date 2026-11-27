@@ -1,0 +1,99 @@
+From a6c983202bf59a9c3b3300d066e592d788753b4e Mon Sep 17 00:00:00 2001
+From: hibreak <build@localhost>
+Date: Fri, 27 Nov 2026 10:46:20 +0100
+Subject: [PATCH] Messaging: optional outline for outgoing bubbles
+
+Outgoing bubbles are white, so on a white conversation background (an
+e-ink panel's paper) they have no visible edge. Add an outline that a
+device overlay can turn on: message_bubble_outgoing_stroke_width (0dp,
+the stock look, by default) and message_bubble_outgoing_stroke_color.
+Fill and stroke are set on the bubble's shape itself, because the colour
+filter getTintedDrawable applies would paint the stroke in the fill
+colour. Selected bubbles stay solid (their text is white).
+
+Change-Id: Ia8124fe9dbf54a6fbf163ce1a14d7c26c0583cda
+---
+ res/values/colors.xml                          |  2 ++
+ res/values/dimens.xml                          |  2 ++
+ .../messaging/ui/ConversationDrawables.java    | 18 ++++++++++++++++++
+ 3 files changed, 22 insertions(+)
+
+diff --git a/res/values/colors.xml b/res/values/colors.xml
+index 1b48f34..5243faf 100644
+--- a/res/values/colors.xml
++++ b/res/values/colors.xml
+@@ -63,6 +63,8 @@
+     <color name="compose_message_send_color">@color/lineage_accent</color>
+     <color name="compose_message_send_color_pressed">#999999</color>
+     <color name="message_bubble_color_outgoing">#ffffffff</color>
++    <!-- Outline of outgoing bubbles, drawn when message_bubble_outgoing_stroke_width > 0. -->
++    <color name="message_bubble_outgoing_stroke_color">#ff000000</color>
+     <color name="message_error_bubble_color_incoming">#e2e2e2</color>
+     <color name="message_audio_button_color_incoming">#ffffffff</color>
+     <color name="message_bubble_color_selected">@android:color/system_accent3_300</color>
+diff --git a/res/values/dimens.xml b/res/values/dimens.xml
+index 72c1c86..17541fc 100644
+--- a/res/values/dimens.xml
++++ b/res/values/dimens.xml
+@@ -38,6 +38,8 @@
+     <dimen name="blocked_participant_list_item_view_padding">16dp</dimen>
+ 
+     <dimen name="message_bubble_arrow_width">9dp</dimen>
++    <!-- Outline of outgoing (not selected) bubbles; 0 = none, the stock look. -->
++    <dimen name="message_bubble_outgoing_stroke_width">0dp</dimen>
+     <dimen name="message_text_bottom_padding">12dp</dimen>
+     <dimen name="message_text_top_padding">10dp</dimen>
+     <dimen name="message_text_left_right_padding">14dp</dimen>
+diff --git a/src/com/android/messaging/ui/ConversationDrawables.java b/src/com/android/messaging/ui/ConversationDrawables.java
+index a9f30c4..4684830 100644
+--- a/src/com/android/messaging/ui/ConversationDrawables.java
++++ b/src/com/android/messaging/ui/ConversationDrawables.java
+@@ -20,6 +20,7 @@ import android.content.Context;
+ import android.content.res.Resources;
+ import android.content.res.TypedArray;
+ import android.graphics.drawable.Drawable;
++import android.graphics.drawable.GradientDrawable;
+ 
+ import androidx.core.content.res.ResourcesCompat;
+ 
+@@ -49,6 +50,8 @@ public class ConversationDrawables {
+     private Drawable mFastScrollPreviewDrawableRight;
+     private final Context mContext;
+     private int mOutgoingBubbleColor;
++    private int mOutgoingBubbleStrokeWidth;
++    private int mOutgoingBubbleStrokeColor;
+     private int mIncomingErrorBubbleColor;
+     private int mIncomingAudioButtonColor;
+     private int mSelectedBubbleColor;
+@@ -99,6 +102,10 @@ public class ConversationDrawables {
+         mFastScrollPreviewDrawableRight = ResourcesCompat.getDrawable(resources,
+                 R.drawable.fastscroll_preview_right, theme);
+         mOutgoingBubbleColor = resources.getColor(R.color.message_bubble_color_outgoing, theme);
++        mOutgoingBubbleStrokeWidth =
++                resources.getDimensionPixelSize(R.dimen.message_bubble_outgoing_stroke_width);
++        mOutgoingBubbleStrokeColor =
++                resources.getColor(R.color.message_bubble_outgoing_stroke_color, theme);
+         mIncomingErrorBubbleColor =
+                 resources.getColor(R.color.message_error_bubble_color_incoming, theme);
+         mIncomingAudioButtonColor =
+@@ -134,6 +141,17 @@ public class ConversationDrawables {
+             }
+         } else {
+             color = mOutgoingBubbleColor;
++            // An outlined outgoing bubble (e.g. on e-ink panels, where a white bubble on a white
++            // background has no edge). Fill and stroke are set on the shape itself: the colour
++            // filter below would paint the stroke in the fill colour.
++            if (mOutgoingBubbleStrokeWidth > 0 && protoDrawable instanceof GradientDrawable
++                    && protoDrawable.getConstantState() != null) {
++                final GradientDrawable outlined = (GradientDrawable) protoDrawable
++                        .getConstantState().newDrawable(mContext.getResources()).mutate();
++                outlined.setColor(color);
++                outlined.setStroke(mOutgoingBubbleStrokeWidth, mOutgoingBubbleStrokeColor);
++                return outlined;
++            }
+         }
+ 
+         return ImageUtils.getTintedDrawable(mContext, protoDrawable, color);
+-- 
+2.50.1 (Apple Git-155)
+

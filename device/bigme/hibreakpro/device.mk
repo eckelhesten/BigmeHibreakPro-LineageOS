@@ -34,7 +34,8 @@ PRODUCT_PACKAGES += \
     SettingsHiBreakPro \
     ApertureHiBreakPro \
     LineageSdkHiBreakPro \
-    LatinIMEHiBreakPro
+    LatinIMEHiBreakPro \
+    MessagingHiBreakPro
 
 # Device parts: front light (brightness -> LM3630A warm/cold) and e-ink quick settings tiles
 PRODUCT_PACKAGES += HiBreakParts

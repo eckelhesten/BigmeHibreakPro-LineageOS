@@ -27,10 +27,12 @@ import java.util.Objects;
 
 /**
  * Applies the e-ink profile to the composer: the global profile (Default or Reading), overridden
- * per app while that app's task is in front, and the fixed settings (Eink.applyFixedSettings)
- * that used to be switches. Full refreshes happen only when asked (Refresh tile, side key,
- * Keys.EINK_REFRESH_REQUEST), never automatically: the owner wants no unasked flashes (2026-11-23),
- * although white areas get darker over app switches without one (scripts/eink-bench/ghost.py).
+ * per app while that app's task is in front. What used to be switches (FAST for motion and
+ * typing, greys in FAST, the kernel's cleanup and anti-flicker) is fixed, in SurfaceFlinger's
+ * defaults and init.hibreakpro.eink.rc. Full refreshes happen only when asked (Refresh tile,
+ * side key, Keys.EINK_REFRESH_REQUEST), never automatically: the owner wants no unasked flashes
+ * (2026-11-23), although white areas get darker over app switches without one
+ * (scripts/eink-bench/ghost.py).
  *
  * Runs on its own thread at display priority: an app switch's mode change (a task stack query,
  * property writes, SurfaceFlinger's repaint, all blocking IPCs) must not wait behind the front
@@ -124,7 +126,6 @@ class EinkPolicy {
             }
         }, power, null, mHandler, Context.RECEIVER_NOT_EXPORTED);
         mHandler.post(() -> {
-            Eink.applyFixedSettings();
             updateTopPackage();
             applyAll();
         });

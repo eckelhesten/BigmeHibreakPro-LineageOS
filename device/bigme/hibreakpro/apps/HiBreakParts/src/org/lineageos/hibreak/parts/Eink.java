@@ -25,16 +25,6 @@ final class Eink {
     private static final String TAG = "HiBreakEink";
     static final String PROP_GLOBAL_MODE = "vendor.xrz.global_refresh_mode";
     private static final String PROP_FORCE_MODE = "vendor.xrz.force_global_refresh_mode";
-    static final String PROP_AUTO_CLEAN = "vendor.xrz.auto_clean_enabled";
-    static final String PROP_ANTI_FLICKER = "vendor.xrz.anti_flicker_enabled";
-    /** Read by SurfaceFlinger (frameworks/native patch 0006): the fast mode while the screen
-     *  moves, and while the keyboard is up. Always on (Reading scrolls and types in FAST). */
-    static final String PROP_MOTION_FAST = "vendor.xrz.hibreak_motion_fast";
-    static final String PROP_IME_FAST = "vendor.xrz.hibreak_ime_fast";
-    /** Read by SurfaceFlinger's render pass (frameworks/native 0019 + 0022): FAST (A2) draws
-     *  16 greys instead of black and white dots (including while typing); the panel drives them
-     *  in 35 ms passes. Always on: it is what makes Default look good. */
-    static final String PROP_FAST_GREYS = "vendor.xrz.hibreak_fast_greys";
     /** The current temperature band's level map and tone curve for greys in Fast mode. */
     static final String PROP_FAST_LEVELS = "vendor.xrz.hibreak_fast_levels";
     static final String PROP_FAST_GAMMA = "vendor.xrz.hibreak_fast_gamma_x100";
@@ -61,18 +51,6 @@ final class Eink {
         }
         return last; // warmer than every band: the warmest
     }
-    /** Read by SurfaceFlinger's e-ink passes: the grey levels that become black and white in the
-     *  1-bit passes (typing in FAST; legacy enhancement pass). Fixed at the former "Strong": with
-     *  no crush the dither punched white dots into dark-grey web text. The grey passes (Default's
-     *  greys, Reading) ignore them. */
-    private static final String PROP_CONTRAST_BLACK = "vendor.xrz.hibreak_contrast_black";
-    private static final String PROP_CONTRAST_WHITE = "vendor.xrz.hibreak_contrast_white";
-    private static final String PROP_BLEACH = "vendor.xrz.hibreak_eink_bleach";
-    private static final String PROP_CRUSH = "vendor.xrz.hibreak_eink_crush";
-    private static final int CONTRAST_BLACK = 48;
-    private static final int CONTRAST_WHITE = 208;
-    private static final int BLEACH = 194;
-    private static final int CRUSH = 92;
 
     /** The two profiles, and the per-app extra for dark-only apps. */
     static final int PROFILE_DEFAULT = 0;
@@ -180,24 +158,6 @@ final class Eink {
     static void fullRefresh() {
         SystemProperties.set(PROP_FORCE_MODE, Integer.toString(WAVEFORM_GC16));
         requestRepaint();
-    }
-
-    /**
-     * Everything that used to be a switch, set the one way that works: the kernel's cleanup and
-     * anti-flicker on, FAST while the screen moves and while the keyboard is up, greys in FAST,
-     * and the 1-bit passes' black and white levels. Doesn't touch SurfaceFlinger's colour
-     * matrix, so Android's own colour transforms (colour correction, inversion) stay intact.
-     */
-    static void applyFixedSettings() {
-        SystemProperties.set(PROP_AUTO_CLEAN, "1");
-        SystemProperties.set(PROP_ANTI_FLICKER, "1");
-        SystemProperties.set(PROP_MOTION_FAST, "1");
-        SystemProperties.set(PROP_IME_FAST, "1");
-        SystemProperties.set(PROP_FAST_GREYS, "1");
-        SystemProperties.set(PROP_CONTRAST_BLACK, Integer.toString(CONTRAST_BLACK));
-        SystemProperties.set(PROP_CONTRAST_WHITE, Integer.toString(CONTRAST_WHITE));
-        SystemProperties.set(PROP_BLEACH, Integer.toString(BLEACH));
-        SystemProperties.set(PROP_CRUSH, Integer.toString(CRUSH));
     }
 
     /** SurfaceFlinger's repaint transaction, so the composer commits even on a static screen. */

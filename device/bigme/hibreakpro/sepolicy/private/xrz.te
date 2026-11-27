@@ -21,8 +21,7 @@ typeattribute xrz_system_file xrz_system_file_31_0;
 
 # Platform side: the framework, composer, and e-ink settings read the XRZ policy properties;
 # system_server / system_app (HiBreakParts) change user settings, and surfaceflinger switches
-# motion fast-mode / sleep-mode properties (EinkMotion).
-get_prop({ system_server surfaceflinger system_app }, vendor_xrz_prop)
+# motion fast-mode / sleep-mode properties (EinkMotion). set_prop includes get_prop.
 set_prop({ system_server surfaceflinger system_app }, vendor_xrz_prop)
 
 # Bigme's composer reads system_prop properties (the platform's, not its own), which the vendor

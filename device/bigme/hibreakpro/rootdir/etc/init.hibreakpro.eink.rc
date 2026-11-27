@@ -30,6 +30,12 @@ on boot
     # ghosting, and the composer's anti-flicker. Verified on camera 2026-11-13.
     setprop vendor.xrz.auto_clean_enabled 1
     setprop vendor.xrz.anti_flicker_enabled 1
+    # FAST (A2) draws 16 greys instead of black and white dots, also while typing: the panel
+    # drives them in 35 ms passes (SurfaceFlinger's render pass, frameworks/native 0019 + 0022).
+    # It is what makes Default look good, so it is always on, but SurfaceFlinger's own default is
+    # off. The other fixed settings (FAST for motion and typing, bleach 194 and crush 92 for the
+    # 1-bit pass) are SurfaceFlinger's defaults; HiBreakParts used to set them all at its start.
+    setprop vendor.xrz.hibreak_fast_greys 1
 
 # The kernel's own ghost cleanup (eink_debug/clean_a2). It is off after boot; the stock framework
 # switches it on. It is much more than a cleanup: only with it on do whole-panel DU/A2 updates run

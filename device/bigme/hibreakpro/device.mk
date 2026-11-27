@@ -26,7 +26,6 @@ PRODUCT_EXTRA_VNDK_VERSIONS := 31
 TARGET_SCREEN_WIDTH := 824
 TARGET_SCREEN_HEIGHT := 1648
 
-# A/B
 # E-ink overlay packages and customizations
 PRODUCT_PACKAGES += \
     FrameworksResHiBreakPro \

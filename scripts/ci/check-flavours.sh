@@ -133,7 +133,6 @@ for d in "$DIST"/*/; do
     meta=$(unzip -p "$zip" META-INF/com/android/metadata 2>/dev/null)
     unzip -l "$zip" payload.bin >/dev/null 2>&1 && ok "payload.bin present" || err "no payload.bin"
     grep -q '^ota-type=AB' <<<"$meta" && ok "A/B package" || err "not an A/B package"
-    grep -q '^ota-required-cache=0' <<<"$meta" || true
     echo "  post-build: $(sed -n 's/^post-build=//p' <<<"$meta")"
   fi
   du -h "$d"/{system,system_ext,product}.img 2>/dev/null | sed 's/^/  size: /'

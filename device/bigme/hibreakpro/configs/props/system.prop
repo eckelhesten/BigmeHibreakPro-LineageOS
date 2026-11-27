@@ -42,8 +42,8 @@ debug.hwui.eink_text_faded_alpha=70
 # No dim layer behind dialogs and popups; they get a solid outline instead. frameworks/base patch 0005.
 debug.eink.windows=1
 # Fast e-ink mode (A2, ~36 ms per frame) while the screen moves or the keyboard is up, the
-# chosen mode again once it is still. frameworks/native patch 0006; the two triggers have
-# switches in HiBreakParts (vendor.xrz.hibreak_motion_fast, vendor.xrz.hibreak_ime_fast).
+# chosen mode again once it is still. frameworks/native patch 0006; the two triggers are on by
+# default and can be switched off with vendor.xrz.hibreak_motion_fast / vendor.xrz.hibreak_ime_fast.
 debug.sf.eink_motion=1
 # The panel's real density (6.13", 824x1648 = 300 ppi). The composer reports 667.61 x 188.55 dpi,
 # which made SystemUI's falsing check send swipes up on the lock screen back from the bouncer.
@@ -57,13 +57,13 @@ debug.sf.dpi_override=300
 debug.sysui.eink_sleep=1
 debug.sf.eink_sleep=1
 # Enable SurfaceFlinger's e-ink render pass (percent > 0 is required for debug.sf.eink_render=3;
-# 0 = off). For comparison mode (eink_render=2), debug.sf.eink_enhance.* tunes the legacy pass.
+# 0 = off). debug.sf.eink_enhance.{radius_x10,t1_x1000,t2_x1000,gate0_x1000,gate1_x1000} tune it.
 debug.sf.eink_enhance=100
 # The pass renders the frame as the panel will show it (frameworks/native 0013+):
 # grey text of any weight solid, faint cards, fields and separators kept as 1-px outlines, light
 # greys bleached and dark greys crushed, then a blue-noise dither to pure black and white
 # (16 exact levels in the grey modes; FAST gets a cheap 1-bit pass unless fast_greys is active).
-# 2 = the legacy enhancement pass above, for comparison. Tunables: debug.sf.eink.*.
+# Below 3 there is no pass (2 was the legacy enhancement pass, removed). Tunables: debug.sf.eink.*.
 debug.sf.eink_render=3
 # Tone curve of the render pass, measured on camera with a grey ramp (2026-11-20): the blue-noise
 # dither has little dot gain, so a power of 2.0 (2.4 for HD's 16 greys) brings an app's grey
